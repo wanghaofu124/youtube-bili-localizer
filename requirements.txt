@@ -1,0 +1,13 @@
+yt-dlp>=2025.1.0
+faster-whisper>=1.1.0
+openai>=1.0.0
+playwright>=1.40.0
+python-dotenv>=1.0.0
+pytesseract>=0.3.13
+Pillow>=10.0.0
+
+# Optional CUDA runtime for faster-whisper/CTranslate2 on Windows.
+# These packages are large; install them when using GPU transcription.
+nvidia-cuda-runtime-cu12==12.8.90; platform_system == "Windows"
+nvidia-cublas-cu12==12.8.4.1; platform_system == "Windows"
+nvidia-cudnn-cu12==9.8.0.87; platform_system == "Windows"

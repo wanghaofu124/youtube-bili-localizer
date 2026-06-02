@@ -1,0 +1,25 @@
+[project]
+name = "youtube-bili-localizer"
+version = "0.1.0"
+description = "Authorized video localization pipeline: download, transcribe, translate, burn subtitles, and assist Bilibili upload."
+requires-python = ">=3.10"
+dependencies = [
+  "yt-dlp>=2025.1.0",
+  "faster-whisper>=1.1.0",
+  "openai>=1.0.0",
+  "playwright>=1.40.0",
+  "python-dotenv>=1.0.0",
+  "pytesseract>=0.3.13",
+  "Pillow>=10.0.0",
+]
+
+[project.scripts]
+yblocalizer = "yblocalizer.cli:main"
+yblocalizer-gui = "yblocalizer.gui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
