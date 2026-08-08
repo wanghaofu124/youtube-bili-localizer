@@ -24,7 +24,14 @@ def segments_to_srt(
     blocks: list[str] = []
     for index, segment in enumerate(segments, start=1):
         start = format_srt_timestamp(segment.start)
-        end = format_srt_timestamp(segment.end)
+        end = segment.end
+        if index < len(segments):
+            next_start = segments[index].start
+            if end > next_start - 0.05:
+                # 规整时间重叠：两条字幕同时显示会互相叠加占满画面，
+                # 将本条结束时间截到下一条开始前，保证任何时刻至多一条字幕。
+                end = max(segment.start + 0.1, next_start - 0.05)
+        end = format_srt_timestamp(end)
         text = format_segment_text(
             segment,
             display_mode=display_mode,

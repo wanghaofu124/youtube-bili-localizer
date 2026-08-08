@@ -1,0 +1,26 @@
+.metadata-notice {
+  margin: -2px 20px 14px;
+  padding: 8px 10px;
+  border-left: 3px solid var(--amber);
+  background: #fff8ec;
+  color: #765b45;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.metadata-notice.loading {
+  border-left-color: #c57a2a;
+  color: #805a2e;
+}
+
+.metadata-notice.success {
+  border-left-color: var(--green);
+  background: #f3faf5;
+  color: #39765e;
+}
+
+.metadata-notice.error {
+  border-left-color: var(--danger);
+  background: #fff3f0;
+  color: var(--danger);
+}

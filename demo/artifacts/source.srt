@@ -1,0 +1,9 @@
+﻿1
+00:00:00,000 --> 00:00:06,340
+This is a short authorized demo
+video for the subtitle pipeline.
+
+2
+00:00:06,340 --> 00:00:10,340
+The program will create subtitles
+and render them.

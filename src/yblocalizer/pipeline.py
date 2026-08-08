@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 import threading
-
+from .cancellation import CancellationRequested, _cancellation_requested as _shared_cancellation_requested
 from .download import download_with_ytdlp, import_local_video
 from .media import extract_audio
 from .models import VideoJob, save_segments
@@ -22,7 +22,7 @@ from .util import ensure_rights_confirmed, timestamp_id
 LogFn = Callable[[str], None]
 
 # 全局中断标志
-_cancellation_requested = threading.Event()
+_cancellation_requested = _shared_cancellation_requested
 
 
 def request_cancellation() -> None:
@@ -62,11 +62,18 @@ class PipelineOptions:
     i_have_rights: bool = False
     require_reuse_allowed: bool = False
     cookies_from_browser: str | None = None
+    cookies_file: str | None = None
     max_seconds: int | None = None
     subtitle_source: str = "auto"
     ocr_fallback_to_audio: bool = True
     whisper_model_size: str = "small"
     source_language: str | None = None
+    beam_size: int = 5
+    ocr_interval: float = 1.0
+    ocr_crop_ratio: float = 0.30
+    ocr_min_chars: int = 3
+    subtitle_margin_ratio: float = 0.055
+    render_crf: int = 20
     device: str = "cpu"
     compute_type: str = "int8"
     translator: str = "deepseek"
@@ -99,7 +106,60 @@ class PipelineResult:
     rendered_video: Path
 
 
-def run_pipeline(options: PipelineOptions, log: LogFn | None = None) -> PipelineResult:
+def _estimate_audio_offset(audio_segments: list, ocr_segments: list) -> float | None:
+    """Estimate the global audio-subtitle time offset using OCR anchors.
+
+    OCR timestamps come from video frames (accurate), Whisper timestamps may
+    drift. Text-match each OCR cue to the closest audio cue, keep only
+    high-confidence matches, then use the median of the inlier time
+    differences as the correction offset.
+    """
+    if not audio_segments or not ocr_segments:
+        return None
+    from difflib import SequenceMatcher
+
+    def clean(text: str) -> str:
+        import re
+        return re.sub(r"[^a-z0-9\s]", "", text.lower()).strip()
+
+    diffs: list[float] = []
+    for ocr in ocr_segments:
+        ocr_text = clean(ocr.text)
+        if len(ocr_text) < 6:
+            continue
+        best = None
+        best_score = 0.0
+        for audio in audio_segments:
+            score = SequenceMatcher(None, ocr_text, clean(audio.text)).ratio()
+            if score > best_score:
+                best_score = score
+                best = audio
+        if best is not None and best_score >= 0.75:
+            diffs.append(best.start - ocr.start)
+    if len(diffs) < 2:
+        return None
+    diffs.sort()
+    median = diffs[len(diffs) // 2]
+    # 剔除与中位数相差过大的离群匹配（OCR 残片误配），只保留一致的核心样本
+    core = [d for d in diffs if abs(d - median) <= 1.5]
+    if len(core) < 2:
+        return None
+    core.sort()
+    return core[len(core) // 2]
+
+
+def _shift_segments(segments: list, offset: float) -> None:
+    """Shift all segment times by ``offset`` seconds (in place)."""
+    for segment in segments:
+        segment.start = max(0.0, round(segment.start - offset, 2))
+        segment.end = max(0.1, round(segment.end - offset, 2))
+
+
+def run_pipeline(
+    options: PipelineOptions,
+    log: LogFn | None = None,
+    progress: Callable[[float], None] | None = None,
+) -> PipelineResult:
     logger = log or (lambda message: print(message, flush=True))
     ensure_rights_confirmed(options.i_have_rights)
     work_dir = options.output_dir / timestamp_id()
@@ -118,6 +178,8 @@ def run_pipeline(options: PipelineOptions, log: LogFn | None = None) -> Pipeline
                 max_seconds=options.max_seconds,
                 require_reuse_allowed=options.require_reuse_allowed,
                 cookies_from_browser=options.cookies_from_browser,
+                cookies_file=options.cookies_file,
+                progress=progress,
             )
             if job.license:
                 logger(f"YouTube license: {job.license}")
@@ -134,7 +196,10 @@ def run_pipeline(options: PipelineOptions, log: LogFn | None = None) -> Pipeline
             logger(f"YouTube cover: {job.thumbnail_path}")
         elif job.thumbnail_url:
             logger("YouTube cover URL was found, but the cover image could not be downloaded.")
-        transcription_prompt = _build_transcription_prompt(options.title or job.title, job.description)
+        # 注意：不要给 whisper 传 initial_prompt！实测 initial_prompt 会导致
+        # faster-whisper 段时间戳系统性提前（最多 10-15 秒）且长段粘连吞掉静音，
+        # 使字幕在无语音的片段里提前出现。正确时间轴优先于专名提示。
+        transcription_prompt = None
 
         if options.subtitle_source == "ocr":
             logger("2/5 Skipping audio extraction; OCR subtitle mode is enabled.")
@@ -151,6 +216,7 @@ def run_pipeline(options: PipelineOptions, log: LogFn | None = None) -> Pipeline
         source_segment_items = []
         if options.subtitle_source == "merged":
             logger("3/5 Merged subtitle mode: transcribing audio and reading on-screen text with OCR...")
+            logger("首次使用会自动下载 Whisper 模型（约 500MB），需要联网，请耐心等待；后续会使用本地缓存。")
             if job.audio is None:
                 raise RuntimeError("Audio was not extracted.")
             audio_segments_json = work_dir / "segments.audio.json"
@@ -166,6 +232,7 @@ def run_pipeline(options: PipelineOptions, log: LogFn | None = None) -> Pipeline
                 device=options.device,
                 compute_type=options.compute_type,
                 initial_prompt=transcription_prompt,
+                beam_size=options.beam_size,
                 log=logger,
             )
             logger(f"Audio subtitle lines: {len(audio_segment_items)}")
@@ -175,12 +242,31 @@ def run_pipeline(options: PipelineOptions, log: LogFn | None = None) -> Pipeline
                     work_dir=work_dir,
                     segments_json=ocr_segments_json,
                     srt_path=ocr_srt,
+                    interval_seconds=max(0.2, options.ocr_interval),
+                    crop_bottom_ratio=max(0.05, min(1.0, options.ocr_crop_ratio)),
+                    min_chars=max(1, options.ocr_min_chars),
                 )
                 logger(f"OCR subtitle lines: {len(ocr_segment_items)}")
             except Exception as exc:
                 logger(f"OCR subtitle reading failed: {exc}")
                 ocr_segment_items = []
             used_ocr_subtitles = bool(ocr_segment_items)
+            if audio_segment_items and ocr_segment_items:
+                # 用画面 OCR 时间戳作为锚点，自动校正音频字幕的整体时间偏移
+                # 注意：仅校正「较小的系统性误差」（Whisper 常见 0.1~3s）。
+                # 偏移过大说明素材本身音画不同步，跟随画面字幕反而会出错，跳过并提示。
+                offset = _estimate_audio_offset(audio_segment_items, ocr_segment_items)
+                if offset is not None and 0.12 <= abs(offset) <= 3.0:
+                    _shift_segments(audio_segment_items, offset)
+                    logger(f"Detected audio-subtitle time offset {offset:+.2f}s; auto-corrected using OCR anchors.")
+                elif offset is not None and abs(offset) > 3.0:
+                    logger(
+                        f"Detected a large audio/OCR time mismatch ({offset:+.2f}s); "
+                        "the source video itself may be out of sync. Skipping auto-correction; "
+                        "use manual alignment in the subtitle page if needed."
+                    )
+                else:
+                    logger("OCR anchors found; audio-subtitle timing is within tolerance, no shift needed.")
             source_segment_items = merge_audio_ocr_segments(audio_segment_items, ocr_segment_items)
             save_segments(source_segments, source_segment_items)
             write_srt(source_srt, source_segment_items, display_mode="source")
@@ -193,6 +279,9 @@ def run_pipeline(options: PipelineOptions, log: LogFn | None = None) -> Pipeline
                     work_dir=work_dir,
                     segments_json=source_segments,
                     srt_path=source_srt,
+                    interval_seconds=max(0.2, options.ocr_interval),
+                    crop_bottom_ratio=max(0.05, min(1.0, options.ocr_crop_ratio)),
+                    min_chars=max(1, options.ocr_min_chars),
                 )
                 used_ocr_subtitles = True
                 logger(f"OCR subtitle lines: {len(source_segment_items)}")
@@ -245,6 +334,9 @@ def run_pipeline(options: PipelineOptions, log: LogFn | None = None) -> Pipeline
                             work_dir=work_dir,
                             segments_json=source_segments,
                             srt_path=source_srt,
+                            interval_seconds=max(0.2, options.ocr_interval),
+                            crop_bottom_ratio=max(0.05, min(1.0, options.ocr_crop_ratio)),
+                            min_chars=max(1, options.ocr_min_chars),
                         )
                         used_ocr_subtitles = True
                         logger(f"OCR subtitle lines: {len(source_segment_items)}")
@@ -326,10 +418,8 @@ def run_pipeline(options: PipelineOptions, log: LogFn | None = None) -> Pipeline
 
         logger("5/5 Rendering hard subtitles with ffmpeg...")
         check_cancelled()
-        render_margin_v = options.subtitle_margin_v
         if used_ocr_subtitles:
-            render_margin_v = max(render_margin_v, 110)
-            logger(f"OCR mode: raising Chinese subtitles with MarginV={render_margin_v} to avoid the original English captions.")
+            logger("OCR mode: raising Chinese subtitles above the original English captions.")
         rendered = burn_subtitles(
             job.raw_video,
             translated_srt,
@@ -340,7 +430,9 @@ def run_pipeline(options: PipelineOptions, log: LogFn | None = None) -> Pipeline
             outline_color=options.subtitle_outline_color,
             outline=options.subtitle_outline,
             shadow=options.subtitle_shadow,
-            margin_v=render_margin_v,
+            raised_margin=used_ocr_subtitles,
+            crf=options.render_crf,
+            margin_ratio=options.subtitle_margin_ratio,
         )
         job.rendered_video = rendered
         logger(f"Rendered video: {rendered}")
@@ -375,9 +467,11 @@ def run_pipeline(options: PipelineOptions, log: LogFn | None = None) -> Pipeline
             translated_srt=translated_srt,
             rendered_video=rendered,
         )
-    except CancellationError:
+    except (CancellationError, CancellationRequested) as exc:
         logger("\n任务已被用户中断。")
-        raise
+        if isinstance(exc, CancellationError):
+            raise
+        raise CancellationError(str(exc)) from exc
     finally:
         # 无论成功还是中断，都重置标志
         reset_cancellation()

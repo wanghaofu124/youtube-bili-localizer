@@ -185,11 +185,12 @@ def _correct_source_chat_provider(
         )
         context_window = _context_window(segments, batch_start=start, batch_count=len(batch), radius=8)
         prompt = (
-            "Correct these numbered English source subtitle lines before translation.\n"
+            "Correct these numbered source subtitle lines before translation.\n"
             "The text may contain ASR mistakes from speech, OCR text from the video, or both. "
             "Use the full transcript, nearby lines, video metadata, and on-screen text hints to fix obvious "
             "misheard words, names, negations, numbers, units, and domain terms.\n"
-            "Return English source subtitles only. Do not translate to Chinese. Preserve the speaker's meaning, "
+            "Return the corrected subtitles in the SAME language as the input text; do NOT translate them "
+            "into English or any other language. Preserve the speaker's meaning, "
             "tone, and timing. Keep each line concise enough for subtitles. Do not invent unsupported facts.\n"
             "If an ASR line ends with an ellipsis or cuts off after a verb, complete only the immediate missing "
             "object when it is strongly supported by metadata, nearby transcript, or on-screen text.\n"
@@ -210,7 +211,7 @@ def _correct_source_chat_provider(
                     {
                         "role": "system",
                         "content": (
-                            "You are a meticulous English subtitle transcript editor. "
+                            "You are a meticulous subtitle transcript editor. "
                             "You correct ASR/OCR errors using audiovisual context while preserving line count."
                         ),
                     },
@@ -390,7 +391,7 @@ def _translate_chat_provider(
                 "Keep each translation concise enough for on-screen subtitles. Prefer natural Simplified Chinese. "
                 "Prefer wording that feels natural to Bilibili viewers; avoid stiff literal calques when a common "
                 "Chinese expression is clearer.\n"
-                "Keep names, brands, units, and special terms consistent. If an English OCR line is slightly noisy, "
+                "Keep names, brands, units, and special terms consistent. If an OCR line is slightly noisy, "
                 "infer the most likely sentence from context instead of copying the noise.\n"
                 "Some lines may contain both 'Speech:' and 'On-screen text:'. Treat these labels as source hints: "
                 "merge duplicate meaning, preserve useful screen-text jokes or role labels, and output natural Chinese "
@@ -444,7 +445,9 @@ def _translate_chat_provider(
 
 
 def _translation_review_enabled() -> bool:
-    value = os.getenv("YB_TRANSLATION_REVIEW", "1").strip().lower()
+    # 默认关闭：复审会为每批字幕多一次 LLM 调用（翻倍翻译成本）。
+    # 需要更精细的翻译时设置 YB_TRANSLATION_REVIEW=1 开启。
+    value = os.getenv("YB_TRANSLATION_REVIEW", "0").strip().lower()
     return value not in {"0", "false", "no", "off"}
 
 

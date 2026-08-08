@@ -8,6 +8,7 @@ __pycache__/
 .playwright/
 build/
 dist/
+*.spec
 *.egg-info/
 data/
 outputs/
@@ -16,6 +17,14 @@ demo/**/*.mp4
 demo/**/*.wav
 demo/**/*.m4a
 demo/**/*.mov
+!demo/authorized-demo-10s.mp4
+!demo/README.md
+!demo/artifacts/
+!demo/artifacts/**
+benchmarks/runs/
 *.log
 .DS_Store
 Thumbs.db
+frontend/node_modules/
+frontend/dist/
+frontend/.preview.png

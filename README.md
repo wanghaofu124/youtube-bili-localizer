@@ -1,106 +1,141 @@
-# YouTube Bili Localizer
+# YouTube 视频本地化工具（YouTube Bili Localizer）
 
-一个用于授权视频本地化的桌面工具：获取 YouTube 或本地视频素材，自动转写字幕、翻译成中文、压制硬字幕，并辅助打开 B 站创作中心填写投稿信息。
+面向**已获授权视频**的 Python 本地化工具：将本地文件或授权 URL 转为中文字幕硬字幕视频，并在人工确认前辅助填写 B 站投稿信息。
 
-> 只处理你拥有版权、已获得作者明确授权，或许可证允许下载、改编和转载的视频。本项目不会绕过 YouTube、B 站或任何平台的登录、验证码、风控和版权限制。
+> 仅处理你拥有版权、已取得明确授权或许可证允许下载、改编与转载的素材。本项目不绕过登录、验证码、风控或版权限制；B 站流程不会自动点击“立即投稿”。
 
-## 详细教程
+## 演示与能力
 
-第一次使用请先看这里：
+仓库内提供一段已授权的 10 秒输入样例：[`demo/authorized-demo-10s.mp4`](demo/authorized-demo-10s.mp4)。运行一次本地 demo 后，可在 `demo/artifacts/` 查看生成的源字幕、中文字幕和硬字幕成片。
 
-[详细使用教程](docs/使用教程.md)
+![授权样例的中文字幕硬字幕输出](demo/artifacts/preview.png)
 
-教程包含安装、API Key 配置、GUI 全流程、CUDA、字幕模式、B 站发布辅助、命令行示例和常见问题。
+```mermaid
+flowchart LR
+    A[授权 URL / 本地视频] --> B[yt-dlp 导入或本地复制]
+    B --> C[faster-whisper 音频转写]
+    B --> D[OCR 画面文字]
+    C --> E[时间轴合并与字幕校对]
+    D --> E
+    E --> F[LLM 上下文翻译]
+    F --> G[SRT / 双语排版]
+    G --> H[FFmpeg 硬字幕渲染]
+    H --> I[Playwright 投稿信息辅助]
+```
 
-## 功能
+- URL 或本地文件输入；`yt-dlp` 支持读取用户已登录浏览器的 cookies（不会绕过平台验证）。
+- `faster-whisper` 支持 CPU、CUDA 和可配置精度；OCR 可识别画面内英文字幕与信息标签。
+- 音频/OCR 可分别使用，或按时间轴合并；转写、翻译和输出均保留可检查的 JSON/SRT 中间产物。
+- OpenAI / DeepSeek 可进行源字幕校对、上下文分批翻译和投稿元数据生成。
+- 支持中文、原文、双语字幕，动态换行、字体、描边、阴影和位置配置。
+- 图形工作台（WebView 界面）：素材、处理、字幕精修、视频修改（删除/保留/静音/导出/重排）、发布辅助、任务历史；另保留 CLI。
+- 字幕时间轴精修与视频片段级编辑均自动保持字幕对齐，处理结果（转写/OCR/翻译对照）实时可见。
 
-- 使用 `yt-dlp` 获取授权视频素材，支持读取浏览器 cookies。
-- 使用 `faster-whisper` 从音频转写字幕，支持 CPU、CUDA 或自动降级。
-- 支持音频字幕、画面 OCR 字幕，以及“音频 + OCR 合并翻译”。
-- 支持 `none` 调试翻译器，以及 `openai` / `deepseek` 生成中文字幕。
-- 翻译前可用模型校对源字幕，修正明显 ASR/OCR 错误、专有名词和上下文问题。
-- 支持中文单语、原文 + 中文、中英双语字幕显示。
-- 可设置字体、字号、字幕颜色、描边、阴影和位置。
-- 使用 `ffmpeg` 将 `.srt` 字幕压制进视频。
-- 使用 Playwright 辅助打开 B 站创作中心、上传视频、填写标题、简介、标签和封面，并在提交前停住等待人工确认。
-- 提供 Tkinter 图形界面，支持输出目录占用查看和选择性清理。
+## 5 分钟跑通
 
-## 快速安装
+### 0. 直接运行（推荐）
+
+双击 `dist\YouTubeBiliLocalizerWorkbenchRestore2\YouTubeBiliLocalizerWorkbenchRestore2.exe`，按教程完成首次配置（DeepSeek Key、YouTube cookies.txt），粘贴链接或导入本地视频即可处理。完整图文说明见[使用教程](docs/使用教程.md)。
+
+### 1. 源码安装
 
 ```powershell
 cd D:\codex\youtube-bili-localizer
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-pip install -e .
+pip install -e ".[dev]"
 playwright install chromium
 ```
 
-还需要安装 `ffmpeg`，并确保 `ffmpeg` 在系统 `PATH` 中。
-
-## API Key
-
-复制示例配置：
+另需安装并配置 `ffmpeg` 到 `PATH`。复制 `.env.example` 为 `.env`，填写一个翻译服务的 API Key：
 
 ```powershell
 copy .env.example .env
 ```
 
-按需填写：
+### 2. 处理授权样例
 
-```env
-OPENAI_API_KEY=
-OPENAI_TRANSLATE_MODEL=gpt-4.1-mini
-
-DEEPSEEK_API_KEY=
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_TRANSLATE_MODEL=deepseek-v4-flash
-```
-
-`.env` 已加入 `.gitignore`，不要把真实密钥提交到 GitHub。
-
-## 启动 GUI
-
-无终端窗口启动：
+CPU 通用配置：
 
 ```powershell
-.\launch_gui.vbs
+yblocalizer process --file demo\authorized-demo-10s.mp4 --i-have-rights --translator deepseek --subtitle-source audio --device cpu --compute-type int8 --output-dir outputs\demo
 ```
 
-调试模式启动：
+有 NVIDIA CUDA 环境时可改用：`--device cuda --compute-type float16`。成功后目录结构如下：
+
+```text
+outputs/demo/job-*/
+├── source.srt                 # 英文源字幕
+├── segments.source.json       # 带时间轴的源分段
+├── zh.srt                     # 中文或双语字幕
+├── segments.translated.json   # 翻译后的分段
+├── publish_metadata.json      # 建议标题和标签
+└── rendered.mp4               # 最终硬字幕视频
+```
+
+完整的 GUI、URL 输入、CUDA、OCR、字幕样式和投稿辅助说明请看[使用教程](docs/使用教程.md)。
+
+## Windows EXE 打包
+
+工作台 EXE 使用 PyInstaller 构建：
 
 ```powershell
-.\launch_gui_debug.bat
+python -m PyInstaller --noconfirm YouTubeBiliLocalizerWorkbenchRestore2.spec
 ```
 
-也可以直接运行：
+产物位于 `dist\YouTubeBiliLocalizerWorkbenchRestore2\`。目标机器仍需安装 `ffmpeg`；OCR 模式另需安装 Tesseract；YouTube 下载建议安装 Node.js。Whisper 模型首次转写时自动下载。
+
+> **数据位置**：运行时的配置（`.env`）、任务输出、字幕、浏览器 Profile 与任务历史（SQLite）都保存在用户数据目录 `C:\Users\<用户名>\AppData\Roaming\YouTubeBiliLocalizer\`，与 EXE 安装目录分离——升级或重建 EXE 不会删除你的数据。
+
+## 工作台前端
+
+暖色 React 工作台在 [`frontend/`](frontend/) 实现（Vite + React，由本地 HTTP 桥 `yblocalizer.workbench_api` 提供 API）。包含视频预览、真实下载进度、字幕时间轴编辑、逐条字幕时间/文字/删除编辑、视频片段级修改（删除/保留/静音/导出/重排）、处理结果实时对照、B 站投稿辅助状态、任务历史与输出文件管理。前端构建：`cd frontend && npm run build`。
+
+## 开发验证与性能基准
 
 ```powershell
-python -m yblocalizer.gui
+# CI 同款：不下载媒体、不加载模型、不调用 API、不启动浏览器
+python -m pytest -q
+python -m compileall -q src
+
+# 真实本机基准：会加载模型并调用 .env 配置的翻译服务
+python scripts/benchmark_demo.py --device cpu --compute-type int8 --export-demo
+python scripts/benchmark_demo.py --device cuda --compute-type float16
 ```
 
-## 命令行示例
+基准会对生产流水线的导入、音频提取、转写、字幕审校、翻译、投稿元数据生成及渲染逐阶段计时，并输出版本化 JSON 到 `benchmarks/runs/`。
 
-处理授权 YouTube 链接：
+### 已记录的本机基准
 
-```powershell
-python -m yblocalizer process --url "https://www.youtube.com/watch?v=VIDEO_ID" --i-have-rights --require-reuse-allowed --max-seconds 60 --translator deepseek
-```
+同一 10 秒、1280×720 授权样例，以 `small` Whisper、DeepSeek 翻译与 FFmpeg 渲染完整运行。端到端数据包含网络翻译和元数据生成延迟，不能泛化为其他视频或网络环境的性能承诺。
 
-处理本地视频：
+| 配置 | 转写 | 翻译 | 端到端 |
+| --- | ---: | ---: | ---: |
+| CPU / int8 | 36.085 秒 | 28.361 秒 | 74.492 秒 |
+| RTX 5070 CUDA / float16 | 11.426 秒 | 21.656 秒 | 44.814 秒 |
 
-```powershell
-python -m yblocalizer process --file "D:\path\input.mp4" --i-have-rights --translator deepseek
-```
+完整配置、阶段耗时与产物摘要见 [CPU 记录](benchmarks/cpu.json) 和 [CUDA 记录](benchmarks/cuda.json)。
 
-辅助发布到 B 站：
+GitHub Actions 在 Ubuntu 的 Python 3.10 与 3.12 上运行编译检查和 mock 测试。测试覆盖字幕时间轴与排版、OCR/音频合并、翻译行数修复、中文结果验证、文案模板、输出目录安全清理、CLI 参数映射和完整流水线的 mock 成功/失败路径。
 
-```powershell
-python -m yblocalizer publish --video "outputs\job-xxx\rendered.mp4" --title "标题" --description "已获授权转载/本地化。" --source-url "https://www.youtube.com/watch?v=VIDEO_ID"
-```
+## 架构与关键取舍
 
-更多说明见 [详细使用教程](docs/使用教程.md)。
+| 设计 | 原因 |
+| --- | --- |
+| 重型依赖惰性导入 | CLI 帮助、测试和非模型功能不需要下载或加载 Whisper / Playwright。 |
+| 音频与 OCR 双路径 | 语音转写覆盖对白，OCR 补足画面标签与已烧录字幕；合并时按时间重叠与文本相似度去重。 |
+| 上下文分批翻译 | 控制单次 API 请求大小，同时在批次前后提供上下文，避免逐句直译。 |
+| 动态字幕排版 | 根据语种、可用时长和字符数调整换行，限制屏幕行数以提升可读性。 |
+| 人工确认投稿 | Playwright 仅协助上传和填写；用户核对分类、版权声明和内容后手动提交。 |
 
-## 免责声明
+## 面试材料
 
-请只在合法授权范围内使用本工具。使用者需要自行确认素材版权、转载授权、平台规则和最终发布内容。本项目不提供规避平台限制、批量搬运未授权内容或绕过安全机制的能力。
+> 开发 Python 视频本地化工具，提供 CLI 与桌面 GUI，实现“授权 URL/本地视频 → faster-whisper 转写、OCR 画面文字提取与时间轴合并 → LLM 上下文翻译审校 → SRT/双语字幕 → FFmpeg 硬字幕渲染”的端到端流程；在 RTX 5070、Whisper small / float16 配置下，完成 10 秒授权样例总耗时 44.814 秒，并以 19 项 mock 测试和 GitHub Actions 验证关键失败路径。基于 Playwright 实现 B 站创作中心的投稿信息填写辅助，提交操作保留人工确认。
+
+60 秒讲解顺序：问题场景（授权素材本地化）→ 架构（双字幕来源和端到端产物）→ 难点（时间轴合并、翻译行数/可读性）→ 工程保障（mock 测试、基准 JSON、CI）→ 合规边界（人工提交与授权确认）。
+
+## 公开资产与安全
+
+- 仅 `demo/authorized-demo-10s.mp4` 与从它生成的 `demo/artifacts/` 可作为公开演示媒体。
+- `outputs/`、浏览器诊断截图、cookies、Profile、API 响应、日志及无明确授权素材一律忽略，禁止提交。
+- `.env` 已忽略；请勿提交 API Key。有关本地开发与基准更新方式见 [benchmarks/README.md](benchmarks/README.md)。

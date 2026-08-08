@@ -7,6 +7,7 @@ import os
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -1369,6 +1370,8 @@ class LocalizerApp(tk.Tk):
 
 
 def main() -> None:
+    if getattr(sys, "frozen", False):
+        os.chdir(Path(sys.executable).resolve().parent)
     app = LocalizerApp()
     app.mainloop()
 

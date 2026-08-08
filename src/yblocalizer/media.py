@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .cancellation import is_cancellation_requested
 from .util import require_command, run
 
 
@@ -24,6 +25,7 @@ def extract_audio(video_path: Path, output_path: Path | None = None) -> Path:
             "-c:a",
             "pcm_s16le",
             str(output_path),
-        ]
+        ],
+        cancel_check=is_cancellation_requested,
     )
     return output_path

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from argparse import ArgumentParser, Namespace
+import os
 from pathlib import Path
+import sys
 
 try:
     from dotenv import load_dotenv
@@ -20,6 +22,8 @@ from .util import ensure_rights_confirmed, timestamp_id
 
 
 def main() -> None:
+    if getattr(sys, "frozen", False):
+        os.chdir(Path(sys.executable).resolve().parent)
     if load_dotenv:
         load_dotenv(Path(".env"))
     parser = build_parser()

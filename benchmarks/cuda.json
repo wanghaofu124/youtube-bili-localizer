@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "started_at": "2026-08-02T13:38:00.857952+00:00",
+  "environment": {
+    "os": "Windows-11-10.0.22631-SP0",
+    "python": "3.14.0",
+    "cpu": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+    "gpu": ["NVIDIA GeForce RTX 5070, 591.86, 12227 MiB"],
+    "ffmpeg": "ffmpeg version 8.1.1-full_build-www.gyan.dev"
+  },
+  "input": {
+    "path": "demo/authorized-demo-10s.mp4",
+    "bytes": 109311,
+    "duration_seconds": 10.0
+  },
+  "configuration": {
+    "device": "cuda",
+    "compute_type": "float16",
+    "whisper_model_size": "small",
+    "translator": "deepseek",
+    "translate_model": null,
+    "subtitle_source": "audio"
+  },
+  "status": "success",
+  "stage_seconds": {
+    "prepare_source": 0.003,
+    "extract_audio": 0.122,
+    "transcribe": 11.426,
+    "review_source": 3.986,
+    "translate": 21.656,
+    "publish_metadata": 6.745,
+    "render": 0.46
+  },
+  "total_seconds": 44.814,
+  "outputs": {
+    "source_srt_bytes": 189,
+    "translated_srt_bytes": 164,
+    "rendered_video_bytes": 133070
+  }
+}

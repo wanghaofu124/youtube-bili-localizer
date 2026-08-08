@@ -1,0 +1,107 @@
+/* Generated artwork: small contextual accents, never a substitute for real controls. */
+.material-view > header {
+  position: relative;
+  min-height: 118px;
+  padding-right: 210px;
+}
+
+.material-view > header::after {
+  position: absolute;
+  top: 8px;
+  right: 14px;
+  width: 178px;
+  height: 100px;
+  content: "";
+  opacity: 0.72;
+  background: url("/images/studio-workbench.png") center / cover no-repeat;
+  mix-blend-mode: multiply;
+  pointer-events: none;
+}
+
+.empty-editor::before {
+  width: 174px;
+  height: 90px;
+  content: "";
+  opacity: 0.9;
+  background: url("/images/subtitle-flow.png") center / cover no-repeat;
+}
+
+.subtitle-editor .empty-editor {
+  min-height: 198px;
+  display: grid;
+  grid-template-columns: 174px minmax(260px, 430px);
+  grid-template-rows: auto auto;
+  column-gap: 24px;
+  row-gap: 4px;
+  align-content: center;
+  justify-content: center;
+  text-align: left;
+}
+
+.subtitle-editor .empty-editor::before {
+  grid-column: 1;
+  grid-row: 1 / 3;
+}
+
+.subtitle-editor .empty-editor b {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.subtitle-editor .empty-editor span {
+  grid-column: 2;
+  grid-row: 2;
+}
+
+.publish-warning {
+  min-height: 118px;
+  padding-right: 190px;
+  background-image: url("/images/publish-review.png");
+  background-position: right 12px center;
+  background-size: 162px auto;
+  background-repeat: no-repeat;
+}
+
+@media (max-width: 1180px) {
+  .material-view > header {
+    padding-right: 20px;
+  }
+
+  .material-view > header::after {
+    display: none;
+  }
+
+  .publish-warning {
+    min-height: 0;
+    padding-right: 10px;
+    background-image: none;
+  }
+
+  .subtitle-editor .empty-editor {
+    grid-template-columns: 150px minmax(220px, 1fr);
+  }
+
+  .empty-editor::before {
+    width: 150px;
+    height: 78px;
+  }
+}
+
+@media (max-width: 760px) {
+  .subtitle-editor .empty-editor {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto auto;
+    justify-items: center;
+    text-align: center;
+  }
+
+  .subtitle-editor .empty-editor::before,
+  .subtitle-editor .empty-editor b,
+  .subtitle-editor .empty-editor span {
+    grid-column: 1;
+  }
+
+  .subtitle-editor .empty-editor::before { grid-row: 1; }
+  .subtitle-editor .empty-editor b { grid-row: 2; }
+  .subtitle-editor .empty-editor span { grid-row: 3; }
+}

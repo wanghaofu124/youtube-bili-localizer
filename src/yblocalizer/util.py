@@ -7,6 +7,10 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+from typing import Callable
+
+from .cancellation import CancellationRequested
 
 
 def require_command(name: str) -> None:
@@ -34,12 +38,46 @@ def _discover_windows_command(name: str) -> Path | None:
     return matches[0] if matches else None
 
 
-def run(command: list[str], cwd: Path | None = None) -> None:
+def run(command: list[str], cwd: Path | None = None, cancel_check: Callable[[], bool] | None = None) -> None:
     printable = " ".join(command)
     print(f"$ {printable}")
-    completed = subprocess.run(command, cwd=cwd, text=True)
-    if completed.returncode != 0:
-        raise RuntimeError(f"Command failed with exit code {completed.returncode}: {printable}")
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+    process = subprocess.Popen(
+        command, cwd=cwd, text=True, errors="replace",
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        creationflags=creationflags,
+    )
+    output: list[str] = []
+    while True:
+        line = process.stdout.readline() if process.stdout else ""
+        if not line and process.poll() is not None:
+            break
+        if line:
+            output.append(line.rstrip())
+        if cancel_check and cancel_check():
+            _terminate_process_tree(process)
+            raise CancellationRequested("任务已被用户中断")
+    if process.returncode != 0:
+        tail = "\n".join(output[-40:])
+        raise RuntimeError(f"Command failed with exit code {process.returncode}: {printable}\n{tail}")
+
+
+def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    """Terminate only the known child command after the user presses cancel."""
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            check=False,
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=3)
 
 
 def slugify(value: str, fallback: str = "video") -> str:

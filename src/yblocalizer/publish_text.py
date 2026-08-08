@@ -1,8 +1,16 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 from string import Formatter
 import json
+import os
+
+
+def _custom_templates_file() -> Path:
+    data_dir = os.environ.get("YBLOCALIZER_DATA_DIR", "data")
+    path = Path(data_dir) / "custom_templates.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 ALLOWED_TEMPLATE_FIELDS = {"source", "custom_text"}
@@ -49,7 +57,7 @@ DEFAULT_TEMPLATES = {
     ),
 }
 
-CUSTOM_TEMPLATES_FILE = Path("data/custom_templates.json")
+CUSTOM_TEMPLATES_FILE = _custom_templates_file()
 
 
 def get_all_templates() -> dict[str, str]:
@@ -66,6 +74,7 @@ def build_bilibili_description(
     include_source_link: bool = True,
     custom_text: str = "",
     extra_lines: list[str] | None = None,
+    template_body: str | None = None,
 ) -> str:
     """
     构建B站发布文案。
@@ -76,14 +85,20 @@ def build_bilibili_description(
         include_source_link: 是否包含原视频链接
         custom_text: 自定义模板时的额外文本
         extra_lines: 额外追加的行（如标签、鸣谢等）
+        template_body: 可选的模板正文。传入时直接使用该正文作为模板，
+            不再按 template_name 查询已保存模板（用于「草稿」场景）。
     """
     source_text = source.strip() if include_source_link and source.strip() else "请在发布前补充"
-    
-    templates = get_all_templates()
-    template = templates.get(template_name)
-    if template is None:
-        template = DEFAULT_TEMPLATES["授权本地化"]
-    
+
+    if template_body is not None and str(template_body).strip():
+        validate_template(template_body)
+        template = template_body
+    else:
+        templates = get_all_templates()
+        template = templates.get(template_name)
+        if template is None:
+            template = DEFAULT_TEMPLATES["授权本地化"]
+
     description = _format_template(template, source=source_text, custom_text=custom_text).strip()
     
     # 确保原视频链接在文案中
