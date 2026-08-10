@@ -133,12 +133,6 @@ GitHub Actions 在 Ubuntu 的 Python 3.10 与 3.12 上运行编译检查和 mock
 | 动态字幕排版 | 根据语种、可用时长和字符数调整换行，限制屏幕行数以提升可读性。 |
 | 人工确认投稿 | Playwright 仅协助上传和填写；用户核对分类、版权声明和内容后手动提交。 |
 
-## 面试材料
-
-> 开发 Python 视频本地化工具，提供 CLI 与桌面 GUI，实现“授权 URL/本地视频 → faster-whisper 转写、OCR 画面文字提取与时间轴合并 → LLM 上下文翻译审校 → SRT/双语字幕 → FFmpeg 硬字幕渲染”的端到端流程；在 RTX 5070、Whisper small / float16 配置下，完成 10 秒授权样例总耗时 44.814 秒，并以 19 项 mock 测试和 GitHub Actions 验证关键失败路径。基于 Playwright 实现 B 站创作中心的投稿信息填写辅助，提交操作保留人工确认。
-
-60 秒讲解顺序：问题场景（授权素材本地化）→ 架构（双字幕来源和端到端产物）→ 难点（时间轴合并、翻译行数/可读性）→ 工程保障（mock 测试、基准 JSON、CI）→ 合规边界（人工提交与授权确认）。
-
 ## 公开资产与安全
 
 - 仅 `demo/authorized-demo-10s.mp4` 与从它生成的 `demo/artifacts/` 可作为公开演示媒体。
