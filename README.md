@@ -33,21 +33,26 @@ flowchart LR
 
 ## 5 分钟跑通
 
-### 0. 直接运行（推荐）
+### 0. 前置要求（Windows）
 
-双击 `dist\YouTubeBiliLocalizerWorkbenchRestore2\YouTubeBiliLocalizerWorkbenchRestore2.exe`，按教程完成首次配置（DeepSeek Key、YouTube cookies.txt），粘贴链接或导入本地视频即可处理。完整图文说明见[使用教程](docs/使用教程.md)。
+1. **Python 3.10+**：从 <https://www.python.org/downloads/> 安装，勾选 **Add python.exe to PATH**；
+2. **ffmpeg**：管理员 PowerShell 执行 `winget install Gyan.FFmpeg`，装完后重开终端（刷新 PATH）；
+3. **Node.js**（可选但强烈建议）：YouTube 视频流需要 JS 挑战求解；
+4. **Tesseract OCR**（可选，仅「画面字幕 OCR」需要）：`winget install UB-Mannheim.TesseractOCR`；
+5. **NVIDIA GPU**（可选）：有 CUDA 时可用 `--device cuda` 加速转写。
 
 ### 1. 源码安装
 
 ```powershell
-cd D:\codex\youtube-bili-localizer
+git clone https://github.com/wanghaofu124/youtube-bili-localizer.git
+cd youtube-bili-localizer
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 playwright install chromium
 ```
 
-另需安装并配置 `ffmpeg` 到 `PATH`。复制 `.env.example` 为 `.env`，填写一个翻译服务的 API Key：
+复制 `.env.example` 为 `.env`，填写一个翻译服务的 API Key：
 
 ```powershell
 copy .env.example .env
@@ -75,15 +80,15 @@ outputs/demo/job-*/
 
 完整的 GUI、URL 输入、CUDA、OCR、字幕样式和投稿辅助说明请看[使用教程](docs/使用教程.md)。
 
-## Windows EXE 打包
+## Windows EXE 打包（可选）
 
-工作台 EXE 使用 PyInstaller 构建：
+源码运行即可正常使用全部功能；如需免安装 EXE，用 PyInstaller 自行打包：
 
 ```powershell
-python -m PyInstaller --noconfirm YouTubeBiliLocalizerWorkbenchRestore2.spec
+powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 ```
 
-产物位于 `dist\YouTubeBiliLocalizerWorkbenchRestore2\`。目标机器仍需安装 `ffmpeg`；OCR 模式另需安装 Tesseract；YouTube 下载建议安装 Node.js。Whisper 模型首次转写时自动下载。
+产物位于 `dist\`（`YouTubeBiliLocalizer.exe` 为图形界面、`yblocalizer.exe` 为命令行）。目标机器仍需安装 `ffmpeg`；OCR 模式另需 Tesseract；YouTube 下载建议安装 Node.js。Whisper 模型首次转写时自动下载。
 
 > **数据位置**：运行时的配置（`.env`）、任务输出、字幕、浏览器 Profile 与任务历史（SQLite）都保存在用户数据目录 `C:\Users\<用户名>\AppData\Roaming\YouTubeBiliLocalizer\`，与 EXE 安装目录分离——升级或重建 EXE 不会删除你的数据。
 
