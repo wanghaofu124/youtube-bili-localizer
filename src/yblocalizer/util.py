@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from typing import Callable
 
@@ -48,15 +49,31 @@ def run(command: list[str], cwd: Path | None = None, cancel_check: Callable[[], 
         creationflags=creationflags,
     )
     output: list[str] = []
+    cancelled = False
+
+    def _watch_cancel() -> None:
+        nonlocal cancelled
+        while process.poll() is None:
+            if cancel_check and cancel_check():
+                cancelled = True
+                _terminate_process_tree(process)
+                return
+            time.sleep(0.1)
+
+    if cancel_check:
+        threading.Thread(target=_watch_cancel, daemon=True).start()
+
     while True:
-        line = process.stdout.readline() if process.stdout else ""
+        try:
+            line = process.stdout.readline() if process.stdout else ""
+        except (OSError, ValueError):
+            line = ""
         if not line and process.poll() is not None:
             break
         if line:
             output.append(line.rstrip())
-        if cancel_check and cancel_check():
-            _terminate_process_tree(process)
-            raise CancellationRequested("任务已被用户中断")
+    if cancelled:
+        raise CancellationRequested("任务已被用户中断")
     if process.returncode != 0:
         tail = "\n".join(output[-40:])
         raise RuntimeError(f"Command failed with exit code {process.returncode}: {printable}\n{tail}")
