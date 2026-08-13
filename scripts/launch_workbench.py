@@ -122,14 +122,18 @@ class DesktopBridge:
 
 
 def main() -> int:
-    server = build_server(ASSET_ROOT / "frontend" / "dist", "127.0.0.1", 8765)
+    # Use an OS-assigned loopback port.  A user may still have an older EXE
+    # open while trying a new release; a fixed port would make the new window
+    # silently attach to that older local service instead of its own backend.
+    server = build_server(ASSET_ROOT / "frontend" / "dist", "127.0.0.1", 0)
+    host, port = server.server_address[:2]
     worker = threading.Thread(target=server.serve_forever, daemon=True, name="workbench-api")
     worker.start()
     try:
         bridge = DesktopBridge(server)
         bridge._window = webview.create_window(
             "YouTube Bili Localizer",
-            "http://127.0.0.1:8765",
+            f"http://{host}:{port}",
             width=1440,
             height=920,
             min_size=(1024, 720),

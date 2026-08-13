@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from yblocalizer.workbench_api import DEMO_VIDEO, DemoJob, Material, WorkbenchHandler, WorkbenchJobs, _upsert_env, _resolve_output_root, _safe_options, public_path, stage_from_log
+from yblocalizer.workbench_api import DEMO_VIDEO, DemoJob, Material, WorkbenchHandler, WorkbenchJobs, _upsert_env, _resolve_output_root, _safe_options, build_server, public_path, stage_from_log
 
 
 def test_workbench_maps_existing_pipeline_logs_to_stages() -> None:
@@ -102,3 +102,62 @@ def test_readiness_reports_cpu_float16_and_profile_conflict(monkeypatch: pytest.
     assert result["ready"] is False
     assert any("float16" in issue for issue in result["issues"])
     assert any("B 站" in issue for issue in result["issues"])
+
+
+def test_history_defaults_to_current_output_root_and_hides_private_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    current_root = tmp_path / "current"
+    current_job = current_root / "job-a"
+    old_job = tmp_path / "old" / "job-b"
+    current_job.mkdir(parents=True)
+    old_job.mkdir(parents=True)
+    records = [
+        {"id": "current", "title": "Current", "status": "completed", "stage": "Done", "progress": 100,
+         "error": None, "output_dir": str(current_job), "rendered_video": str(current_job / "rendered.mp4"),
+         "options": {"cookies_file": "secret.txt"}, "created_at": 1, "finished_at": 2},
+        {"id": "old", "title": "Old", "status": "completed", "stage": "Done", "progress": 100,
+         "error": None, "output_dir": str(old_job), "rendered_video": None,
+         "options": {"cookies_file": "old-secret.txt"}, "created_at": 1, "finished_at": 2},
+    ]
+    handler = object.__new__(WorkbenchHandler)
+    monkeypatch.setattr("yblocalizer.workbench_api.job_db.list_jobs", lambda limit=None: records)
+    monkeypatch.setattr("yblocalizer.workbench_api._resolve_output_root", lambda value: Path(value))
+
+    visible = handler._history_records("current", str(current_root))
+
+    assert [item["id"] for item in visible] == ["current"]
+    assert "options" not in visible[0]
+    assert visible[0]["output_exists"] is True
+    assert visible[0]["rendered_exists"] is False
+
+
+def test_history_current_scope_is_used_for_server_side_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "output"
+    selected = root / "job"
+    selected.mkdir(parents=True)
+    records = [{"id": "visible", "output_dir": str(selected)}]
+    handler = object.__new__(WorkbenchHandler)
+    monkeypatch.setattr("yblocalizer.workbench_api.job_db.list_jobs", lambda limit=None: records)
+    monkeypatch.setattr("yblocalizer.workbench_api._resolve_output_root", lambda value: Path(value))
+    assert [item["id"] for item in handler._history_records("current", str(root), include_private=True)] == ["visible"]
+
+
+def test_diagnostics_reports_missing_tools_without_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    handler = object.__new__(WorkbenchHandler)
+    monkeypatch.setattr("yblocalizer.workbench_api.shutil.which", lambda command: "C:/tools/ffmpeg.exe" if command == "ffmpeg" else None)
+    result = handler._diagnostics()
+    assert result["ready"] is False
+    assert result["checks"][0]["available"] is True
+    assert all("C:/" not in item["message"] for item in result["checks"])
+
+
+def test_workbench_server_can_bind_an_ephemeral_loopback_port() -> None:
+    server = build_server(Path("frontend/dist"), "127.0.0.1", 0)
+    try:
+        assert server.server_address[0] == "127.0.0.1"
+        assert server.server_address[1] > 0
+    finally:
+        server.server_close()

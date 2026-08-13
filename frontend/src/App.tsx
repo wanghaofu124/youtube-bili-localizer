@@ -100,8 +100,17 @@ type HistoryJob = {
   error: string | null;
   output_dir: string | null;
   rendered_video: string | null;
+  output_exists: boolean;
+  rendered_exists: boolean;
   created_at: number | null;
   finished_at: number | null;
+};
+type Diagnostic = {
+  id: string;
+  label: string;
+  purpose: string;
+  available: boolean;
+  message: string;
 };
 
 const defaults: Options = {
@@ -276,6 +285,7 @@ function App() {
   const [online, setOnline] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [message, setMessage] = useState("正在连接本地服务…");
   const [metadata, setMetadata] = useState<{
@@ -323,6 +333,9 @@ function App() {
   }>({ status: "idle", message: "", logs: [], error: null, active: false });
   const [viewedTaskId, setViewedTaskId] = useState<string | null>(null);
   const [jobHistory, setJobHistory] = useState<HistoryJob[]>([]);
+  const [historyScope, setHistoryScope] = useState<"current" | "all">("current");
+  const [historyTotal, setHistoryTotal] = useState(0);
+  const [diagnostics, setDiagnostics] = useState<Diagnostic[]>([]);
   const [translationReady, setTranslationReady] = useState(true);
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const [cutStart, setCutStart] = useState("");
@@ -340,6 +353,9 @@ function App() {
     job?.status ?? "",
   );
   const dirty = history.length > 0;
+  const publishVideoReady = Boolean(
+    nativePublishToken || selectedPublishVideo || job?.result?.rendered_video,
+  );
   const savedTemplateBody =
     templates.find((item) => item.name === templateName)?.body ?? "";
   const templateDraftDirty = templateBody !== savedTemplateBody;
@@ -399,15 +415,49 @@ function App() {
     if (settings.cookies_file) {
       updateOptions("cookies_file", settings.cookies_file);
     }
+    if (settings.default_output_dir) {
+      setOptions((current) => current.output_dir === defaults.output_dir
+        ? { ...current, output_dir: settings.default_output_dir! }
+        : current);
+    }
     setCookiesFileValid(settings.cookies_file_valid ?? null);
     setApiKeyConfigured(Boolean(settings.deepseek_key_configured));
   };
   const loadJobHistory = async () => {
     try {
-      const response = await api<{ jobs: HistoryJob[] }>("/api/history/jobs?limit=50");
+      const query = new URLSearchParams({
+        limit: "50",
+        scope: historyScope,
+        output_dir: options.output_dir,
+      });
+      const response = await api<{ jobs: HistoryJob[]; total: number }>(`/api/history/jobs?${query}`);
       setJobHistory(response.jobs);
+      setHistoryTotal(response.total);
     } catch {
       /* history is best-effort */
+    }
+  };
+  const loadDiagnostics = async () => {
+    try {
+      const response = await api<{ checks: Diagnostic[] }>("/api/diagnostics");
+      setDiagnostics(response.checks);
+    } catch {
+      /* A local service error is already reported by the connection state. */
+    }
+  };
+  const clearHistory = async () => {
+    if (!historyTotal) return;
+    const scopeLabel = historyScope === "current" ? "当前输出目录" : "全部输出目录";
+    if (!window.confirm(`清除“${scopeLabel}”中的 ${historyTotal} 条任务记录吗？\n\n只删除历史列表记录，不会删除任何视频、字幕或输出文件。`)) return;
+    try {
+      const response = await api<{ message: string }>("/api/history/clear", {
+        method: "POST",
+        body: JSON.stringify({ confirmed: true, scope: historyScope, output_dir: options.output_dir }),
+      });
+      setMessage(response.message);
+      await loadJobHistory();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "清除任务历史失败");
     }
   };
   const openHistoryPath = async (path: string) => {
@@ -537,6 +587,7 @@ function App() {
       loadMaterials(),
       loadTemplates(),
       loadSettings(),
+      loadDiagnostics(),
     ])
       .then(() => {
         setOnline(true);
@@ -576,7 +627,7 @@ function App() {
       void loadJobHistory();
     }
     if (view === "publish") void loadPublishSession();
-  }, [view]);
+  }, [view, historyScope, options.output_dir]);
   useEffect(() => {
     if (!publishSession.active) return;
     const timer = window.setInterval(loadPublishSession, 1500);
@@ -1078,6 +1129,10 @@ function App() {
     }
   };
   const publishAssist = async () => {
+    if (!publishVideoReady) {
+      setMessage("请先选择当前任务成片、输出目录中的成片，或任意本地成片，再打开投稿辅助。");
+      return;
+    }
     if (
       !window.confirm(
         "将打开 B 站投稿页并辅助填写。不会自动点击投稿；请在页面中人工检查并提交。继续吗？",
@@ -1242,6 +1297,15 @@ function App() {
             去设置
           </button>
         </div>
+      )}
+      {diagnostics.some((check) => !check.available) && (
+        <section className="diagnostics-banner" aria-label="首次使用依赖检查">
+          <div>
+            <b>开始前还需安装 {diagnostics.filter((check) => !check.available).map((check) => check.label).join("、")}</b>
+            <span>这些本机工具用于音频、OCR 与字幕渲染；安装后重启工作台即可重新检测。</span>
+          </div>
+          <button className="text-button" onClick={() => setShortcutHelpOpen(true)}>查看说明</button>
+        </section>
       )}
       <div className="form-grid two">
         <label>
@@ -2241,7 +2305,10 @@ function App() {
         </div>
       )}
       <footer className="card-footer">
-        <button className="primary" onClick={publishAssist}>
+        <div className="publish-submit-hint">
+          {!publishVideoReady && <span>请先选择一份可投稿的成片。</span>}
+        </div>
+        <button className="primary" onClick={publishAssist} disabled={!publishVideoReady} title={!publishVideoReady ? "请先选择成片" : "打开 B 站投稿辅助"}>
           打开投稿辅助
         </button>
         <button className="danger" onClick={closePublishBrowser}>
@@ -2300,9 +2367,19 @@ function App() {
       </div>
       <section className="history-section">
         <header>
-          <b>任务历史</b>
-          <small>{jobHistory.length ? `最近 ${jobHistory.length} 条` : "暂无历史任务"}</small>
+          <div>
+            <b>任务历史</b>
+            <small>{historyTotal ? `${historyScope === "current" ? "当前输出目录" : "全部目录"} · ${historyTotal} 条` : "暂无历史任务"}</small>
+          </div>
+          <label className="history-scope">
+            范围
+            <select value={historyScope} onChange={(event) => setHistoryScope(event.target.value as "current" | "all") }>
+              <option value="current">当前输出目录</option>
+              <option value="all">全部历史</option>
+            </select>
+          </label>
           <button onClick={() => void loadJobHistory()}>刷新</button>
+          <button className="history-clear" onClick={() => void clearHistory()} disabled={!historyTotal}>清除记录</button>
         </header>
         {jobHistory.length > 0 && (
           <div className="history-table">
@@ -2314,10 +2391,10 @@ function App() {
                 <b title={item.title}>{item.title}</b>
                 <small>{item.created_at ? new Date(item.created_at * 1000).toLocaleString() : "—"}</small>
                 <small>{item.finished_at && item.created_at ? `${Math.max(1, Math.round(item.finished_at - item.created_at))}s` : ""}</small>
-                <button onClick={() => void openHistoryPath(item.output_dir || "")} disabled={!item.output_dir}>
+                <button onClick={() => void openHistoryPath(item.output_dir || "")} disabled={!item.output_exists} title={item.output_exists ? "打开任务输出目录" : "输出目录已不存在"}>
                   打开输出
                 </button>
-                <button onClick={() => void openHistoryPath(item.rendered_video || "")} disabled={!item.rendered_video}>
+                <button onClick={() => void openHistoryPath(item.rendered_video || "")} disabled={!item.rendered_exists} title={item.rendered_exists ? "打开成品视频" : "成品视频未生成或已删除"}>
                   成品
                 </button>
               </article>
@@ -2384,6 +2461,9 @@ function App() {
           </span>
           <button className="text-button" onClick={() => setSettingsOpen(true)}>
             设置
+          </button>
+          <button className="text-button" onClick={() => setShortcutHelpOpen(true)}>
+            帮助
           </button>
           <button className="text-button" onClick={() => setInspectorOpen((value) => !value)}>
             检查器
@@ -2611,6 +2691,22 @@ function App() {
           <button className="primary" onClick={saveSettings}>
             保存本地设置
           </button>
+        </div>
+      )}
+      {shortcutHelpOpen && (
+        <div className="modal-backdrop" role="presentation">
+          <section className="template-modal help-modal" role="dialog" aria-modal="true" aria-label="使用帮助">
+            <header><div><p className="eyebrow">使用帮助</p><h2>开始前检查与快捷键</h2></div><button onClick={() => setShortcutHelpOpen(false)} aria-label="关闭帮助">×</button></header>
+            <section className="help-section">
+              <b>本机依赖</b>
+              {diagnostics.length ? diagnostics.map((check) => <p key={check.id} className={check.available ? "help-ok" : "help-missing"}><strong>{check.available ? "✓" : "!"} {check.label}</strong> · {check.purpose}<br /><span>{check.message}</span></p>) : <p>正在检测 FFmpeg、Node.js 与 Tesseract…</p>}
+            </section>
+            <section className="help-section">
+              <b>快捷键</b>
+              <dl className="shortcut-list"><div><dt>Ctrl + O</dt><dd>选择本地视频（先确认授权）</dd></div><div><dt>Ctrl + L</dt><dd>回到素材区并聚焦视频链接</dd></div><div><dt>Ctrl + R</dt><dd>开始处理（输入框中不会触发）</dd></div><div><dt>Esc</dt><dd>请求中断正在运行的任务</dd></div></dl>
+            </section>
+            <footer><button className="primary" onClick={() => setShortcutHelpOpen(false)}>知道了</button></footer>
+          </section>
         </div>
       )}
       <footer className="footer">

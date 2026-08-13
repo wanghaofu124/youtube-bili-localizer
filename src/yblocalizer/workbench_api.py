@@ -1293,6 +1293,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "cookies_file": cookies_file,
                 "cookies_file_valid": _cookies_file_has_login(Path(cookies_file)) if cookies_file else None,
             }); return
+        if path == "/api/diagnostics":
+            self._json(self._diagnostics()); return
         if path == "/api/templates":
             self._json({"templates": [{"name": name, "body": body} for name, body in get_all_templates().items()]}); return
         if path == "/api/outputs":
@@ -1310,7 +1312,14 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 limit = int(parse_qs(urlparse(self.path).query).get("limit", ["50"])[0])
             except ValueError:
                 limit = 50
-            self._json({"jobs": job_db.list_jobs(max(1, min(200, limit)))}); return
+            query = parse_qs(urlparse(self.path).query)
+            scope = str(query.get("scope", ["current"])[0]).lower()
+            output_dir = str(query.get("output_dir", [str(OUTPUT_ROOT)])[0])
+            try:
+                records = self._history_records(scope, output_dir)
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST); return
+            self._json({"jobs": records[:max(1, min(200, limit))], "total": len(records), "scope": scope}); return
         match = re.fullmatch(r"/api/materials/([\w-]+)/media", path)
         if match:
             media = self.jobs.material_path(match.group(1))
@@ -1342,8 +1351,21 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if path == "/api/publish/upload":
             self._upload_publish_video(); return
         payload = self._payload()
+        if path == "/api/history/clear":
+            if payload.get("confirmed") is not True:
+                self._json({"error": "Clearing history requires explicit confirmation."}, HTTPStatus.BAD_REQUEST); return
+            try:
+                scope = str(payload.get("scope", "current")).lower()
+                records = self._history_records(scope, str(payload.get("output_dir") or OUTPUT_ROOT), include_private=True)
+                deleted = job_db.delete_jobs([str(record["id"]) for record in records])
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST); return
+            self._json({"deleted": deleted, "message": f"已清除 {deleted} 条任务记录；输出视频和字幕文件未删除。"})
+            return
         if path == "/api/history/open":
             target = Path(str(payload.get("path", ""))).expanduser()
+            if not self._history_path_is_allowed(target):
+                self._json({"error": "只能打开任务历史中的输出目录或成品文件。"}, HTTPStatus.BAD_REQUEST); return
             if not target.exists():
                 self._json({"error": "该任务输出已不存在（可能已被删除）。"}, HTTPStatus.BAD_REQUEST); return
             try:
@@ -1526,6 +1548,82 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "files": [{"id": str(file.path.relative_to(root)).replace("\\", "/"), "name": file.path.name, "kind": file.kind, "size": file.size, "size_label": format_bytes(file.size)} for file in task.files],
             } for task in tasks],
         }
+
+    def _diagnostics(self) -> dict[str, Any]:
+        """Report first-run prerequisites without exposing local secrets or paths."""
+        checks = []
+        for command, label, purpose, install_hint in (
+            ("ffmpeg", "FFmpeg", "提取音频与硬字幕渲染", "安装 FFmpeg，并将其加入 PATH 后重启本工具。"),
+            ("node", "Node.js", "OCR 字幕识别服务", "安装 Node.js LTS，并将其加入 PATH 后重启本工具。"),
+            ("tesseract", "Tesseract", "OCR 字幕识别引擎", "安装 Tesseract OCR，并将其加入 PATH 后重启本工具。"),
+        ):
+            available = shutil.which(command) is not None
+            checks.append({
+                "id": command,
+                "label": label,
+                "purpose": purpose,
+                "available": available,
+                "message": "已检测到。" if available else install_hint,
+            })
+        return {"ready": all(check["available"] for check in checks), "checks": checks}
+
+    @staticmethod
+    def _path_is_within(path: Path, root: Path) -> bool:
+        try:
+            path.expanduser().resolve().relative_to(root.expanduser().resolve())
+        except (OSError, ValueError):
+            return False
+        return True
+
+    def _history_records(
+        self, scope: str, output_dir: str, *, include_private: bool = False
+    ) -> list[dict[str, Any]]:
+        if scope not in {"current", "all"}:
+            raise ValueError("History scope must be current or all.")
+        root = _resolve_output_root(output_dir)
+        records = job_db.list_jobs(None)
+        if scope == "current":
+            records = [
+                record for record in records
+                if record.get("output_dir") and self._path_is_within(Path(str(record["output_dir"])), root)
+            ]
+        if include_private:
+            return records
+        public: list[dict[str, Any]] = []
+        for record in records:
+            output_dir_value = str(record.get("output_dir") or "")
+            rendered_value = str(record.get("rendered_video") or "")
+            public.append({
+                "id": record["id"],
+                "title": record.get("title") or "未命名任务",
+                "status": record.get("status") or "unknown",
+                "stage": record.get("stage") or "—",
+                "progress": record.get("progress") or 0,
+                "error": record.get("error"),
+                "output_dir": output_dir_value or None,
+                "rendered_video": rendered_value or None,
+                "output_exists": bool(output_dir_value and Path(output_dir_value).expanduser().exists()),
+                "rendered_exists": bool(rendered_value and Path(rendered_value).expanduser().is_file()),
+                "created_at": record.get("created_at"),
+                "finished_at": record.get("finished_at"),
+            })
+        return public
+
+    def _history_path_is_allowed(self, target: Path) -> bool:
+        try:
+            resolved = target.expanduser().resolve()
+        except OSError:
+            return False
+        for record in job_db.list_jobs(None):
+            for value in (record.get("output_dir"), record.get("rendered_video")):
+                if not value:
+                    continue
+                try:
+                    if resolved == Path(str(value)).expanduser().resolve():
+                        return True
+                except OSError:
+                    continue
+        return False
 
     def _open_output_root(self, payload: dict[str, Any]) -> None:
         try:

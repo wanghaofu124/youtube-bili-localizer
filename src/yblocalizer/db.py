@@ -113,16 +113,26 @@ def record_job(
             connection.close()
 
 
-def list_jobs(limit: int = 50) -> list[dict[str, Any]]:
+def list_jobs(limit: int | None = 50) -> list[dict[str, Any]]:
+    """Return persisted jobs, newest first.
+
+    ``None`` is deliberately reserved for server-side maintenance operations
+    such as clearing the visible history scope.  UI callers should keep using
+    a bounded limit.
+    """
     with _lock:
         connection = _connect()
         try:
-            rows = connection.execute(
+            query = (
                 "SELECT id, material_id, source_url, title, status, stage, progress, error, "
                 "output_dir, rendered_video, device, compute_type, options, "
-                "created_at, started_at, finished_at FROM jobs ORDER BY created_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+                "created_at, started_at, finished_at FROM jobs ORDER BY created_at DESC"
+            )
+            rows = (
+                connection.execute(query).fetchall()
+                if limit is None
+                else connection.execute(f"{query} LIMIT ?", (limit,)).fetchall()
+            )
         finally:
             connection.close()
     columns = [
@@ -139,3 +149,19 @@ def list_jobs(limit: int = 50) -> list[dict[str, Any]]:
             item["options"] = {}
         output.append(item)
     return output
+
+
+def delete_jobs(job_ids: list[str]) -> int:
+    """Delete persisted history records only; never delete output files."""
+    ids = [job_id for job_id in job_ids if isinstance(job_id, str) and job_id]
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    with _lock:
+        connection = _connect()
+        try:
+            cursor = connection.execute(f"DELETE FROM jobs WHERE id IN ({placeholders})", ids)
+            connection.commit()
+            return int(cursor.rowcount)
+        finally:
+            connection.close()

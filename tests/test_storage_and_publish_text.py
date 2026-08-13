@@ -10,6 +10,7 @@ from yblocalizer.publish_text import (
     validate_template,
 )
 from yblocalizer.storage import delete_paths
+from yblocalizer import db as job_db
 
 
 def test_delete_paths_only_allows_output_root(tmp_path: Path) -> None:
@@ -26,6 +27,23 @@ def test_delete_paths_only_allows_output_root(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="outside output directory"):
         delete_paths([outside], allowed)
     assert outside.exists()
+
+
+def test_delete_job_history_records_does_not_touch_output_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("YBLOCALIZER_DATA_DIR", str(tmp_path / "user-data"))
+    job_db.init_db()
+    output = tmp_path / "output" / "rendered.mp4"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"video")
+    job_db.record_job(
+        "task-1", None, None, "Example", "completed", "Done", 100, None,
+        str(output.parent), str(output), "cpu", "int8", {}, 1, 1, 2,
+    )
+    assert job_db.delete_jobs(["task-1"]) == 1
+    assert job_db.list_jobs() == []
+    assert output.exists()
 
 
 def test_publish_description_has_one_source_link() -> None:
