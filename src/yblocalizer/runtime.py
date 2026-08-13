@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum
 import threading
 import time
 from typing import Callable
@@ -32,7 +32,7 @@ class CancellationToken:
             raise CancellationRequested("任务已被用户中断")
 
 
-class PipelineStage(StrEnum):
+class PipelineStage(str, Enum):
     QUEUED = "queued"
     PREPARING = "preparing"
     DOWNLOADING = "downloading"
