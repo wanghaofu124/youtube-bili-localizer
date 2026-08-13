@@ -10,6 +10,13 @@ from pathlib import Path
 
 import webview
 
+# Set the data root before importing any application modules.  Some modules
+# load publishing-template helpers at import time; relying on the process
+# working directory here makes a double-clicked EXE try to create `data` in
+# a protected directory such as C:\\Windows\\System32.
+_USER_DATA_ROOT = Path(os.environ.get("APPDATA") or Path.home()) / "YouTubeBiliLocalizer"
+os.environ.setdefault("YBLOCALIZER_DATA_DIR", str(_USER_DATA_ROOT))
+
 from yblocalizer.workbench_api import ASSET_ROOT, OUTPUT_ROOT, build_server
 
 if sys.platform == "win32":

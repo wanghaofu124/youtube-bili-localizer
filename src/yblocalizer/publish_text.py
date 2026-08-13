@@ -7,7 +7,12 @@ import os
 
 
 def _custom_templates_file() -> Path:
-    data_dir = os.environ.get("YBLOCALIZER_DATA_DIR", "data")
+    # Resolve on demand instead of during module import.  The workbench sets
+    # YBLOCALIZER_DATA_DIR during startup, and this keeps template storage out
+    # of whichever directory happened to launch the EXE.
+    data_dir = os.environ.get("YBLOCALIZER_DATA_DIR") or (
+        Path(os.environ.get("APPDATA") or Path.home()) / "YouTubeBiliLocalizer"
+    )
     path = Path(data_dir) / "custom_templates.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
@@ -56,9 +61,6 @@ DEFAULT_TEMPLATES = {
         "原视频链接：{source}"
     ),
 }
-
-CUSTOM_TEMPLATES_FILE = _custom_templates_file()
-
 
 def get_all_templates() -> dict[str, str]:
     """获取所有模板，包括默认模板和用户自定义模板。"""
@@ -128,10 +130,11 @@ def ensure_source_link(description: str, source: str, include_source_link: bool 
 
 def _load_custom_templates() -> dict[str, str]:
     """从文件加载用户自定义模板。"""
-    if not CUSTOM_TEMPLATES_FILE.exists():
+    template_file = _custom_templates_file()
+    if not template_file.exists():
         return {}
     try:
-        data = json.loads(CUSTOM_TEMPLATES_FILE.read_text(encoding="utf-8"))
+        data = json.loads(template_file.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             return data
     except (json.JSONDecodeError, OSError):
@@ -142,10 +145,11 @@ def _load_custom_templates() -> dict[str, str]:
 def save_custom_template(name: str, template: str) -> None:
     """保存用户自定义模板到文件。"""
     validate_template(template)
-    CUSTOM_TEMPLATES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    template_file = _custom_templates_file()
+    template_file.parent.mkdir(parents=True, exist_ok=True)
     templates = _load_custom_templates()
     templates[name] = template
-    CUSTOM_TEMPLATES_FILE.write_text(
+    template_file.write_text(
         json.dumps(templates, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -153,11 +157,12 @@ def save_custom_template(name: str, template: str) -> None:
 
 def delete_custom_template(name: str) -> bool:
     """删除用户自定义模板。"""
+    template_file = _custom_templates_file()
     templates = _load_custom_templates()
     if name not in templates:
         return False
     del templates[name]
-    CUSTOM_TEMPLATES_FILE.write_text(
+    template_file.write_text(
         json.dumps(templates, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )

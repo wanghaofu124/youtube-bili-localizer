@@ -592,7 +592,7 @@ function App() {
       const target = event.target as HTMLElement | null;
       const typing = target?.matches("input, textarea, select");
       if (event.ctrlKey && event.key.toLowerCase() === "o") {
-        event.preventDefault(); fileInput.current?.click(); return;
+        event.preventDefault(); void chooseNativeMaterial(); return;
       }
       if (event.ctrlKey && event.key.toLowerCase() === "l") {
         event.preventDefault(); setView("material"); document.getElementById("source-url")?.focus(); return;

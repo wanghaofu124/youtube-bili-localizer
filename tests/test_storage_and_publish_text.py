@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from yblocalizer.publish_text import build_bilibili_description, ensure_source_link, validate_template
+from yblocalizer.publish_text import (
+    build_bilibili_description,
+    ensure_source_link,
+    get_all_templates,
+    save_custom_template,
+    validate_template,
+)
 from yblocalizer.storage import delete_paths
 
 
@@ -32,3 +38,12 @@ def test_publish_description_has_one_source_link() -> None:
 def test_custom_template_rejects_unknown_variables() -> None:
     with pytest.raises(ValueError, match="模板变量不支持"):
         validate_template("{source} {secret}")
+
+
+def test_custom_templates_follow_current_user_data_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("YBLOCALIZER_DATA_DIR", str(tmp_path / "user-data"))
+    save_custom_template("测试模板", "来源：{source}")
+    assert (tmp_path / "user-data" / "custom_templates.json").exists()
+    assert get_all_templates()["测试模板"] == "来源：{source}"

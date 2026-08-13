@@ -27,6 +27,14 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from dotenv import load_dotenv
 
+# This must happen before importing modules which may read the template store.
+# A packaged GUI can be launched with a protected system directory as its
+# current working directory, so relative "data" paths are never safe here.
+_DEFAULT_USER_DATA_ROOT = Path(os.environ.get("APPDATA") or Path.home()) / "YouTubeBiliLocalizer"
+os.environ.setdefault("YBLOCALIZER_DATA_DIR", str(_DEFAULT_USER_DATA_ROOT))
+_DEFAULT_USER_DATA_ROOT.mkdir(parents=True, exist_ok=True)
+load_dotenv(_DEFAULT_USER_DATA_ROOT / ".env")
+
 from .download import get_video_metadata
 from .models import Segment, load_segments, save_segments
 from .pipeline import (
@@ -62,10 +70,7 @@ def _asset_root() -> Path:
 PROJECT_ROOT = _runtime_root()
 ASSET_ROOT = _asset_root()
 # 用户数据目录（独立于 EXE 安装目录）：重建/升级 EXE 不会删除用户数据
-USER_DATA_ROOT = Path(os.environ.get("APPDATA") or Path.home()) / "YouTubeBiliLocalizer"
-os.environ.setdefault("YBLOCALIZER_DATA_DIR", str(USER_DATA_ROOT))
-USER_DATA_ROOT.mkdir(parents=True, exist_ok=True)
-load_dotenv(USER_DATA_ROOT / ".env")
+USER_DATA_ROOT = _DEFAULT_USER_DATA_ROOT
 DEMO_VIDEO = ASSET_ROOT / "demo" / "authorized-demo-10s.mp4"
 OUTPUT_ROOT = USER_DATA_ROOT / "outputs" / "workbench_demo"
 UPLOAD_ROOT = USER_DATA_ROOT / "outputs" / "workbench_uploads"
