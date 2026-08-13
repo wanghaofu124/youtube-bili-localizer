@@ -111,6 +111,7 @@ type Diagnostic = {
   purpose: string;
   available: boolean;
   message: string;
+  required?: boolean;
 };
 
 const defaults: Options = {
@@ -119,7 +120,7 @@ const defaults: Options = {
   cookies_from_browser: "",
   cookies_file: "",
   max_seconds: 10,
-  subtitle_source: "merged",
+  subtitle_source: "audio",
   whisper_model_size: "small",
   source_language: "",
   beam_size: 5,
@@ -276,6 +277,8 @@ function App() {
   const [device, setDevice] = useState("cuda");
   const [computeType, setComputeType] = useState("float16");
   const [options, setOptions] = useState<Options>(defaults);
+  const [appVersion, setAppVersion] = useState("0.2.0");
+  const [demoPreview, setDemoPreview] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const [cues, setCues] = useState<Cue[]>([]);
   const [history, setHistory] = useState<Cue[][]>([]);
@@ -315,6 +318,7 @@ function App() {
   const [showFullLogs, setShowFullLogs] = useState(false);
   const [now, setNow] = useState(Date.now());
   const [readiness, setReadiness] = useState<string[]>([]);
+  const [preflightWarnings, setPreflightWarnings] = useState<string[]>([]);
   const [outputs, setOutputs] = useState<Outputs | null>(null);
   const [selectedOutputPaths, setSelectedOutputPaths] = useState<string[]>([]);
   const [selectedOutputTaskIds, setSelectedOutputTaskIds] = useState<string[]>([]);
@@ -360,11 +364,14 @@ function App() {
     templates.find((item) => item.name === templateName)?.body ?? "";
   const templateDraftDirty = templateBody !== savedTemplateBody;
   const duration =
+    (demoPreview ? 10 : null) ??
     job?.material.duration_seconds ??
     selected?.duration_seconds ??
     metadata?.duration ??
     10;
-  const previewSrc = job
+  const previewSrc = demoPreview
+    ? "/api/demo/rendered"
+    : job
     ? `/api/jobs/${job.id}/media/${preview === "rendered" && job.result ? "rendered" : "source"}`
     : selected
       ? `/api/materials/${selected.id}/media`
@@ -443,6 +450,33 @@ function App() {
       setDiagnostics(response.checks);
     } catch {
       /* A local service error is already reported by the connection state. */
+    }
+  };
+  const loadBootstrap = async () => {
+    const bootstrap = await api<{
+      version: string;
+      defaults: Options;
+      capabilities: Record<string, Omit<Diagnostic, "id" | "message">>;
+    }>("/api/bootstrap");
+    setAppVersion(bootstrap.version);
+    setOptions((current) => ({ ...current, ...bootstrap.defaults }));
+    setDiagnostics(Object.entries(bootstrap.capabilities).map(([id, item]) => ({
+      id, ...item,
+      message: item.available ? "已检测到。" : item.required ? "必需组件未安装。" : "可选组件未安装；不影响默认音频模式。",
+    })));
+  };
+  const previewAuthorizedDemo = async () => {
+    try {
+      const data = await api<{ cues: Cue[]; translation_ready: boolean }>("/api/demo/cues");
+      setDemoPreview(true);
+      setJob(null);
+      setCues(data.cues);
+      setTranslationReady(true);
+      setPreview("rendered");
+      setView("subtitle");
+      setMessage("正在预览仓库内预生成的授权演示结果；未启动下载、模型或 API。 ");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "无法加载演示结果");
     }
   };
   const clearHistory = async () => {
@@ -528,12 +562,17 @@ function App() {
     !!text && /Cookies|机器人|登录验证|拦截/i.test(text);
   const checkReadiness = async () => {
     try {
-      const response = await api<{ ready: boolean; issues: string[]; message: string }>("/api/readiness", {
+      const response = await api<{
+        ready: boolean;
+        blocking: Array<{ code: string; message: string }>;
+        warnings: Array<{ code: string; message: string }>;
+      }>("/api/preflight", {
         method: "POST",
         body: JSON.stringify({ source_url: sourceUrl, material_id: selected?.id, authorized, device, compute_type: computeType, options: taskOptions() }),
       });
-      setReadiness(response.issues);
-      setMessage(response.message);
+      setReadiness(response.blocking.map((item) => item.message));
+      setPreflightWarnings(response.warnings.map((item) => item.message));
+      setMessage(response.ready ? (response.warnings[0]?.message ?? "基础配置可以运行。") : response.blocking.map((item) => item.message).join("；"));
       return response.ready;
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "检查配置失败");
@@ -576,18 +615,17 @@ function App() {
   const applyRecommended = () => {
     setDevice("cpu");
     setComputeType("int8");
-    setOptions((current) => ({ ...current, subtitle_source: "merged", whisper_model_size: "small", source_language: "", translator: "deepseek", target_lang: "zh-Hans", smart_translation: true, smart_subtitle_layout: true, font_name: "Microsoft YaHei", font_size: 24, subtitle_display_mode: "translated", subtitle_color: "白色", subtitle_outline_color: "黑色", subtitle_effect: "描边" }));
+    setOptions((current) => ({ ...current, subtitle_source: "audio", whisper_model_size: "small", source_language: "", translator: "deepseek", target_lang: "zh-Hans", smart_translation: true, smart_subtitle_layout: true, font_name: "Microsoft YaHei", font_size: 24, subtitle_display_mode: "translated", subtitle_color: "白色", subtitle_outline_color: "黑色", subtitle_effect: "描边" }));
     setIncludeSourceLink(true);
-    setMessage("已应用推荐设置：CPU 稳定模式、音频+OCR 合并与中文硬字幕。");
+    setMessage("已应用推荐设置：CPU int8、音频转写与中文硬字幕；OCR 保持可选。");
   };
 
   useEffect(() => {
     Promise.all([
-      api<{ ok: boolean }>("/api/health"),
+      loadBootstrap(),
       loadMaterials(),
       loadTemplates(),
       loadSettings(),
-      loadDiagnostics(),
     ])
       .then(() => {
         setOnline(true);
@@ -777,6 +815,7 @@ function App() {
         }),
       });
       setJob(created);
+      setDemoPreview(false);
       setCues([]);
       setPreview("source");
       setMessage(
@@ -1296,13 +1335,16 @@ function App() {
           <button className="primary small" onClick={() => setSettingsOpen(true)}>
             去设置
           </button>
+          <button className="secondary small" onClick={() => void previewAuthorizedDemo()}>
+            直接预览演示结果
+          </button>
         </div>
       )}
-      {diagnostics.some((check) => !check.available) && (
+      {diagnostics.some((check) => check.required && !check.available) && (
         <section className="diagnostics-banner" aria-label="首次使用依赖检查">
           <div>
-            <b>开始前还需安装 {diagnostics.filter((check) => !check.available).map((check) => check.label).join("、")}</b>
-            <span>这些本机工具用于音频、OCR 与字幕渲染；安装后重启工作台即可重新检测。</span>
+            <b>开始前还需安装 {diagnostics.filter((check) => check.required && !check.available).map((check) => check.label).join("、")}</b>
+            <span>这里只列出默认流程的必需组件；Tesseract 等 OCR 组件按所选模式检查。</span>
           </div>
           <button className="text-button" onClick={() => setShortcutHelpOpen(true)}>查看说明</button>
         </section>
@@ -1316,6 +1358,7 @@ function App() {
             placeholder="粘贴 YouTube / B 站视频链接"
             onChange={(event) => {
               setSourceUrl(event.target.value);
+              setDemoPreview(false);
               setMetadata(null);
               setMetadataNotice("");
               setMetadataState("idle");
@@ -1450,9 +1493,13 @@ function App() {
         我确认拥有处理、转载或发布该视频的授权/许可证
       </label>
       <div className="card-footer task-tools">
+        <button className="secondary" onClick={() => void previewAuthorizedDemo()}>
+          预览授权演示结果
+        </button>
         <button onClick={applyRecommended} disabled={running}>推荐设置</button>
         <button onClick={() => void checkReadiness()} disabled={running}>检查配置</button>
         {readiness.length > 0 && <span className="readiness-error">{readiness.join("；")}</span>}
+        {!readiness.length && preflightWarnings.length > 0 && <span className="readiness-warning">{preflightWarnings.join("；")}</span>}
       </div>
     </section>
   );
@@ -1771,6 +1818,9 @@ function App() {
         </section>
       )}
       <footer className="card-footer">
+        <button className="secondary" onClick={() => void previewAuthorizedDemo()}>
+          预览授权演示结果
+        </button>
         <button
           className="primary"
           onClick={start}
@@ -1788,7 +1838,9 @@ function App() {
           <div>
             <p className="eyebrow">字幕工作区</p>
             <h1>
-              {preview === "rendered" && job?.result
+              {demoPreview
+                ? "授权演示成片（只读）"
+                : preview === "rendered" && job?.result
                 ? "中文字幕成片"
                 : "原始视频"}
             </h1>
@@ -1802,7 +1854,7 @@ function App() {
             </button>
             <button
               className={preview === "rendered" ? "selected" : ""}
-              disabled={!job?.result}
+              disabled={!job?.result && !demoPreview}
               onClick={() => setPreview("rendered")}
             >
               成片
@@ -2442,7 +2494,7 @@ function App() {
           <b>
             YouTube Bili
             <br />
-            Localizer
+            Localizer <small>v{appVersion}</small>
           </b>
         </a>
         <div className="project-name">

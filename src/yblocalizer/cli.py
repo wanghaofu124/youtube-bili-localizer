@@ -112,7 +112,7 @@ def build_parser() -> ArgumentParser:
     process.add_argument("--i-have-rights", action="store_true", help="Confirm you have the rights/license to process this video")
     process.add_argument(
         "--subtitle-source",
-        default="auto",
+        default="audio",
         choices=["auto", "audio", "ocr", "merged"],
         help="Use auto detection, audio transcription, OCR, or merged audio+OCR subtitles",
     )

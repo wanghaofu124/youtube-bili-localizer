@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-import threading
-from .cancellation import CancellationRequested, _cancellation_requested as _shared_cancellation_requested
 from .download import download_with_ytdlp, import_local_video
 from .media import extract_audio
 from .models import VideoJob, save_segments
@@ -17,38 +15,53 @@ from .subtitle_merge import merge_audio_ocr_segments
 from .transcribe import transcribe_audio
 from .translate import correct_source_segments, generate_publish_metadata, save_publish_metadata, translate_segments_file
 from .util import ensure_rights_confirmed, timestamp_id
+from .runtime import CancellationRequested, PipelineContext, PipelineStage
+from .cancellation import _cancellation_requested as _deprecated_global_cancellation
 
 
 LogFn = Callable[[str], None]
 
-# 全局中断标志
-_cancellation_requested = _shared_cancellation_requested
+_legacy_context = PipelineContext()
 
 
 def request_cancellation() -> None:
-    """请求中断当前运行的任务。"""
-    _cancellation_requested.set()
+    """Deprecated adapter for the maintenance-only Tk GUI."""
+    _legacy_context.cancellation.cancel()
+    _deprecated_global_cancellation.set()
 
 
 def reset_cancellation() -> None:
     """重置中断标志。"""
-    _cancellation_requested.clear()
+    _legacy_context.cancellation.reset()
+    _deprecated_global_cancellation.clear()
 
 
 def is_cancellation_requested() -> bool:
     """检查是否已请求中断。"""
-    return _cancellation_requested.is_set()
+    return _legacy_context.cancellation.cancelled
 
 
 def check_cancelled() -> None:
     """检查中断标志，如果已请求中断则抛出异常。"""
-    if _cancellation_requested.is_set():
-        raise CancellationError("任务已被用户中断")
+    try:
+        _legacy_context.check_cancelled()
+    except CancellationRequested as exc:
+        raise CancellationError(str(exc)) from exc
 
 
 class CancellationError(Exception):
     """任务被用户中断时抛出的异常。"""
     pass
+
+
+def _extract_audio(video: Path, output: Path, ctx: PipelineContext) -> Path:
+    """Call the new cancellable adapter while tolerating old third-party wrappers."""
+    import inspect
+    parameters = inspect.signature(extract_audio).parameters.values()
+    supports_cancel = "cancel_check" in inspect.signature(extract_audio).parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
+    )
+    return extract_audio(video, output, cancel_check=ctx.is_cancelled) if supports_cancel else extract_audio(video, output)
 
 
 @dataclass(slots=True)
@@ -64,7 +77,7 @@ class PipelineOptions:
     cookies_from_browser: str | None = None
     cookies_file: str | None = None
     max_seconds: int | None = None
-    subtitle_source: str = "auto"
+    subtitle_source: str = "audio"
     ocr_fallback_to_audio: bool = True
     whisper_model_size: str = "small"
     source_language: str | None = None
@@ -159,8 +172,13 @@ def run_pipeline(
     options: PipelineOptions,
     log: LogFn | None = None,
     progress: Callable[[float], None] | None = None,
+    context: PipelineContext | None = None,
 ) -> PipelineResult:
+    ctx = context or _legacy_context
     logger = log or (lambda message: print(message, flush=True))
+    def report(stage: PipelineStage, percent: int, message: str) -> None:
+        logger(message)
+        ctx.emit(stage, percent, message)
     ensure_rights_confirmed(options.i_have_rights)
     work_dir = options.output_dir / timestamp_id()
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -168,9 +186,10 @@ def run_pipeline(
     try:
         if options.subtitle_source not in {"audio", "ocr", "auto", "merged"}:
             raise RuntimeError(f"Unknown subtitle source: {options.subtitle_source}")
-        logger("1/5 Preparing source video...")
-        check_cancelled()
+        report(PipelineStage.PREPARING, 4, "1/5 Preparing source video...")
+        ctx.check_cancelled()
         if options.source_kind == "url":
+            ctx.emit(PipelineStage.DOWNLOADING, 5, "正在下载视频")
             job = download_with_ytdlp(
                 options.source,
                 work_dir=work_dir,
@@ -180,6 +199,7 @@ def run_pipeline(
                 cookies_from_browser=options.cookies_from_browser,
                 cookies_file=options.cookies_file,
                 progress=progress,
+                cancel_check=ctx.check_cancelled,
             )
             if job.license:
                 logger(f"YouTube license: {job.license}")
@@ -205,16 +225,18 @@ def run_pipeline(
             logger("2/5 Skipping audio extraction; OCR subtitle mode is enabled.")
         else:
             logger("2/5 Extracting audio...")
-            check_cancelled()
-            job.audio = extract_audio(job.raw_video, work_dir / "audio.wav")
+            ctx.check_cancelled()
+            ctx.emit(PipelineStage.AUDIO, 16, "正在提取音频")
+            job.audio = _extract_audio(job.raw_video, work_dir / "audio.wav", ctx)
             logger(f"Audio: {job.audio}")
 
-        check_cancelled()
+        ctx.check_cancelled()
         source_segments = work_dir / "segments.source.json"
         source_srt = work_dir / "source.srt"
         used_ocr_subtitles = False
         source_segment_items = []
         if options.subtitle_source == "merged":
+            ctx.emit(PipelineStage.TRANSCRIBING, 26, "正在转写音频并读取画面文字")
             logger("3/5 Merged subtitle mode: transcribing audio and reading on-screen text with OCR...")
             logger("首次使用会自动下载 Whisper 模型（约 500MB），需要联网，请耐心等待；后续会使用本地缓存。")
             if job.audio is None:
@@ -234,6 +256,7 @@ def run_pipeline(
                 initial_prompt=transcription_prompt,
                 beam_size=options.beam_size,
                 log=logger,
+                cancel_check=ctx.check_cancelled,
             )
             logger(f"Audio subtitle lines: {len(audio_segment_items)}")
             try:
@@ -245,6 +268,7 @@ def run_pipeline(
                     interval_seconds=max(0.2, options.ocr_interval),
                     crop_bottom_ratio=max(0.05, min(1.0, options.ocr_crop_ratio)),
                     min_chars=max(1, options.ocr_min_chars),
+                    cancel_check=ctx.is_cancelled,
                 )
                 logger(f"OCR subtitle lines: {len(ocr_segment_items)}")
             except Exception as exc:
@@ -272,6 +296,7 @@ def run_pipeline(
             write_srt(source_srt, source_segment_items, display_mode="source")
             logger(f"Merged subtitle lines: {len(source_segment_items)}")
         elif options.subtitle_source == "ocr":
+            ctx.emit(PipelineStage.OCR, 28, "正在读取画面字幕")
             logger("3/5 Reading burned-in English subtitles from video frames with OCR...")
             try:
                 source_segment_items = extract_ocr_subtitles(
@@ -282,6 +307,7 @@ def run_pipeline(
                     interval_seconds=max(0.2, options.ocr_interval),
                     crop_bottom_ratio=max(0.05, min(1.0, options.ocr_crop_ratio)),
                     min_chars=max(1, options.ocr_min_chars),
+                    cancel_check=ctx.is_cancelled,
                 )
                 used_ocr_subtitles = True
                 logger(f"OCR subtitle lines: {len(source_segment_items)}")
@@ -290,9 +316,9 @@ def run_pipeline(
                     raise
                 logger(f"OCR subtitle reading failed: {exc}")
                 logger("Falling back to audio transcription with faster-whisper.")
-                check_cancelled()
+                ctx.check_cancelled()
                 if job.audio is None:
-                    job.audio = extract_audio(job.raw_video, work_dir / "audio.wav")
+                    job.audio = _extract_audio(job.raw_video, work_dir / "audio.wav", ctx)
                     logger(f"Audio: {job.audio}")
                 source_segment_items = transcribe_audio(
                     job.audio,
@@ -304,8 +330,10 @@ def run_pipeline(
                     compute_type=options.compute_type,
                     initial_prompt=transcription_prompt,
                     log=logger,
+                    cancel_check=ctx.check_cancelled,
                 )
         else:
+            ctx.emit(PipelineStage.TRANSCRIBING, 28, "正在语音转写")
             if options.subtitle_source == "auto":
                 logger("3/5 Auto subtitle mode: trying audio transcription first...")
             else:
@@ -322,6 +350,7 @@ def run_pipeline(
                 compute_type=options.compute_type,
                 initial_prompt=transcription_prompt,
                 log=logger,
+                cancel_check=ctx.check_cancelled,
                 )
             if not source_segment_items:
                 if options.subtitle_source == "audio" and not options.ocr_fallback_to_audio:
@@ -337,6 +366,7 @@ def run_pipeline(
                             interval_seconds=max(0.2, options.ocr_interval),
                             crop_bottom_ratio=max(0.05, min(1.0, options.ocr_crop_ratio)),
                             min_chars=max(1, options.ocr_min_chars),
+                            cancel_check=ctx.is_cancelled,
                         )
                         used_ocr_subtitles = True
                         logger(f"OCR subtitle lines: {len(source_segment_items)}")
@@ -372,7 +402,8 @@ def run_pipeline(
             logger(f"4/5 Translating subtitles with {options.translator} using context-aware mode...")
         else:
             logger(f"4/5 Translating subtitles with {options.translator}...")
-        check_cancelled()
+        ctx.check_cancelled()
+        ctx.emit(PipelineStage.TRANSLATING, 62, "正在翻译字幕")
         translated_segments = work_dir / "segments.translated.json"
         translated_srt = work_dir / "zh.srt"
         translated_segment_items = translate_segments_file(
@@ -417,7 +448,8 @@ def run_pipeline(
         logger(f"Publish metadata: {metadata_path}")
 
         logger("5/5 Rendering hard subtitles with ffmpeg...")
-        check_cancelled()
+        ctx.check_cancelled()
+        ctx.emit(PipelineStage.RENDERING, 84, "正在渲染硬字幕成片")
         if used_ocr_subtitles:
             logger("OCR mode: raising Chinese subtitles above the original English captions.")
         rendered = burn_subtitles(
@@ -433,12 +465,14 @@ def run_pipeline(
             raised_margin=used_ocr_subtitles,
             crf=options.render_crf,
             margin_ratio=options.subtitle_margin_ratio,
+            cancel_check=ctx.is_cancelled,
         )
         job.rendered_video = rendered
         logger(f"Rendered video: {rendered}")
 
         if options.publish_to_bilibili:
-            check_cancelled()
+            ctx.check_cancelled()
+            ctx.emit(PipelineStage.PUBLISHING, 96, "正在打开投稿辅助")
             logger("Opening Bilibili Creator Center for assisted publishing...")
             source_for_description = job.webpage_url or (job.source if job.source.startswith(("http://", "https://")) else "")
             publish_description = ensure_source_link(
@@ -460,6 +494,7 @@ def run_pipeline(
                 log=logger,
             )
 
+        ctx.emit(PipelineStage.COMPLETED, 100, "处理完成")
         return PipelineResult(
             job=job,
             work_dir=work_dir,
@@ -473,8 +508,8 @@ def run_pipeline(
             raise
         raise CancellationError(str(exc)) from exc
     finally:
-        # 无论成功还是中断，都重置标志
-        reset_cancellation()
+        if context is None:
+            reset_cancellation()
 
 
 def _merge_tags(*groups: list[str]) -> list[str]:

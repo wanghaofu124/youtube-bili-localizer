@@ -2,7 +2,9 @@ from pathlib import Path
 
 import pytest
 
+from yblocalizer.runtime import PipelineEvent, PipelineStage
 from yblocalizer.workbench_api import DEMO_VIDEO, DemoJob, Material, WorkbenchHandler, WorkbenchJobs, _upsert_env, _resolve_output_root, _safe_options, build_server, public_path, stage_from_log
+from yblocalizer.workbench_config import default_options, preflight
 
 
 def test_workbench_maps_existing_pipeline_logs_to_stages() -> None:
@@ -15,10 +17,14 @@ def test_workbench_maps_existing_pipeline_logs_to_stages() -> None:
 def test_workbench_job_never_moves_progress_backwards() -> None:
     material = Material("demo", DEMO_VIDEO, "demo.mp4", 10, 1280, 720, True)
     job = DemoJob(id="demo", material=material, device="cuda", compute_type="float16")
-    job.add_log("5/5 Rendering hard subtitles with ffmpeg...")
-    job.add_log("3/5 Transcribing audio with faster-whisper...")
+    job.apply_event(PipelineEvent(PipelineStage.RENDERING, 90, "rendering"))
+    job.apply_event(PipelineEvent(PipelineStage.TRANSCRIBING, 48, "transcribing"))
     assert job.progress == 90
-    assert job.stage == "转写字幕"
+    assert job.stage == "语音转写"
+
+
+def test_workbench_default_subtitle_source_is_audio() -> None:
+    assert default_options()["subtitle_source"] == "audio"
 
 
 def test_workbench_public_path_is_relative_to_project(tmp_path: Path) -> None:
@@ -45,6 +51,7 @@ def test_workbench_cancel_marks_running_job_as_cancelling(monkeypatch: pytest.Mo
     cancelled = jobs.cancel(job.id)
     assert cancelled is job
     assert cancelled.status == "cancelling"
+    assert cancelled.cancellation.cancelled is True
     assert any("Cancellation requested" in line for line in cancelled.logs)
 
 
@@ -149,9 +156,20 @@ def test_diagnostics_reports_missing_tools_without_paths(monkeypatch: pytest.Mon
     handler = object.__new__(WorkbenchHandler)
     monkeypatch.setattr("yblocalizer.workbench_api.shutil.which", lambda command: "C:/tools/ffmpeg.exe" if command == "ffmpeg" else None)
     result = handler._diagnostics()
-    assert result["ready"] is False
+    assert result["ready"] is True
     assert result["checks"][0]["available"] is True
     assert all("C:/" not in item["message"] for item in result["checks"])
+
+
+def test_preflight_treats_tesseract_as_conditional(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("yblocalizer.workbench_config.shutil.which", lambda command: "tool" if command == "ffmpeg" else None)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "configured")
+    audio = preflight({"material_id": "demo", "authorized": True, "device": "cpu", "compute_type": "int8", "options": {"subtitle_source": "audio"}}, "outputs")
+    merged = preflight({"material_id": "demo", "authorized": True, "device": "cpu", "compute_type": "int8", "options": {"subtitle_source": "merged"}}, "outputs")
+    ocr = preflight({"material_id": "demo", "authorized": True, "device": "cpu", "compute_type": "int8", "options": {"subtitle_source": "ocr"}}, "outputs")
+    assert audio["ready"] and not audio["warnings"]
+    assert merged["ready"] and merged["warnings"][0]["code"] == "ocr_unavailable"
+    assert not ocr["ready"] and ocr["blocking"][-1]["code"] == "tesseract_required"
 
 
 def test_workbench_server_can_bind_an_ephemeral_loopback_port() -> None:

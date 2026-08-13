@@ -1,6 +1,6 @@
 [project]
 name = "youtube-bili-localizer"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Authorized video localization pipeline: download, transcribe, translate, burn subtitles, and assist Bilibili upload."
 requires-python = ">=3.10"
 dependencies = [
@@ -25,6 +25,9 @@ yblocalizer-gui = "yblocalizer.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "yblocalizer.__version__"}
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

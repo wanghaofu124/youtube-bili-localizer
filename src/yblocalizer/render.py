@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 from .cancellation import is_cancellation_requested
 from .util import require_command, run
@@ -42,6 +43,7 @@ def burn_subtitles(
     raised_margin: bool = False,
     crf: int = 20,
     margin_ratio: float = 0.055,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> Path:
     require_command("ffmpeg")
     video_path = video_path.resolve()
@@ -104,6 +106,6 @@ def burn_subtitles(
             str(output_path),
         ],
         cwd=subtitle_path.parent,
-        cancel_check=is_cancellation_requested,
+        cancel_check=cancel_check or is_cancellation_requested,
     )
     return output_path

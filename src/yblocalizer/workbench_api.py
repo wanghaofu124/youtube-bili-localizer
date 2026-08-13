@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -42,10 +43,12 @@ from .pipeline import (
     PipelineOptions,
     _estimate_audio_offset,
     _shift_segments,
-    is_cancellation_requested,
-    request_cancellation,
     run_pipeline,
 )
+from . import __version__
+from .workbench_config import capabilities, default_options, normalize_options, preflight
+from .runtime import CancellationToken, PipelineContext, PipelineEvent, STAGE_LABELS
+from .job_service import transition_job
 from .publish_bili import assist_publish, open_upload_page
 from .publish_text import build_bilibili_description, delete_custom_template, get_all_templates, save_custom_template
 from .render import burn_subtitles
@@ -53,6 +56,8 @@ from .storage import delete_paths, format_bytes, scan_outputs
 from .subtitle import write_srt
 from .util import run as run_command
 from . import db as job_db
+
+LOGGER = logging.getLogger("yblocalizer.workbench")
 
 
 def _runtime_root() -> Path:
@@ -71,76 +76,20 @@ PROJECT_ROOT = _runtime_root()
 ASSET_ROOT = _asset_root()
 # 用户数据目录（独立于 EXE 安装目录）：重建/升级 EXE 不会删除用户数据
 USER_DATA_ROOT = _DEFAULT_USER_DATA_ROOT
+LOG_ROOT = USER_DATA_ROOT / "logs"
+LOG_ROOT.mkdir(parents=True, exist_ok=True)
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        filename=LOG_ROOT / "workbench.log", level=logging.INFO, encoding="utf-8",
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
 DEMO_VIDEO = ASSET_ROOT / "demo" / "authorized-demo-10s.mp4"
 OUTPUT_ROOT = USER_DATA_ROOT / "outputs" / "workbench_demo"
 UPLOAD_ROOT = USER_DATA_ROOT / "outputs" / "workbench_uploads"
 MEDIA_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
-COLOR_MAP = {
-    "白色": "&H00FFFFFF", "黄色": "&H0000FFFF", "青色": "&H00FFFF00",
-    "绿色": "&H0000FF00", "黑色": "&H00000000", "灰色": "&H00808080", "蓝色": "&H00FF0000",
-}
-
-
 def _safe_options(value: Any) -> dict[str, Any]:
-    """Normalize the workbench form into PipelineOptions-compatible values."""
-    raw = value if isinstance(value, dict) else {}
-    translator = str(raw.get("translator", "deepseek")).lower()
-    if translator not in {"deepseek", "openai", "none"}:
-        raise ValueError("translator must be deepseek, openai, or none.")
-    subtitle_source = str(raw.get("subtitle_source", "merged"))
-    if subtitle_source not in {"auto", "audio", "ocr", "merged"}:
-        raise ValueError("Unknown subtitle source.")
-    display_mode = str(raw.get("subtitle_display_mode", "translated"))
-    if display_mode not in {"translated", "bilingual-source-first", "bilingual-translation-first"}:
-        raise ValueError("Unknown subtitle display mode.")
-    try:
-        font_size = max(8, min(96, int(raw.get("font_size", 24))))
-        max_seconds = raw.get("max_seconds")
-        max_seconds = None if max_seconds in {None, "", 0, "0"} else max(1, int(max_seconds))
-    except (TypeError, ValueError) as exc:
-        raise ValueError("Font size and URL duration must be valid numbers.") from exc
-    effect = str(raw.get("subtitle_effect", "描边"))
-    output_dir = str(raw.get("output_dir") or OUTPUT_ROOT)
-    cookies_file = str(raw.get("cookies_file", "")).strip() or os.getenv("YBLOCALIZER_COOKIES_FILE", "").strip() or None
-    cookies_from_browser = str(raw.get("cookies_from_browser", "")).strip() or None
-    if cookies_file:
-        # 已配置 cookies.txt 时忽略浏览器来源，避免 UI 状态混乱导致读取失败
-        cookies_from_browser = None
-    return {
-        "title": str(raw.get("title", "")).strip() or None,
-        "require_reuse_allowed": bool(raw.get("require_reuse_allowed", False)),
-        "cookies_from_browser": cookies_from_browser,
-        "cookies_file": cookies_file,
-        "max_seconds": max_seconds,
-        "subtitle_source": subtitle_source,
-        "whisper_model_size": str(raw.get("whisper_model_size", "small")),
-        "source_language": str(raw.get("source_language", "")).strip() or None,
-        "beam_size": max(1, min(10, int(raw.get("beam_size", 5)))),
-        "ocr_interval": max(0.2, float(raw.get("ocr_interval", 1.0))),
-        "ocr_crop_ratio": max(0.05, min(1.0, float(raw.get("ocr_crop_ratio", 0.30)))),
-        "ocr_min_chars": max(1, int(raw.get("ocr_min_chars", 3))),
-        "subtitle_margin_ratio": max(0.01, min(0.4, float(raw.get("subtitle_margin_ratio", 0.055)))),
-        "render_crf": max(14, min(32, int(raw.get("render_crf", 20)))),
-        "translator": translator,
-        "target_lang": str(raw.get("target_lang", "zh-Hans")).strip() or "zh-Hans",
-        "translate_model": str(raw.get("translate_model", "")).strip() or None,
-        "smart_translation": bool(raw.get("smart_translation", True)),
-        "smart_subtitle_layout": bool(raw.get("smart_subtitle_layout", True)),
-        "font_name": str(raw.get("font_name", "Microsoft YaHei")).strip() or "Microsoft YaHei",
-        "font_size": font_size,
-        "subtitle_display_mode": display_mode,
-        "subtitle_color": COLOR_MAP.get(str(raw.get("subtitle_color", "白色")), "&H00FFFFFF"),
-        "subtitle_outline_color": COLOR_MAP.get(str(raw.get("subtitle_outline_color", "黑色")), "&H00000000"),
-        "subtitle_outline": 0 if effect in {"阴影", "无"} else 1,
-        "subtitle_shadow": 1 if effect in {"阴影", "描边+阴影"} else 0,
-        "output_dir": output_dir,
-        "description": str(raw.get("description", "")).strip(),
-        "tags": [str(item).strip() for item in raw.get("tags", []) if str(item).strip()] if isinstance(raw.get("tags", []), list) else [],
-        "publish_to_bilibili": bool(raw.get("publish_to_bilibili", False)),
-        "include_source_link": bool(raw.get("include_source_link", True)),
-        "bilibili_browser": "msedge" if str(raw.get("bilibili_browser", "chromium")).lower() in {"edge", "msedge"} else "chromium",
-        "close_after_fill": bool(raw.get("close_after_fill", False)),
-    }
+    """Compatibility adapter; defaults and validation live in one module."""
+    return normalize_options(value, str(OUTPUT_ROOT))
 
 
 def _resolve_output_root(value: str) -> Path:
@@ -159,6 +108,37 @@ def _cookies_file_has_login(path: Path) -> bool:
     except OSError:
         return False
     return "\tSID\t" in text or "\tHSID\t" in text or "LOGIN_INFO" in text
+
+
+def _read_srt_rows(path: Path) -> list[tuple[float, float, str]]:
+    if not path.is_file():
+        return []
+    rows: list[tuple[float, float, str]] = []
+    for block in re.split(r"\r?\n\s*\r?\n", path.read_text(encoding="utf-8-sig")):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if len(lines) < 2:
+            continue
+        timing_index = next((index for index, line in enumerate(lines) if "-->" in line), -1)
+        if timing_index < 0:
+            continue
+        try:
+            start_raw, end_raw = (part.strip() for part in lines[timing_index].split("-->", 1))
+            def seconds(value: str) -> float:
+                hours, minutes, rest = value.replace(",", ".").split(":")
+                return int(hours) * 3600 + int(minutes) * 60 + float(rest)
+            rows.append((seconds(start_raw), seconds(end_raw), "\n".join(lines[timing_index + 1:])))
+        except (ValueError, IndexError):
+            continue
+    return rows
+
+
+def _demo_cues(source_path: Path, translated_path: Path) -> list[dict[str, Any]]:
+    source_rows, translated_rows = _read_srt_rows(source_path), _read_srt_rows(translated_path)
+    return [
+        {"id": index, "start": start, "end": end, "source": text,
+         "translated": translated_rows[index][2] if index < len(translated_rows) else text, "kind": "demo"}
+        for index, (start, end, text) in enumerate(source_rows)
+    ]
 
 
 def _upsert_env(path: Path, updates: dict[str, str]) -> None:
@@ -284,6 +264,19 @@ def stage_from_log(message: str) -> tuple[str, int]:
     return "处理中", 8
 
 
+def _classify_job_error(exc: Exception) -> tuple[str, str]:
+    text = str(exc).lower()
+    if "ffmpeg" in text:
+        return "ffmpeg_unavailable", "安装 FFmpeg 并加入 PATH，然后重新运行配置检查。"
+    if "api key" in text or "authentication" in text:
+        return "translator_auth_failed", "在设置中重新保存翻译 API Key。"
+    if "cookie" in text or "not a bot" in text:
+        return "youtube_auth_required", "重新导出已登录 YouTube 的 cookies.txt，或选择可用的浏览器 Cookies。"
+    if "cuda" in text or "out of memory" in text:
+        return "compute_failed", "切换到 CPU + int8，或选择更小的 Whisper 模型。"
+    return "pipeline_failed", "打开完整日志查看失败阶段，修正配置后重试。"
+
+
 def public_path(path: Path | None) -> str | None:
     if path is None:
         return None
@@ -352,6 +345,8 @@ class DemoJob:
     progress: int = 0
     logs: list[str] = field(default_factory=list)
     error: str | None = None
+    error_code: str | None = None
+    suggested_action: str | None = None
     result: dict[str, str] | None = None
     work_dir: Path | None = None
     raw_video: Path | None = None
@@ -360,17 +355,25 @@ class DemoJob:
     duration_override: float | None = None
     started_at: float | None = None
     finished_at: float | None = None
+    cancellation: CancellationToken = field(default_factory=CancellationToken, repr=False)
 
     def add_log(self, message: str) -> None:
         self.logs.append(message)
-        match = re.search(r"\[p=(\d+)\]", message)
-        if match:
-            self.progress = max(self.progress, min(100, int(match.group(1))))
-            return
-        stage, progress = stage_from_log(message)
-        if stage != "处理中":
-            self.stage = stage
-        self.progress = max(self.progress, progress)
+        self._write_log(message)
+
+    def apply_event(self, event: PipelineEvent) -> None:
+        self.stage = STAGE_LABELS[event.stage]
+        self.progress = max(self.progress, event.progress)
+        if not self.logs or self.logs[-1] != event.message:
+            self.logs.append(event.message)
+            self._write_log(event.message)
+
+    def _write_log(self, message: str) -> None:
+        try:
+            with (LOG_ROOT / f"{self.id}.log").open("a", encoding="utf-8") as stream:
+                stream.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+        except OSError:
+            LOGGER.warning("Could not append per-job log for %s", self.id)
 
     def snapshot(self) -> dict[str, Any]:
         material = self.material.snapshot()
@@ -378,7 +381,8 @@ class DemoJob:
             material["duration_seconds"] = self.duration_override
         return {
             "id": self.id, "status": self.status, "stage": self.stage, "progress": self.progress,
-            "logs": self.logs, "error": self.error, "result": self.result,
+            "logs": self.logs, "error": self.error, "error_code": self.error_code,
+            "suggested_action": self.suggested_action, "result": self.result,
             "device": self.device, "compute_type": self.compute_type, "material": material,
             "options": _public_options(self.options),
             "started_at": self.started_at,
@@ -407,7 +411,7 @@ class PublishSession:
 
 
 class WorkbenchJobs:
-    """One media job at a time because pipeline cancellation is process-global."""
+    """Application service for live workbench jobs and persisted snapshots."""
 
     def __init__(self) -> None:
         demo_duration, demo_width, demo_height = _probe_media(DEMO_VIDEO)
@@ -485,21 +489,8 @@ class WorkbenchJobs:
                     "finished_at": job.finished_at,
                 }
             job_db.record_job(**snapshot)
-            try:
-                (USER_DATA_ROOT / "history_debug.log").write_text(
-                    "{} persisted ({} -> {})\n".format(job.id[:8], job.status, snapshot["created_at"]),
-                    encoding="utf-8", append=True,
-                )
-            except Exception:
-                pass
         except Exception as exc:  # pragma: no cover - storage must never break tasks
-            try:
-                (USER_DATA_ROOT / "history_errors.log").write_text(
-                    "{}: {}\n".format(time.strftime("%Y-%m-%d %H:%M:%S"), exc),
-                    encoding="utf-8", append=True,
-                )
-            except Exception:
-                pass
+            LOGGER.exception("Could not persist job %s: %s", job.id, exc)
 
     def publish_session(self) -> PublishSession:
         with self._lock:
@@ -577,10 +568,9 @@ class WorkbenchJobs:
         with self._lock:
             job = self._jobs.get(job_id)
             if job and job.status in {"queued", "running"}:
-                job.status = "cancelling"
-                job.stage = "正在取消"
+                transition_job(job, "cancelling", "正在取消")
                 job.add_log("Cancellation requested from workbench.")
-                request_cancellation()
+                job.cancellation.cancel()
         if job:
             self._persist(job)
         return job
@@ -859,7 +849,7 @@ class WorkbenchJobs:
                 "-map", "0:v:0?", "-map", "0:a:0?",
                 str(kept_video),
             ],
-            cancel_check=is_cancellation_requested,
+            cancel_check=job.cancellation.is_cancelled,
         )
         if not kept_video.exists():
             raise RuntimeError("截取保留没有生成输出文件。")
@@ -890,7 +880,7 @@ class WorkbenchJobs:
                 "-map", "0:v:0?", "-map", "0:a:0?",
                 str(muted),
             ],
-            cancel_check=is_cancellation_requested,
+            cancel_check=job.cancellation.is_cancelled,
         )
         if not muted.exists():
             raise RuntimeError("静音处理没有生成输出文件。")
@@ -913,7 +903,7 @@ class WorkbenchJobs:
                         "-map", "0:v:0?", "-map", "0:a:0?",
                         str(part),
                     ],
-                    cancel_check=is_cancellation_requested,
+                    cancel_check=job.cancellation.is_cancelled,
                 )
                 parts.append(part)
             reordered = work_dir / f"reordered-{uuid.uuid4().hex[:8]}.mp4"
@@ -925,7 +915,7 @@ class WorkbenchJobs:
                     "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
                     "-c", "copy", str(reordered),
                 ],
-                cancel_check=is_cancellation_requested,
+                cancel_check=job.cancellation.is_cancelled,
             )
         finally:
             for part in parts:
@@ -1023,7 +1013,7 @@ class WorkbenchJobs:
                 "-map", "0:v:0?", "-map", "0:a:0?",
                 str(out),
             ],
-            cancel_check=is_cancellation_requested,
+            cancel_check=job.cancellation.is_cancelled,
         )
         if not out.exists():
             raise RuntimeError("导出片段失败。")
@@ -1089,7 +1079,7 @@ class WorkbenchJobs:
                 "-map", "0:v:0?", "-map", "0:a:0?",
                 str(trimmed),
             ],
-            cancel_check=is_cancellation_requested,
+            cancel_check=job.cancellation.is_cancelled,
         )
         if not trimmed.exists():
             raise RuntimeError("Trimming produced no output video.")
@@ -1172,10 +1162,8 @@ class WorkbenchJobs:
     def _run_pipeline(self, job: DemoJob) -> None:
         load_dotenv(USER_DATA_ROOT / ".env")
         with self._lock:
-            job.status = "running"
+            transition_job(job, "running", "准备素材", progress=4)
             job.started_at = time.time()
-            job.stage = "准备素材"
-            job.progress = 4
             job.add_log(f"Started {job.material.name}.")
 
         def log(message: str) -> None:
@@ -1185,7 +1173,11 @@ class WorkbenchJobs:
         def download_progress(fraction: float) -> None:
             # 准备素材阶段：4% -> 12% 反映真实下载字节进度
             with self._lock:
-                job.add_log(f"[p={4 + int(8 * max(0.0, min(1.0, fraction)))}] 正在下载视频 {int(fraction * 100)}%…")
+                job.progress = max(job.progress, 4 + int(8 * max(0.0, min(1.0, fraction))))
+
+        def on_event(event: PipelineEvent) -> None:
+            with self._lock:
+                job.apply_event(event)
 
         try:
             source_url = job.material.source_url
@@ -1208,16 +1200,17 @@ class WorkbenchJobs:
                 publish_to_bilibili=options["publish_to_bilibili"], include_source_link_in_description=options["include_source_link"],
                 bilibili_browser=options["bilibili_browser"], bilibili_profile_dir=USER_DATA_ROOT / "data" / ("bilibili-edge-profile" if options["bilibili_browser"] == "msedge" else "bilibili-profile"),
                 bilibili_wait_for_review=not options["close_after_fill"],
-            ), log=log, progress=download_progress)
+            ), log=log, progress=download_progress, context=PipelineContext(job.cancellation, on_event))
         except CancellationError:
             with self._lock:
-                job.status, job.stage = "cancelled", "已取消"
+                transition_job(job, "cancelled", "已取消")
                 job.finished_at = time.time()
                 job.add_log("Task was cancelled.")
         except Exception as exc:
             traceback.print_exc()
             with self._lock:
-                job.status, job.stage, job.error = "failed", "处理失败", str(exc)
+                transition_job(job, "failed", "处理失败", error=str(exc))
+                job.error_code, job.suggested_action = _classify_job_error(exc)
                 job.finished_at = time.time()
                 job.add_log(f"Task failed: {exc}")
         else:
@@ -1229,7 +1222,7 @@ class WorkbenchJobs:
                     "translated_srt": public_path(result.translated_srt) or "", "rendered_video": public_path(result.rendered_video) or "",
                 }
                 job.add_log("Task completed successfully.")
-                job.status, job.stage, job.progress = "completed", "处理完成", 100
+                transition_job(job, "completed", "处理完成", progress=100)
                 job.finished_at = time.time()
         finally:
             with self._lock:
@@ -1278,7 +1271,28 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         if path == "/api/health":
-            self._json({"ok": True, "demo_source": "demo/authorized-demo-10s.mp4"}); return
+            self._json({"ok": True, "version": __version__}); return
+        if path == "/api/bootstrap":
+            self._json({
+                "version": __version__,
+                "defaults": default_options(str(OUTPUT_ROOT)),
+                "capabilities": capabilities(),
+                "demo": {
+                    "name": "authorized-demo-10s.mp4", "duration_seconds": 10,
+                    "source_media": "/api/demo/source", "rendered_media": "/api/demo/rendered",
+                    "cues": "/api/demo/cues",
+                },
+                "legacy_gui": {"supported": True, "status": "maintenance", "message": "旧 Tk GUI 仅维护兼容性，不再新增功能。"},
+            }); return
+        if path in {"/api/demo/source", "/api/demo/rendered"}:
+            demo_path = DEMO_VIDEO if path.endswith("source") else ASSET_ROOT / "demo" / "artifacts" / "rendered.mp4"
+            if demo_path.is_file(): self._serve_media(demo_path)
+            else: self._json({"error": "Demo artifact is not available."}, HTTPStatus.NOT_FOUND)
+            return
+        if path == "/api/demo/cues":
+            source_path = ASSET_ROOT / "demo" / "artifacts" / "source.srt"
+            translated_path = ASSET_ROOT / "demo" / "artifacts" / "zh.srt"
+            self._json({"cues": _demo_cues(source_path, translated_path), "translation_ready": True}); return
         if path == "/api/settings":
             cookies_file = os.getenv("YBLOCALIZER_COOKIES_FILE", "")
             try:
@@ -1386,8 +1400,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 self._json({"title": metadata.title, "duration": metadata.duration, "license": metadata.license, "view_count": metadata.view_count, "webpage_url": metadata.webpage_url, "thumbnail_url": metadata.thumbnail_url})
             except Exception as exc: self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
-        if path == "/api/readiness":
-            self._json(self._readiness(payload)); return
+        if path in {"/api/preflight", "/api/readiness"}:
+            result = preflight(
+                payload, str(OUTPUT_ROOT),
+                lambda browser: bool(self._publish_profile_process_ids(browser)),
+            )
+            if path == "/api/readiness":
+                result["issues"] = [item["message"] for item in result["blocking"]]
+                result["message"] = "基础配置可以运行。" if result["ready"] else "；".join(result["issues"])
+            self._json(result); return
         if path == "/api/publish/native-video":
             try: self._json(self.jobs.publish_file_metadata(str(payload.get("token", ""))))
             except ValueError as exc: self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -1552,20 +1573,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def _diagnostics(self) -> dict[str, Any]:
         """Report first-run prerequisites without exposing local secrets or paths."""
         checks = []
-        for command, label, purpose, install_hint in (
-            ("ffmpeg", "FFmpeg", "提取音频与硬字幕渲染", "安装 FFmpeg，并将其加入 PATH 后重启本工具。"),
-            ("node", "Node.js", "OCR 字幕识别服务", "安装 Node.js LTS，并将其加入 PATH 后重启本工具。"),
-            ("tesseract", "Tesseract", "OCR 字幕识别引擎", "安装 Tesseract OCR，并将其加入 PATH 后重启本工具。"),
-        ):
-            available = shutil.which(command) is not None
-            checks.append({
-                "id": command,
-                "label": label,
-                "purpose": purpose,
-                "available": available,
-                "message": "已检测到。" if available else install_hint,
-            })
-        return {"ready": all(check["available"] for check in checks), "checks": checks}
+        for command, item in capabilities().items():
+            checks.append({"id": command, **item, "message": "已检测到。" if item["available"] else ("必需组件未安装。" if item["required"] else "可选组件未安装；不影响默认音频模式。")})
+        return {"ready": all(check["available"] for check in checks if check["required"]), "checks": checks}
 
     @staticmethod
     def _path_is_within(path: Path, root: Path) -> bool:
@@ -1675,23 +1685,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             return []
 
     def _readiness(self, payload: dict[str, Any]) -> dict[str, Any]:
-        options = _safe_options(payload.get("options"))
-        source_url = str(payload.get("source_url", "")).strip()
-        has_material = bool(payload.get("material_id"))
-        authorized = bool(payload.get("authorized", False))
-        device = str(payload.get("device", "cpu")).lower()
-        compute_type = str(payload.get("compute_type", "int8")).lower()
-        issues: list[str] = []
-        if not source_url and not has_material: issues.append("还没有选择素材。")
-        if not authorized: issues.append("还没有确认处理授权。")
-        if source_url and options["max_seconds"] is not None and options["max_seconds"] < 1: issues.append("URL 读取长度必须大于 0。")
-        if options["target_lang"].lower().startswith("zh") and options["translator"] == "none": issues.append("中文字幕不能使用 none 翻译器。")
-        if options["translator"] == "deepseek" and not os.getenv("DEEPSEEK_API_KEY"): issues.append("DeepSeek API Key 尚未配置。")
-        if options["translator"] == "openai" and not os.getenv("OPENAI_API_KEY"): issues.append("OpenAI API Key 尚未配置。")
-        if options["cookies_file"] and not Path(options["cookies_file"]).expanduser().is_file(): issues.append("Cookies 文件不存在，请重新选择。")
-        if device == "cpu" and compute_type in {"float16", "int8_float16"}: issues.append("CPU 不支持当前 float16 精度，请使用 int8 或 float32。")
-        if options["publish_to_bilibili"] and self._publish_profile_process_ids(options["bilibili_browser"]): issues.append("B 站自动化浏览器正在使用中，请关闭后再开始全流程。")
-        return {"ready": not issues, "issues": issues, "message": "基础配置可以运行。" if not issues else "；".join(issues)}
+        result = preflight(payload, str(OUTPUT_ROOT), lambda browser: bool(self._publish_profile_process_ids(browser)))
+        issues = [item["message"] for item in result["blocking"]]
+        return {**result, "issues": issues, "message": "基础配置可以运行。" if result["ready"] else "；".join(issues)}
 
     def _start_publish_check(self, payload: dict[str, Any]) -> None:
         browser = "msedge" if str(payload.get("browser", "chromium")).lower() in {"edge", "msedge"} else "chromium"
@@ -1903,6 +1899,9 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 def build_server(frontend_dir: Path, host: str, port: int) -> ThreadingHTTPServer:
     class Handler(WorkbenchHandler): pass
     job_db.init_db()
+    recovered = job_db.recover_interrupted_jobs(time.time())
+    if recovered:
+        LOGGER.warning("Recovered %d interrupted job(s) from the previous process", recovered)
     Handler.frontend_dir, Handler.jobs = frontend_dir.resolve(), WorkbenchJobs()
 
     class WorkbenchHTTPServer(ThreadingHTTPServer):

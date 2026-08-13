@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import Callable
 
-from .cancellation import check_cancelled
+from .cancellation import check_cancelled as legacy_check_cancelled
 from .models import Segment, save_segments
 from .subtitle import write_srt
 
@@ -23,8 +23,10 @@ def transcribe_audio(
     initial_prompt: str | None = None,
     beam_size: int = 5,
     log: LogFn | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> list[Segment]:
-    check_cancelled()
+    check = cancel_check or legacy_check_cancelled
+    check()
     if device.strip().lower() in {"cuda", "auto"}:
         _prepend_nvidia_cuda_dll_paths()
     try:
@@ -53,7 +55,7 @@ def transcribe_audio(
             )
             raw_segments = []
             for item in whisper_segments:
-                check_cancelled()
+                check()
                 text = item.text.strip()
                 if text:
                     raw_segments.append(Segment(start=float(item.start), end=float(item.end), text=text))

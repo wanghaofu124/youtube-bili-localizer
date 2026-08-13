@@ -4,6 +4,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 import re
 import shutil
+from typing import Callable
 
 from .models import Segment, save_segments
 from .subtitle import write_srt
@@ -143,6 +144,7 @@ def extract_ocr_subtitles(
     interval_seconds: float = 1.0,
     crop_bottom_ratio: float = 0.30,
     min_chars: int = 3,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> list[Segment]:
     """Extract burned-in English subtitles from video frames with OCR.
 
@@ -164,6 +166,7 @@ def extract_ocr_subtitles(
             interval_seconds=interval_seconds,
             y_ratio=y_ratio,
             height_ratio=height_ratio,
+            cancel_check=cancel_check,
         )
         frames = sorted(frame_dir.glob("frame-*.png"))
         if not frames:
@@ -198,6 +201,7 @@ def _extract_region_frames(
     interval_seconds: float,
     y_ratio: float,
     height_ratio: float,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> None:
     if frame_dir.exists():
         shutil.rmtree(frame_dir)
@@ -216,7 +220,8 @@ def _extract_region_frames(
             "-vsync",
             "0",
             str(frame_pattern),
-        ]
+        ],
+        cancel_check=cancel_check,
     )
 
 

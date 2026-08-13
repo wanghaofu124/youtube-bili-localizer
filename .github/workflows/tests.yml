@@ -22,3 +22,11 @@ jobs:
         run: python -m compileall -q src
       - name: Run mocked tests
         run: python -m pytest -q
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build desktop frontend
+        working-directory: frontend
+        run: npm ci && npm run build

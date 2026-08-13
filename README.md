@@ -125,6 +125,8 @@ GitHub Actions 在 Ubuntu 的 Python 3.10 与 3.12 上运行编译检查和 mock
 
 ## 架构与关键取舍
 
+v0.2 将 React 工作台确定为唯一新增功能的 UI，旧 Tk GUI 进入兼容维护。默认值、能力探测与预检统一由后端提供；任务使用独立取消令牌和结构化阶段事件，跨启动历史由 SQLite 管理。详细边界见 [v0.2 架构说明](docs/architecture-v0.2.md)。
+
 | 设计 | 原因 |
 | --- | --- |
 | 重型依赖惰性导入 | CLI 帮助、测试和非模型功能不需要下载或加载 Whisper / Playwright。 |

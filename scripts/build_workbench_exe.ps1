@@ -25,19 +25,19 @@ if ($Clean) {
     Remove-Item -Force -LiteralPath (Join-Path $ProjectRoot "dist\$AppName.exe") -ErrorAction SilentlyContinue
 }
 
-$ExcludedModules = @("torch", "pandas", "scipy", "pytest", "matplotlib", "IPython", "jupyter", "notebook", "tensorboard")
+$ExcludedModules = @("torch", "torchvision", "torchaudio", "onnxruntime", "pyarrow", "pandas", "scipy", "pytest", "matplotlib", "IPython", "jupyter", "notebook", "tensorboard")
 $Arguments = @("-m", "PyInstaller", "--noconfirm", "--clean", "--onedir", "--windowed", "--icon", "assets\\app-icon.ico", "--name", $AppName, "--paths", "src")
 foreach ($module in $ExcludedModules) { $Arguments += @("--exclude-module", $module) }
 $Arguments += @(
-    "--collect-all", "faster_whisper",
-    "--collect-all", "ctranslate2",
-    "--collect-all", "pytesseract",
-    "--collect-all", "webview",
-    "--collect-all", "pythonnet",
+    "--collect-submodules", "faster_whisper",
+    "--collect-data", "faster_whisper",
+    "--collect-binaries", "ctranslate2",
+    "--collect-submodules", "webview",
     "--hidden-import", "webview.platforms.edgechromium",
     "--hidden-import", "openai",
     "--add-data", "frontend\dist;frontend\dist",
     "--add-data", "demo\authorized-demo-10s.mp4;demo",
+    "--add-data", "demo\artifacts;demo\artifacts",
     "scripts\launch_workbench.py"
 )
 

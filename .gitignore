@@ -8,6 +8,8 @@ __pycache__/
 .playwright/
 build/
 dist/
+.release-build/
+releases/
 *.spec
 *.egg-info/
 data/

@@ -8,7 +8,7 @@ from typing import Callable
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from .cancellation import check_cancelled
+from .cancellation import check_cancelled as legacy_check_cancelled
 from .models import VideoJob
 from .util import require_command, slugify
 
@@ -103,7 +103,9 @@ def download_with_ytdlp(
     cookies_from_browser: str | None = None,
     cookies_file: str | None = None,
     progress: Callable[[float], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> VideoJob:
+    check = cancel_check or legacy_check_cancelled
     _validate_video_url(url)
     try:
         import yt_dlp
@@ -114,7 +116,7 @@ def download_with_ytdlp(
     outtmpl = str(work_dir / "%(id)s.%(ext)s")
 
     def download_progress(status: dict) -> None:
-        check_cancelled()
+        check()
         if progress is None:
             return
         if status.get("status") == "downloading":
@@ -150,7 +152,7 @@ def download_with_ytdlp(
         opts["cookiesfrombrowser"] = (cookies_from_browser,)
 
     try:
-        check_cancelled()
+        check()
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
             license_text = info.get("license") or ""
@@ -160,7 +162,7 @@ def download_with_ytdlp(
                     "如果你确认已获得处理或转载授权，请在素材页取消勾选「仅接受 CC reuse allowed」后重新开始任务。"
                 )
             info = ydl.extract_info(url, download=True)
-        check_cancelled()
+        check()
     except Exception as exc:
         _raise_with_cookie_hint(exc, cookies_from_browser)
 

@@ -65,7 +65,7 @@ class LocalizerApp(tk.Tk):
         super().__init__()
         if load_dotenv:
             load_dotenv()
-        self.title("YouTube Bili Localizer")
+        self.title("YouTube Bili Localizer（旧版兼容界面）")
         self.geometry("1080x800")
         self.minsize(980, 720)
         self.log_queue: queue.Queue[str] = queue.Queue()
@@ -98,7 +98,7 @@ class LocalizerApp(tk.Tk):
         self.target_lang = tk.StringVar(value="zh-Hans")
         self.translate_model = tk.StringVar(value="")
         self.api_key = tk.StringVar(value=os.getenv("DEEPSEEK_API_KEY", ""))
-        self.subtitle_source = tk.StringVar(value="音频 + 画面文字合并")
+        self.subtitle_source = tk.StringVar(value="音频转写")
         self.whisper_model = tk.StringVar(value="small")
         self.source_language = tk.StringVar(value="自动检测")
         self.device = tk.StringVar(value="cpu")
@@ -516,7 +516,7 @@ class LocalizerApp(tk.Tk):
     def _apply_easy_defaults(self) -> None:
         self.translator.set("deepseek")
         self.target_lang.set("zh-Hans")
-        self.subtitle_source.set("音频 + 画面文字合并")
+        self.subtitle_source.set("音频转写")
         self.subtitle_mode.set("中文单语")
         self.source_language.set("自动检测")
         self.whisper_model.set("small")
