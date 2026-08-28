@@ -1,6 +1,6 @@
 param(
     [switch]$Clean,
-    [string]$Version = "0.2.5",
+    [string]$Version = "0.2.6",
     [string]$AppName = "YouTubeBiliLocalizer",
     [string]$PythonExe = "",
     [string]$SigningThumbprint = "",

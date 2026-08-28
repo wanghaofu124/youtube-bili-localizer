@@ -10,6 +10,7 @@ import subprocess
 import uuid
 from typing import Any, Callable
 
+from . import dependencies
 from .download import download_with_ytdlp, import_local_video
 from .media import extract_audio
 from .models import VideoJob, load_segments, save_segments
@@ -436,10 +437,13 @@ def run_stage(name: str, options: Any, work_dir: Path, artifacts: WorkflowArtifa
 def validate_media(path: Path, kind: str = "video") -> bool:
     if not path.is_file() or path.stat().st_size <= 0:
         return False
+    ffprobe = dependencies.resolve_command("ffprobe")
+    if ffprobe is None:
+        return False
     selector = "v:0" if kind == "video" else "a:0"
     try:
         result = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", selector, "-show_entries", "stream=index", "-of", "json", str(path)],
+            [str(ffprobe), "-v", "error", "-select_streams", selector, "-show_entries", "stream=index", "-of", "json", str(path)],
             capture_output=True, text=True, timeout=15,
         )
         return result.returncode == 0 and bool((json.loads(result.stdout).get("streams") or []))

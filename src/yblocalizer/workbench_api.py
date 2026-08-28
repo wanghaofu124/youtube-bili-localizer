@@ -18,6 +18,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -3031,10 +3032,26 @@ def build_server(frontend_dir: Path, host: str, port: int) -> ThreadingHTTPServe
                     + body
                 )
                 try:
+                    # Drain the already-sent request headers before closing.
+                    # Closing a Windows socket with unread inbound bytes can
+                    # turn this graceful 503 into WSAECONNABORTED on the
+                    # client, hiding the useful overload message.
+                    request.settimeout(0.1)
+                    received = bytearray()
+                    try:
+                        while len(received) < 64 * 1024 and b"\r\n\r\n" not in received:
+                            chunk = request.recv(4096)
+                            if not chunk:
+                                break
+                            received.extend(chunk)
+                    except (OSError, TimeoutError):
+                        pass
                     request.sendall(response)
+                    try:
+                        request.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
                 finally:
-                    # Avoid an immediate full-duplex shutdown on Windows,
-                    # which can reset the connection before the 503 is read.
                     self.close_request(request)
                 return
             try:

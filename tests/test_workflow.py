@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ from yblocalizer.workflow import (
     invalidate_downstream,
     invalidation_stage,
     new_stage_states,
+    validate_media,
     validate_segments,
     validate_srt,
 )
@@ -69,6 +71,25 @@ def test_subtitle_checkpoint_validation_rejects_malformed_files(tmp_path: Path) 
     subtitle.write_text("not an srt", encoding="utf-8")
     assert not validate_segments(segments)
     assert not validate_srt(subtitle)
+
+
+def test_media_validation_uses_the_managed_ffprobe_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    media = tmp_path / "input.mp4"
+    media.write_bytes(b"media")
+    managed = tmp_path / "tools" / "ffprobe"
+    seen: list[str] = []
+
+    monkeypatch.setattr("yblocalizer.dependencies.resolve_command", lambda name: managed if name == "ffprobe" else None)
+
+    def fake_run(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        seen.append(command[0])
+        return SimpleNamespace(returncode=0, stdout='{"streams":[{"index":0}]}')
+
+    monkeypatch.setattr("yblocalizer.workflow.subprocess.run", fake_run)
+    assert validate_media(media)
+    assert seen == [str(managed)]
 
 
 def test_transcription_refuses_to_download_a_missing_model(tmp_path: Path) -> None:

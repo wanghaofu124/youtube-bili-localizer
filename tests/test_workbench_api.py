@@ -664,6 +664,7 @@ def test_staged_job_api_creates_draft_prepares_then_runs_one_stage(
     monkeypatch.setattr("yblocalizer.dependencies.resolve_command", lambda name, tools_root=None: Path(f"C:/tools/{name}.exe"))
     monkeypatch.setattr("yblocalizer.workbench_api.require_whisper_model", lambda size, root=None: tmp_path / size)
     monkeypatch.setattr("yblocalizer.workbench_api.render_encoder_status", lambda: {"cpu": True, "nvidia": False})
+    monkeypatch.setattr("yblocalizer.workflow.validate_media", lambda *_args: True)
     def fake_start(self, job, stages, *, auto_run):
         job.status, job.current_stage, job.auto_run = "running", stages[0], auto_run
         return job

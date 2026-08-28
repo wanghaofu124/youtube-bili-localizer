@@ -107,7 +107,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 公开交付应使用固定的 Python 3.12 构建环境：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1 -Clean -Version 0.2.5 -PythonExe C:\Python312\python.exe
+powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1 -Clean -Version 0.2.6 -PythonExe C:\Python312\python.exe
 ```
 
 `requirements-build.lock` 固定 Windows onedir 构建依赖。若已安装 Inno Setup 6，可继续执行 `scripts\build_installer.ps1` 生成带卸载项和快捷方式的普通用户安装程序；脚本会从 Inno 官方仓库获取固定提交的简体中文语言文件，并校验 SHA-256。公开 Release 应提供代码签名证书，并给两个脚本传入 `-SigningThumbprint` 与 `-RequireSignature`；本地测试包可以保持未签名，但不应冒充正式签名版本。

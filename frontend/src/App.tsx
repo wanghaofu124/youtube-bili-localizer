@@ -403,7 +403,7 @@ function App() {
   const [device, setDevice] = useState("cuda");
   const [computeType, setComputeType] = useState("float16");
   const [options, setOptions] = useState<Options>(defaults);
-  const [appVersion, setAppVersion] = useState("0.2.5");
+  const [appVersion, setAppVersion] = useState("0.2.6");
   const [demoPreview, setDemoPreview] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const [cues, setCues] = useState<Cue[]>([]);
