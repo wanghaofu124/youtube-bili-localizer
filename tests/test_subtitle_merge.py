@@ -14,3 +14,11 @@ def test_merge_preserves_useful_visual_label() -> None:
 def test_merge_ignores_empty_ocr_and_returns_audio() -> None:
     audio = [Segment(0, 1, "hello")]
     assert merge_audio_ocr_segments(audio, [Segment(0, 1, "...")]) == audio
+
+
+def test_merge_keeps_standalone_cjk_ocr_text() -> None:
+    merged = merge_audio_ocr_segments(
+        [Segment(3, 4, "Later audio line")],
+        [Segment(0, 1.5, "这是画面中的中文字幕")],
+    )
+    assert [item.text for item in merged] == ["这是画面中的中文字幕", "Later audio line"]

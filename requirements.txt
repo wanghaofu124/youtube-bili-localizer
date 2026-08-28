@@ -1,6 +1,7 @@
 # 常规安装请使用 pyproject.toml（推荐）：pip install -e ".[dev]"
 # 本文件仅在你需要额外安装 Windows CUDA 加速包时使用：pip install -r requirements.txt
 yt-dlp>=2025.1.0
+yt-dlp-getpot-wpc>=1.1.2,<2
 faster-whisper>=1.1.0
 openai>=1.0.0
 playwright>=1.40.0

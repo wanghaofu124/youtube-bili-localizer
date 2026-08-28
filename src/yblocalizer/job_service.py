@@ -11,13 +11,16 @@ class MutableJob(Protocol):
 
 
 ALLOWED_TRANSITIONS: dict[str, set[str]] = {
+    "draft": {"preparing", "ready", "running", "cancelled", "failed"},
+    "preparing": {"draft", "ready", "failed"},
+    "ready": {"draft", "running", "completed"},
     "queued": {"running", "cancelling", "cancelled", "failed"},
     "running": {"cancelling", "cancelled", "completed", "failed"},
     "cancelling": {"cancelled", "failed"},
-    "completed": {"running"},
-    "failed": {"running"},
-    "cancelled": {"running"},
-    "interrupted": {"running"},
+    "completed": {"draft", "ready", "running"},
+    "failed": {"draft", "ready", "running"},
+    "cancelled": {"draft", "ready", "running"},
+    "interrupted": {"draft", "ready", "running"},
 }
 
 

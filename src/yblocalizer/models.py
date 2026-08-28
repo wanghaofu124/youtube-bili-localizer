@@ -45,10 +45,16 @@ class PublishMetadata:
 
 def save_segments(path: Path, segments: list[Segment]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps([asdict(segment) for segment in segments], ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        temporary.write_text(
+            json.dumps([asdict(segment) for segment in segments], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def load_segments(path: Path) -> list[Segment]:

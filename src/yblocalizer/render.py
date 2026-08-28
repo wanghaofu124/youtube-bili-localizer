@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Callable
 
 from .cancellation import is_cancellation_requested
+from .performance import ffmpeg_thread_args, normalize_resource_profile
 from .util import require_command, run
+from .dependencies import resolve_command
 
 
 def _probe_video_size(path: Path) -> tuple[int, int] | None:
@@ -29,6 +31,47 @@ def _probe_video_size(path: Path) -> tuple[int, int] | None:
     return None
 
 
+def render_encoder_status() -> dict[str, bool]:
+    """Return encoders that are realistically usable on this machine."""
+    ffmpeg = resolve_command("ffmpeg")
+    if ffmpeg is None:
+        return {"cpu": False, "nvidia": False}
+    try:
+        completed = subprocess.run(
+            [str(ffmpeg), "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        encoders = completed.stdout + completed.stderr
+    except (OSError, subprocess.SubprocessError):
+        encoders = ""
+    return {
+        "cpu": "libx264" in encoders,
+        "nvidia": "h264_nvenc" in encoders and resolve_command("nvidia-smi") is not None,
+    }
+
+
+def _video_encoder_args(encoder: str, crf: int) -> tuple[str, list[str]]:
+    mode = str(encoder or "auto").strip().lower()
+    if mode not in {"auto", "cpu", "nvidia"}:
+        raise ValueError("渲染编码器必须是 auto、cpu 或 nvidia。")
+    status = render_encoder_status()
+    if mode == "nvidia" and not status["nvidia"]:
+        raise RuntimeError("未检测到可用的 NVIDIA NVENC。请改用“自动”或“CPU”。")
+    selected = "nvidia" if mode in {"auto", "nvidia"} and status["nvidia"] else "cpu"
+    if selected == "nvidia":
+        return selected, [
+            "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr",
+            "-cq", str(max(14, min(32, crf))), "-b:v", "0",
+        ]
+    return selected, [
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-crf", str(max(14, min(32, crf))),
+    ]
+
+
 def burn_subtitles(
     video_path: Path,
     subtitle_path: Path,
@@ -43,13 +86,17 @@ def burn_subtitles(
     raised_margin: bool = False,
     crf: int = 20,
     margin_ratio: float = 0.055,
+    encoder: str = "auto",
+    log: Callable[[str], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    resource_profile: str = "balanced",
 ) -> Path:
     require_command("ffmpeg")
     video_path = video_path.resolve()
     subtitle_path = subtitle_path.resolve()
     output_path = output_path.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    profile = normalize_resource_profile(resource_profile)
 
     size = _probe_video_size(video_path)
     if size is not None:
@@ -79,20 +126,19 @@ def burn_subtitles(
             f"Outline={outline},Shadow={shadow},MarginV={actual_margin},Alignment=2,WrapStyle=2"
         )
     filter_expr = f"subtitles={subtitle_path.name}:force_style='{style}'"
-    run(
-        [
+    selected_encoder, encoder_args = _video_encoder_args(encoder, crf)
+    logger = log or (lambda _message: None)
+    logger("字幕渲染使用 NVIDIA NVENC。" if selected_encoder == "nvidia" else "字幕渲染使用 CPU libx264。")
+
+    def command(args: list[str]) -> list[str]:
+        return [
             "ffmpeg",
             "-y",
             "-i",
             str(video_path),
             "-vf",
             filter_expr,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            str(max(14, min(32, crf))),
+            *args,
             # 重新编码音频为aac，确保兼容性
             "-c:a",
             "aac",
@@ -103,9 +149,18 @@ def burn_subtitles(
             "0:v:0?",
             "-map",
             "0:a:0?",
+            *ffmpeg_thread_args(profile),
             str(output_path),
-        ],
-        cwd=subtitle_path.parent,
-        cancel_check=cancel_check or is_cancellation_requested,
-    )
+        ]
+
+    check = cancel_check or is_cancellation_requested
+    try:
+        run(command(encoder_args), cwd=subtitle_path.parent, cancel_check=check, resource_profile=profile)
+    except RuntimeError:
+        if str(encoder).lower() != "auto" or selected_encoder != "nvidia":
+            raise
+        output_path.unlink(missing_ok=True)
+        logger("NVIDIA NVENC 启动失败，已自动降级为 CPU libx264。")
+        _, cpu_args = _video_encoder_args("cpu", crf)
+        run(command(cpu_args), cwd=subtitle_path.parent, cancel_check=check, resource_profile=profile)
     return output_path

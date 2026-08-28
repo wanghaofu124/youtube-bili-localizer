@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Callable
 
 from .cancellation import check_cancelled as legacy_check_cancelled
+from .dependencies import require_whisper_model
 from .models import Segment, save_segments
+from .performance import cpu_thread_limit, normalize_resource_profile
 from .subtitle import write_srt
 
 LogFn = Callable[[str], None]
@@ -24,6 +26,7 @@ def transcribe_audio(
     beam_size: int = 5,
     log: LogFn | None = None,
     cancel_check: Callable[[], None] | None = None,
+    resource_profile: str = "balanced",
 ) -> list[Segment]:
     check = cancel_check or legacy_check_cancelled
     check()
@@ -35,12 +38,21 @@ def transcribe_audio(
         raise RuntimeError("faster-whisper is not installed. Run: pip install -r requirements.txt") from exc
 
     logger = log or (lambda _message: None)
+    profile = normalize_resource_profile(resource_profile)
+    thread_limit = cpu_thread_limit(profile)
+    logger(f"资源模式：{profile}；Whisper CPU 线程上限 {thread_limit}。")
     last_error: Exception | None = None
     for resolved_device, resolved_compute_type, note in _transcribe_attempts(device, compute_type):
         if note:
             logger(note)
         try:
-            model = WhisperModel(model_size, device=resolved_device, compute_type=resolved_compute_type)
+            model = WhisperModel(
+                str(require_whisper_model(model_size)),
+                device=resolved_device,
+                compute_type=resolved_compute_type,
+                cpu_threads=thread_limit,
+                num_workers=1,
+            )
             # word_timestamps=True：让 whisper 用词级对齐重算段边界。
             # 实测不开启时（仅 VAD 粗块），有 BGM 的视频会把数秒静默并入同一条段
             # （如 0-11s 一条字幕），开启后能精确切到真实语音边界（如 0.0-1.0 / 5.9-7.5）。

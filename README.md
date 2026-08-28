@@ -12,7 +12,8 @@
 
 ```mermaid
 flowchart LR
-    A[授权 URL / 本地视频] --> B[yt-dlp 导入或本地复制]
+    A[授权 URL / 本地视频] --> P[下载前准备检查]
+    P --> B[获取素材 / 本地文件就绪]
     B --> C[faster-whisper 音频转写]
     B --> D[OCR 画面文字]
     C --> E[时间轴合并与字幕校对]
@@ -23,23 +24,34 @@ flowchart LR
     H --> I[Playwright 投稿信息辅助]
 ```
 
-- URL 或本地文件输入；`yt-dlp` 支持读取用户已登录浏览器的 cookies（不会绕过平台验证）。
+- URL 或本地文件输入；`yt-dlp` 可按需通过本机 Chrome/Edge 获取 YouTube PO Token，并支持用户自己的登录 Cookies（不会绕过账号权限或平台验证）。
 - `faster-whisper` 支持 CPU、CUDA 和可配置精度；OCR 可识别画面内英文字幕与信息标签。
 - 音频/OCR 可分别使用，或按时间轴合并；转写、翻译和输出均保留可检查的 JSON/SRT 中间产物。
 - OpenAI / DeepSeek 可进行源字幕校对、上下文分批翻译和投稿元数据生成。
 - 支持中文、原文、双语字幕，动态换行、字体、描边、阴影和位置配置。
 - 图形工作台（WebView 界面）：素材、处理、字幕精修、视频修改（删除/保留/静音/导出/重排）、发布辅助、任务历史；另保留 CLI。
+- 三档资源模式：默认“均衡”限制下载带宽与 CPU 线程；“后台”优先保证其他软件流畅；“极速”释放全部资源。
+- 自适应画面字幕 OCR：一次抽帧，优先上次成功区域，低置信度时再扩大搜索；支持配置 Tesseract 语言并明确显示是否回退到 Whisper。
+- 桌面任务按“获取素材 → 字幕提取 → 翻译 → 渲染 → 发布辅助”独立运行；每阶段保存检查点，可取消、重试并在应用重启后从最后有效产物继续。
+- 创建任务不会立即下载。链接、授权、Cookies、FFmpeg/ffprobe、所选 Whisper 模型、OCR、翻译 API、CUDA/精度、渲染编码器和磁盘空间会先在准备中心检查；缺失模型只允许用户明确点击安装。
 - 字幕时间轴精修与视频片段级编辑均自动保持字幕对齐，处理结果（转写/OCR/翻译对照）实时可见。
+- URL 默认限制为 1080p，可选 720p/原始画质；4K 原画会在开始前警告。截取视频开头使用快速封装，字幕渲染自动优先 NVIDIA NVENC，失败时降级 CPU。
 
 ## 5 分钟跑通
 
 ### 0. 前置要求（Windows）
+
+直接使用发布页 EXE 的普通用户：双击启动后按“素材 → 处理 → 检查准备”操作。默认音频流程需要 FFmpeg 和所选 Whisper 模型；OCR 与投稿浏览器只在启用对应功能时需要。安装必须由用户在准备清单或顶部「依赖」中明确确认，完成后只重新检查，不会自动开始下载。应用会显示实际安装状态、进度、失败日志与重试入口，不要求手工配置 PATH。缺少 WebView2 时，桌面壳会在启动前提示并打开微软官方安装页。
+
+下面仅适用于从源码运行：
 
 1. **Python 3.10+**：从 <https://www.python.org/downloads/> 安装，勾选 **Add python.exe to PATH**；
 2. **ffmpeg**：管理员 PowerShell 执行 `winget install Gyan.FFmpeg`，装完后重开终端（刷新 PATH）；
 3. **Node.js**（可选但强烈建议）：YouTube 视频流需要 JS 挑战求解；
 4. **Tesseract OCR**（可选，仅「画面字幕 OCR」需要）：`winget install UB-Mannheim.TesseractOCR`；
 5. **NVIDIA GPU**（可选）：有 CUDA 时可用 `--device cuda` 加速转写。
+
+> YouTube 会持续调整媒体验证。v0.2.3 默认开启「自动浏览器验证」：首次读取链接时可能短暂启动最小化的 Chrome/Edge，用于获取本次请求的 PO Token。公开内容通常不需要 Cookies；只有登录后才能观看的内容才应提供你自己的有效 cookies.txt。HTTP 403 不再被简单判定为“Cookies 错误”。详见 [v0.2.3 可靠性边界](docs/prd-youtube-reliability-v0.2.3.md)。
 
 ### 1. 源码安装
 
@@ -66,6 +78,8 @@ CPU 通用配置：
 yblocalizer process --file demo\authorized-demo-10s.mp4 --i-have-rights --translator deepseek --subtitle-source audio --device cpu --compute-type int8 --output-dir outputs\demo
 ```
 
+处理时电脑仍需承担其他工作，可追加 `--resource-profile background`；默认值是 `balanced`，仅在确认无需同时使用其他重型软件时选择 `maximum`。
+
 有 NVIDIA CUDA 环境时可改用：`--device cuda --compute-type float16`。成功后目录结构如下：
 
 ```text
@@ -88,13 +102,21 @@ outputs/demo/job-*/
 powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 ```
 
-产物位于 `dist\`（`YouTubeBiliLocalizer.exe` 为图形界面、`yblocalizer.exe` 为命令行）。目标机器仍需安装 `ffmpeg`；OCR 模式另需 Tesseract；YouTube 下载建议安装 Node.js。Whisper 模型首次转写时自动下载。
+产物位于 `dist\`（`YouTubeBiliLocalizer.exe` 为图形界面、`yblocalizer.exe` 为命令行）。图形界面的「依赖中心」可检查内置的 YouTube 浏览器验证组件，并安装或预下载 FFmpeg、Whisper small、Node.js、Tesseract 与投稿辅助浏览器；OCR、投稿等未选功能不会强迫安装。安装任务可以取消，关闭应用会终止其外部安装进程。命令行用户仍可自行管理这些系统组件。
+
+公开交付应使用固定的 Python 3.12 构建环境：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1 -Clean -Version 0.2.5 -PythonExe C:\Python312\python.exe
+```
+
+`requirements-build.lock` 固定 Windows onedir 构建依赖。若已安装 Inno Setup 6，可继续执行 `scripts\build_installer.ps1` 生成带卸载项和快捷方式的普通用户安装程序；脚本会从 Inno 官方仓库获取固定提交的简体中文语言文件，并校验 SHA-256。公开 Release 应提供代码签名证书，并给两个脚本传入 `-SigningThumbprint` 与 `-RequireSignature`；本地测试包可以保持未签名，但不应冒充正式签名版本。
 
 > **数据位置**：运行时的配置（`.env`）、任务输出、字幕、浏览器 Profile 与任务历史（SQLite）都保存在用户数据目录 `C:\Users\<用户名>\AppData\Roaming\YouTubeBiliLocalizer\`，与 EXE 安装目录分离——升级或重建 EXE 不会删除你的数据。
 
 ## 工作台前端
 
-暖色 React 工作台在 [`frontend/`](frontend/) 实现（Vite + React，由本地 HTTP 桥 `yblocalizer.workbench_api` 提供 API）。包含视频预览、真实下载进度、字幕时间轴编辑、逐条字幕时间/文字/删除编辑、视频片段级修改（删除/保留/静音/导出/重排）、处理结果实时对照、B 站投稿辅助状态、任务历史与输出文件管理。前端构建：`cd frontend && npm run build`。
+暖色 React 工作台在 [`frontend/`](frontend/) 实现（Vite + React，由本地 HTTP 桥 `yblocalizer.workbench_api` 提供 API）。处理页包含准备清单、五阶段执行卡片、逐阶段/一键运行、禁用原因和恢复入口；任务检查器显示每阶段状态，不再用一个总百分比掩盖实际工作。字幕翻译完成后即可进入编辑器校对，保存修改只使渲染及发布阶段失效。前端构建与交互测试：`cd frontend && npm test && npm run build`。
 
 ## 开发验证与性能基准
 
@@ -125,7 +147,7 @@ GitHub Actions 在 Ubuntu 的 Python 3.10 与 3.12 上运行编译检查和 mock
 
 ## 架构与关键取舍
 
-v0.2 将 React 工作台确定为唯一新增功能的 UI，旧 Tk GUI 进入兼容维护。默认值、能力探测与预检统一由后端提供；任务使用独立取消令牌和结构化阶段事件，跨启动历史由 SQLite 管理。详细边界见 [v0.2 架构说明](docs/architecture-v0.2.md)。
+v0.2 将 React 工作台确定为唯一新增功能的 UI，旧 Tk GUI 进入兼容维护。CLI 与桌面端复用同一组阶段函数；桌面端只负责调度，阶段产物、状态与配置指纹以原子任务清单和 SQLite 双重保存。应用退出时只把当前运行阶段标记为中断，重启后验证已有产物并等待用户确认继续。详细边界见 [v0.2 架构说明](docs/architecture-v0.2.md)。
 
 | 设计 | 原因 |
 | --- | --- |

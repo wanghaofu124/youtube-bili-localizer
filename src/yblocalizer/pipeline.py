@@ -3,17 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-from .download import download_with_ytdlp, import_local_video
-from .media import extract_audio
-from .models import VideoJob, save_segments
-from .ocr_subtitle import extract_ocr_subtitles
-from .publish_bili import assist_publish
-from .publish_text import ensure_source_link
-from .render import burn_subtitles
-from .subtitle import write_srt
-from .subtitle_merge import merge_audio_ocr_segments
-from .transcribe import transcribe_audio
-from .translate import correct_source_segments, generate_publish_metadata, save_publish_metadata, translate_segments_file
+from .models import VideoJob
 from .util import ensure_rights_confirmed, timestamp_id
 from .runtime import CancellationRequested, PipelineContext, PipelineStage
 from .cancellation import _cancellation_requested as _deprecated_global_cancellation
@@ -54,16 +44,6 @@ class CancellationError(Exception):
     pass
 
 
-def _extract_audio(video: Path, output: Path, ctx: PipelineContext) -> Path:
-    """Call the new cancellable adapter while tolerating old third-party wrappers."""
-    import inspect
-    parameters = inspect.signature(extract_audio).parameters.values()
-    supports_cancel = "cancel_check" in inspect.signature(extract_audio).parameters or any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
-    )
-    return extract_audio(video, output, cancel_check=ctx.is_cancelled) if supports_cancel else extract_audio(video, output)
-
-
 @dataclass(slots=True)
 class PipelineOptions:
     source: str
@@ -76,17 +56,23 @@ class PipelineOptions:
     require_reuse_allowed: bool = False
     cookies_from_browser: str | None = None
     cookies_file: str | None = None
+    youtube_po_token_mode: str = "auto"
+    youtube_proxy: str | None = None
+    download_quality: str = "1080p"
+    resource_profile: str = "balanced"
     max_seconds: int | None = None
     subtitle_source: str = "audio"
     ocr_fallback_to_audio: bool = True
     whisper_model_size: str = "small"
     source_language: str | None = None
     beam_size: int = 5
-    ocr_interval: float = 1.0
+    ocr_interval: float = 0.5
     ocr_crop_ratio: float = 0.30
     ocr_min_chars: int = 3
+    ocr_language: str = "eng"
     subtitle_margin_ratio: float = 0.055
     render_crf: int = 20
+    render_encoder: str = "auto"
     device: str = "cpu"
     compute_type: str = "int8"
     translator: str = "deepseek"
@@ -174,334 +160,34 @@ def run_pipeline(
     progress: Callable[[float], None] | None = None,
     context: PipelineContext | None = None,
 ) -> PipelineResult:
+    """Run the CLI-compatible full flow through the checkpointable stages.
+
+    The desktop calls the same stage functions individually.  Keeping this
+    small scheduler here preserves the original one-command CLI without
+    maintaining a second implementation of the media workflow.
+    """
+    from .workflow import WorkflowArtifacts, artifacts_to_video_job, run_stage
+
     ctx = context or _legacy_context
     logger = log or (lambda message: print(message, flush=True))
-    def report(stage: PipelineStage, percent: int, message: str) -> None:
-        logger(message)
-        ctx.emit(stage, percent, message)
     ensure_rights_confirmed(options.i_have_rights)
     work_dir = options.output_dir / timestamp_id()
     work_dir.mkdir(parents=True, exist_ok=True)
-
+    artifacts = WorkflowArtifacts()
+    stages = ["acquire", "extract", "translate", "render"]
+    if options.publish_to_bilibili:
+        stages.append("publish")
     try:
-        if options.subtitle_source not in {"audio", "ocr", "auto", "merged"}:
-            raise RuntimeError(f"Unknown subtitle source: {options.subtitle_source}")
-        report(PipelineStage.PREPARING, 4, "1/5 Preparing source video...")
-        ctx.check_cancelled()
-        if options.source_kind == "url":
-            ctx.emit(PipelineStage.DOWNLOADING, 5, "正在下载视频")
-            job = download_with_ytdlp(
-                options.source,
-                work_dir=work_dir,
-                title=options.title,
-                max_seconds=options.max_seconds,
-                require_reuse_allowed=options.require_reuse_allowed,
-                cookies_from_browser=options.cookies_from_browser,
-                cookies_file=options.cookies_file,
-                progress=progress,
-                cancel_check=ctx.check_cancelled,
-            )
-            if job.license:
-                logger(f"YouTube license: {job.license}")
-            if job.view_count is not None:
-                logger(f"YouTube views: {job.view_count}")
-        elif options.source_kind == "file":
-            job = import_local_video(Path(options.source), work_dir=work_dir, title=options.title)
-        else:
-            raise RuntimeError(f"Unknown source kind: {options.source_kind}")
-        if job.raw_video is None:
-            raise RuntimeError("No raw video was prepared.")
-        logger(f"Raw video: {job.raw_video}")
-        if job.thumbnail_path:
-            logger(f"YouTube cover: {job.thumbnail_path}")
-        elif job.thumbnail_url:
-            logger("YouTube cover URL was found, but the cover image could not be downloaded.")
-        # 注意：不要给 whisper 传 initial_prompt！实测 initial_prompt 会导致
-        # faster-whisper 段时间戳系统性提前（最多 10-15 秒）且长段粘连吞掉静音，
-        # 使字幕在无语音的片段里提前出现。正确时间轴优先于专名提示。
-        transcription_prompt = None
-
-        if options.subtitle_source == "ocr":
-            logger("2/5 Skipping audio extraction; OCR subtitle mode is enabled.")
-        else:
-            logger("2/5 Extracting audio...")
-            ctx.check_cancelled()
-            ctx.emit(PipelineStage.AUDIO, 16, "正在提取音频")
-            job.audio = _extract_audio(job.raw_video, work_dir / "audio.wav", ctx)
-            logger(f"Audio: {job.audio}")
-
-        ctx.check_cancelled()
-        source_segments = work_dir / "segments.source.json"
-        source_srt = work_dir / "source.srt"
-        used_ocr_subtitles = False
-        source_segment_items = []
-        if options.subtitle_source == "merged":
-            ctx.emit(PipelineStage.TRANSCRIBING, 26, "正在转写音频并读取画面文字")
-            logger("3/5 Merged subtitle mode: transcribing audio and reading on-screen text with OCR...")
-            logger("首次使用会自动下载 Whisper 模型（约 500MB），需要联网，请耐心等待；后续会使用本地缓存。")
-            if job.audio is None:
-                raise RuntimeError("Audio was not extracted.")
-            audio_segments_json = work_dir / "segments.audio.json"
-            audio_srt = work_dir / "audio.srt"
-            ocr_segments_json = work_dir / "segments.ocr.json"
-            ocr_srt = work_dir / "ocr.srt"
-            audio_segment_items = transcribe_audio(
-                job.audio,
-                segments_json=audio_segments_json,
-                srt_path=audio_srt,
-                model_size=options.whisper_model_size,
-                language=options.source_language,
-                device=options.device,
-                compute_type=options.compute_type,
-                initial_prompt=transcription_prompt,
-                beam_size=options.beam_size,
-                log=logger,
-                cancel_check=ctx.check_cancelled,
-            )
-            logger(f"Audio subtitle lines: {len(audio_segment_items)}")
-            try:
-                ocr_segment_items = extract_ocr_subtitles(
-                    job.raw_video,
-                    work_dir=work_dir,
-                    segments_json=ocr_segments_json,
-                    srt_path=ocr_srt,
-                    interval_seconds=max(0.2, options.ocr_interval),
-                    crop_bottom_ratio=max(0.05, min(1.0, options.ocr_crop_ratio)),
-                    min_chars=max(1, options.ocr_min_chars),
-                    cancel_check=ctx.is_cancelled,
-                )
-                logger(f"OCR subtitle lines: {len(ocr_segment_items)}")
-            except Exception as exc:
-                logger(f"OCR subtitle reading failed: {exc}")
-                ocr_segment_items = []
-            used_ocr_subtitles = bool(ocr_segment_items)
-            if audio_segment_items and ocr_segment_items:
-                # 用画面 OCR 时间戳作为锚点，自动校正音频字幕的整体时间偏移
-                # 注意：仅校正「较小的系统性误差」（Whisper 常见 0.1~3s）。
-                # 偏移过大说明素材本身音画不同步，跟随画面字幕反而会出错，跳过并提示。
-                offset = _estimate_audio_offset(audio_segment_items, ocr_segment_items)
-                if offset is not None and 0.12 <= abs(offset) <= 3.0:
-                    _shift_segments(audio_segment_items, offset)
-                    logger(f"Detected audio-subtitle time offset {offset:+.2f}s; auto-corrected using OCR anchors.")
-                elif offset is not None and abs(offset) > 3.0:
-                    logger(
-                        f"Detected a large audio/OCR time mismatch ({offset:+.2f}s); "
-                        "the source video itself may be out of sync. Skipping auto-correction; "
-                        "use manual alignment in the subtitle page if needed."
-                    )
-                else:
-                    logger("OCR anchors found; audio-subtitle timing is within tolerance, no shift needed.")
-            source_segment_items = merge_audio_ocr_segments(audio_segment_items, ocr_segment_items)
-            save_segments(source_segments, source_segment_items)
-            write_srt(source_srt, source_segment_items, display_mode="source")
-            logger(f"Merged subtitle lines: {len(source_segment_items)}")
-        elif options.subtitle_source == "ocr":
-            ctx.emit(PipelineStage.OCR, 28, "正在读取画面字幕")
-            logger("3/5 Reading burned-in English subtitles from video frames with OCR...")
-            try:
-                source_segment_items = extract_ocr_subtitles(
-                    job.raw_video,
-                    work_dir=work_dir,
-                    segments_json=source_segments,
-                    srt_path=source_srt,
-                    interval_seconds=max(0.2, options.ocr_interval),
-                    crop_bottom_ratio=max(0.05, min(1.0, options.ocr_crop_ratio)),
-                    min_chars=max(1, options.ocr_min_chars),
-                    cancel_check=ctx.is_cancelled,
-                )
-                used_ocr_subtitles = True
-                logger(f"OCR subtitle lines: {len(source_segment_items)}")
-            except Exception as exc:
-                if not options.ocr_fallback_to_audio:
-                    raise
-                logger(f"OCR subtitle reading failed: {exc}")
-                logger("Falling back to audio transcription with faster-whisper.")
-                ctx.check_cancelled()
-                if job.audio is None:
-                    job.audio = _extract_audio(job.raw_video, work_dir / "audio.wav", ctx)
-                    logger(f"Audio: {job.audio}")
-                source_segment_items = transcribe_audio(
-                    job.audio,
-                    segments_json=source_segments,
-                    srt_path=source_srt,
-                    model_size=options.whisper_model_size,
-                    language=options.source_language,
-                    device=options.device,
-                    compute_type=options.compute_type,
-                    initial_prompt=transcription_prompt,
-                    log=logger,
-                    cancel_check=ctx.check_cancelled,
-                )
-        else:
-            ctx.emit(PipelineStage.TRANSCRIBING, 28, "正在语音转写")
-            if options.subtitle_source == "auto":
-                logger("3/5 Auto subtitle mode: trying audio transcription first...")
-            else:
-                logger("3/5 Transcribing audio with faster-whisper...")
-            if job.audio is None:
-                raise RuntimeError("Audio was not extracted.")
-            source_segment_items = transcribe_audio(
-                job.audio,
-                segments_json=source_segments,
-                srt_path=source_srt,
-                model_size=options.whisper_model_size,
-                language=options.source_language,
-                device=options.device,
-                compute_type=options.compute_type,
-                initial_prompt=transcription_prompt,
-                log=logger,
-                cancel_check=ctx.check_cancelled,
-                )
-            if not source_segment_items:
-                if options.subtitle_source == "audio" and not options.ocr_fallback_to_audio:
-                    logger("Audio transcription produced no speech segments, and OCR fallback is disabled.")
-                else:
-                    logger("Audio transcription produced no speech segments. Falling back to on-screen OCR.")
-                    try:
-                        source_segment_items = extract_ocr_subtitles(
-                            job.raw_video,
-                            work_dir=work_dir,
-                            segments_json=source_segments,
-                            srt_path=source_srt,
-                            interval_seconds=max(0.2, options.ocr_interval),
-                            crop_bottom_ratio=max(0.05, min(1.0, options.ocr_crop_ratio)),
-                            min_chars=max(1, options.ocr_min_chars),
-                            cancel_check=ctx.is_cancelled,
-                        )
-                        used_ocr_subtitles = True
-                        logger(f"OCR subtitle lines: {len(source_segment_items)}")
-                    except Exception as exc:
-                        logger(f"OCR fallback also failed: {exc}")
-        if not source_segment_items:
-            raise RuntimeError(
-                "No readable subtitle text was found. Audio transcription produced no speech segments, "
-                "and OCR could not extract usable on-screen text. Try a clearer video/caption area, "
-                "or add subtitles manually before publishing."
-            )
-        if options.smart_translation and options.translator.lower() in {"openai", "deepseek"}:
-            logger("3/5 Reviewing source subtitles with the translation model before Chinese translation...")
-            try:
-                corrected_source_items = correct_source_segments(
-                    source_segment_items,
-                    provider=options.translator,
-                    model=options.translate_model,
-                    batch_size=options.batch_size,
-                    source_title=options.title or job.title,
-                    source_description=job.description,
-                )
-                if corrected_source_items:
-                    source_segment_items = corrected_source_items
-                    save_segments(source_segments, source_segment_items)
-                    write_srt(source_srt, source_segment_items, display_mode="source")
-                    logger("Source subtitle review finished; corrected source SRT will be used for translation.")
-            except Exception as exc:
-                logger(f"Source subtitle review failed; continuing with original source subtitles: {exc}")
-        logger(f"Source SRT: {source_srt}")
-
-        if options.smart_translation:
-            logger(f"4/5 Translating subtitles with {options.translator} using context-aware mode...")
-        else:
-            logger(f"4/5 Translating subtitles with {options.translator}...")
-        ctx.check_cancelled()
-        ctx.emit(PipelineStage.TRANSLATING, 62, "正在翻译字幕")
-        translated_segments = work_dir / "segments.translated.json"
-        translated_srt = work_dir / "zh.srt"
-        translated_segment_items = translate_segments_file(
-            source_segments,
-            output_json=translated_segments,
-            output_srt=translated_srt,
-            provider=options.translator,
-            target_lang=options.target_lang,
-            model=options.translate_model,
-            batch_size=options.batch_size,
-            validate_language=True,
-            display_mode=options.subtitle_display_mode,
-            smart_translation=options.smart_translation,
-            smart_layout=options.smart_subtitle_layout,
-        )
-        job.translated_subtitles = translated_srt
-        logger(f"Chinese SRT: {translated_srt}")
-        try:
-            publish_metadata = generate_publish_metadata(
-                source_title=options.title or job.title,
-                source_description=job.description,
-                source_segments=source_segment_items,
-                translated_segments=translated_segment_items,
-                provider=options.translator,
-                target_lang=options.target_lang,
-                model=options.translate_model,
-            )
-        except Exception as exc:
-            logger(f"Smart publish metadata failed, using fallback metadata: {exc}")
-            publish_metadata = generate_publish_metadata(
-                source_title=options.title or job.title,
-                source_description=job.description,
-                source_segments=source_segment_items,
-                translated_segments=translated_segment_items,
-                provider="none",
-                target_lang=options.target_lang,
-                model=None,
-            )
-        metadata_path = save_publish_metadata(work_dir / "publish_metadata.json", publish_metadata)
-        logger(f"Smart Bilibili title: {publish_metadata.title}")
-        logger(f"Smart Bilibili tags: {', '.join(publish_metadata.tags)}")
-        logger(f"Publish metadata: {metadata_path}")
-
-        logger("5/5 Rendering hard subtitles with ffmpeg...")
-        ctx.check_cancelled()
-        ctx.emit(PipelineStage.RENDERING, 84, "正在渲染硬字幕成片")
-        if used_ocr_subtitles:
-            logger("OCR mode: raising Chinese subtitles above the original English captions.")
-        rendered = burn_subtitles(
-            job.raw_video,
-            translated_srt,
-            work_dir / "rendered.mp4",
-            font_name=options.font_name,
-            font_size=options.font_size,
-            primary_color=options.subtitle_color,
-            outline_color=options.subtitle_outline_color,
-            outline=options.subtitle_outline,
-            shadow=options.subtitle_shadow,
-            raised_margin=used_ocr_subtitles,
-            crf=options.render_crf,
-            margin_ratio=options.subtitle_margin_ratio,
-            cancel_check=ctx.is_cancelled,
-        )
-        job.rendered_video = rendered
-        logger(f"Rendered video: {rendered}")
-
-        if options.publish_to_bilibili:
-            ctx.check_cancelled()
-            ctx.emit(PipelineStage.PUBLISHING, 96, "正在打开投稿辅助")
-            logger("Opening Bilibili Creator Center for assisted publishing...")
-            source_for_description = job.webpage_url or (job.source if job.source.startswith(("http://", "https://")) else "")
-            publish_description = ensure_source_link(
-                options.description or f"已获授权转载/本地化。",
-                source_for_description,
-                include_source_link=options.include_source_link_in_description,
-            )
-            publish_tags = _merge_tags(publish_metadata.tags, options.tags or [])
-            assist_publish(
-                rendered,
-                title=publish_metadata.title or options.title or job.title or rendered.stem,
-                description=publish_description,
-                tags=publish_tags,
-                cover_path=job.thumbnail_path,
-                profile_dir=options.bilibili_profile_dir,
-                browser=options.bilibili_browser,
-                screenshot_path=work_dir / "bilibili-upload-page.png",
-                wait_for_review=options.bilibili_wait_for_review,
-                log=logger,
-            )
-
+        for stage in stages:
+            artifacts = run_stage(stage, options, work_dir, artifacts, ctx, logger, progress)
         ctx.emit(PipelineStage.COMPLETED, 100, "处理完成")
-        return PipelineResult(
-            job=job,
-            work_dir=work_dir,
-            source_srt=source_srt,
-            translated_srt=translated_srt,
-            rendered_video=rendered,
-        )
+        job = artifacts_to_video_job(options, work_dir, artifacts)
+        source_srt = artifacts.path("source_srt")
+        translated_srt = artifacts.path("translated_srt")
+        rendered_video = artifacts.path("rendered_video")
+        if not source_srt or not translated_srt or not rendered_video:
+            raise RuntimeError("Pipeline completed without all required artifacts.")
+        return PipelineResult(job, work_dir, source_srt, translated_srt, rendered_video)
     except (CancellationError, CancellationRequested) as exc:
         logger("\n任务已被用户中断。")
         if isinstance(exc, CancellationError):
@@ -510,33 +196,3 @@ def run_pipeline(
     finally:
         if context is None:
             reset_cancellation()
-
-
-def _merge_tags(*groups: list[str]) -> list[str]:
-    output: list[str] = []
-    seen: set[str] = set()
-    for group in groups:
-        for tag in group:
-            cleaned = tag.strip().lstrip("#")
-            if not cleaned:
-                continue
-            key = cleaned.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            output.append(cleaned[:16])
-            if len(output) >= 10:
-                return output
-    return output
-
-
-def _build_transcription_prompt(title: str | None, description: str | None) -> str | None:
-    parts = [
-        "Transcribe accurately. Preserve proper nouns, names, brands, numbers, racing classes, and technical terms.",
-    ]
-    if title:
-        parts.append(f"Title: {title}")
-    if description:
-        parts.append(f"Description: {description[:600]}")
-    text = " ".join(part for part in parts if part)
-    return text if text.strip() else None

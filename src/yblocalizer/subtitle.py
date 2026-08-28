@@ -86,16 +86,22 @@ def write_srt(
     max_lines: int = 2,
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        segments_to_srt(
-            segments,
-            display_mode=display_mode,
-            smart_layout=smart_layout,
-            max_chars_per_line=max_chars_per_line,
-            max_lines=max_lines,
-        ),
-        encoding="utf-8-sig",
-    )
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        temporary.write_text(
+            segments_to_srt(
+                segments,
+                display_mode=display_mode,
+                smart_layout=smart_layout,
+                max_chars_per_line=max_chars_per_line,
+                max_lines=max_lines,
+            ),
+            encoding="utf-8-sig",
+        )
+        temporary.replace(path)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
     return path
 
 

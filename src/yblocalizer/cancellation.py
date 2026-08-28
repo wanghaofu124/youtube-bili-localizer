@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import threading
 
-
-class CancellationRequested(Exception):
-    """Raised by a long-running integration when the user requests cancellation."""
+from .runtime import CancellationRequested
 
 
 _cancellation_requested = threading.Event()

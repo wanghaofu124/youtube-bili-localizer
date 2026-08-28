@@ -102,6 +102,9 @@ def _has_visual_label(ocr_text: str, audio_text: str) -> bool:
 def _should_keep_standalone_ocr(ocr: Segment) -> bool:
     text = ocr.text.strip()
     quality = ocr_text_quality(text)
+    cjk_count = len(re.findall(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]", text))
+    if cjk_count >= 4:
+        return quality >= 0.70 and ocr.end - ocr.start >= 0.6
     words = re.findall(r"[A-Za-z][A-Za-z']*", text)
     if quality < 0.75 or len(words) < 3:
         return False

@@ -12,16 +12,12 @@ import time
 from typing import Callable
 
 from .cancellation import CancellationRequested
+from .dependencies import resolve_command
+from .performance import lower_process_priority, normalize_resource_profile
 
 
 def require_command(name: str) -> None:
-    if shutil.which(name) is not None:
-        return
-    discovered = _discover_windows_command(name)
-    if discovered:
-        os.environ["PATH"] = f"{discovered.parent}{os.pathsep}{os.environ.get('PATH', '')}"
-        return
-    if shutil.which(name) is None:
+    if resolve_command(name) is None:
         raise RuntimeError(f"Required command not found on PATH: {name}")
 
 
@@ -39,7 +35,12 @@ def _discover_windows_command(name: str) -> Path | None:
     return matches[0] if matches else None
 
 
-def run(command: list[str], cwd: Path | None = None, cancel_check: Callable[[], bool] | None = None) -> None:
+def run(
+    command: list[str],
+    cwd: Path | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    resource_profile: str = "balanced",
+) -> None:
     printable = " ".join(command)
     print(f"$ {printable}")
     creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
@@ -48,6 +49,7 @@ def run(command: list[str], cwd: Path | None = None, cancel_check: Callable[[], 
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         creationflags=creationflags,
     )
+    lower_process_priority(process, normalize_resource_profile(resource_profile))
     output: list[str] = []
     cancelled = False
 
@@ -60,23 +62,29 @@ def run(command: list[str], cwd: Path | None = None, cancel_check: Callable[[], 
                 return
             time.sleep(0.1)
 
-    if cancel_check:
-        threading.Thread(target=_watch_cancel, daemon=True).start()
-
-    while True:
-        try:
-            line = process.stdout.readline() if process.stdout else ""
-        except (OSError, ValueError):
-            line = ""
-        if not line and process.poll() is not None:
-            break
-        if line:
-            output.append(line.rstrip())
-    if cancelled:
-        raise CancellationRequested("任务已被用户中断")
-    if process.returncode != 0:
-        tail = "\n".join(output[-40:])
-        raise RuntimeError(f"Command failed with exit code {process.returncode}: {printable}\n{tail}")
+    watcher = threading.Thread(target=_watch_cancel, daemon=True) if cancel_check else None
+    if watcher:
+        watcher.start()
+    try:
+        while True:
+            try:
+                line = process.stdout.readline() if process.stdout else ""
+            except (OSError, ValueError):
+                line = ""
+            if not line and process.poll() is not None:
+                break
+            if line:
+                output.append(line.rstrip())
+        if cancelled:
+            raise CancellationRequested("任务已被用户中断")
+        if process.returncode != 0:
+            tail = "\n".join(output[-40:])
+            raise RuntimeError(f"Command failed with exit code {process.returncode}: {printable}\n{tail}")
+    finally:
+        if process.stdout:
+            process.stdout.close()
+        if watcher:
+            watcher.join(timeout=4)
 
 
 def _terminate_process_tree(process: subprocess.Popen[str]) -> None:

@@ -43,8 +43,10 @@ def build_parser() -> ArgumentParser:
     download.add_argument("--title")
     download.add_argument("--output-dir", default="outputs")
     download.add_argument("--max-seconds", type=int, default=None, help="Download only the first N seconds")
+    download.add_argument("--quality", default="1080p", choices=["720p", "1080p", "original"], help="Maximum download resolution")
     download.add_argument("--require-reuse-allowed", action="store_true", help="Require YouTube metadata to say reuse is allowed")
     download.add_argument("--cookies-from-browser", choices=["chrome", "edge", "firefox", "brave", "chromium"], help="Use browser cookies for YouTube bot/login checks")
+    download.add_argument("--resource-profile", default="balanced", choices=["background", "balanced", "maximum"], help="Limit bandwidth/CPU so the desktop stays responsive")
     download.add_argument("--i-have-rights", action="store_true", help="Confirm you have the rights/license to process this video")
     download.set_defaults(func=cmd_download)
 
@@ -55,6 +57,7 @@ def build_parser() -> ArgumentParser:
     transcribe.add_argument("--initial-prompt", default=None)
     transcribe.add_argument("--device", default="cpu")
     transcribe.add_argument("--compute-type", default="int8")
+    transcribe.add_argument("--resource-profile", default="balanced", choices=["background", "balanced", "maximum"])
     transcribe.add_argument("--output-dir")
     transcribe.set_defaults(func=cmd_transcribe)
 
@@ -80,6 +83,8 @@ def build_parser() -> ArgumentParser:
     render.add_argument("--outline-color", default="&H00000000")
     render.add_argument("--outline", type=int, default=1)
     render.add_argument("--shadow", type=int, default=0)
+    render.add_argument("--encoder", default="auto", choices=["auto", "cpu", "nvidia"], help="Subtitle render encoder")
+    render.add_argument("--resource-profile", default="balanced", choices=["background", "balanced", "maximum"])
     render.set_defaults(func=cmd_render)
 
     publish = subparsers.add_parser("publish", help="Assist publishing a prepared video through Bilibili Creator Center")
@@ -107,6 +112,7 @@ def build_parser() -> ArgumentParser:
     process.add_argument("--title")
     process.add_argument("--output-dir", default="outputs")
     process.add_argument("--max-seconds", type=int, default=None, help="Download only the first N seconds when source is a URL")
+    process.add_argument("--download-quality", default="1080p", choices=["720p", "1080p", "original"], help="Maximum URL download resolution")
     process.add_argument("--require-reuse-allowed", action="store_true", help="Require YouTube metadata to say reuse is allowed")
     process.add_argument("--cookies-from-browser", choices=["chrome", "edge", "firefox", "brave", "chromium"], help="Use browser cookies for YouTube bot/login checks")
     process.add_argument("--i-have-rights", action="store_true", help="Confirm you have the rights/license to process this video")
@@ -119,6 +125,7 @@ def build_parser() -> ArgumentParser:
     process.add_argument("--no-ocr-audio-fallback", action="store_true", help="Disable subtitle-source fallback between OCR and audio transcription")
     process.add_argument("--whisper-model-size", default="small")
     process.add_argument("--source-language", default=None)
+    process.add_argument("--ocr-language", default="eng", help="Tesseract language code, for example eng, chi_sim, or eng+chi_sim")
     process.add_argument("--device", default="cpu")
     process.add_argument("--compute-type", default="int8")
     process.add_argument("--translator", default="none", choices=["none", "openai", "deepseek"])
@@ -134,6 +141,8 @@ def build_parser() -> ArgumentParser:
     process.add_argument("--outline-color", default="&H00000000")
     process.add_argument("--outline", type=int, default=1)
     process.add_argument("--shadow", type=int, default=0)
+    process.add_argument("--render-encoder", default="auto", choices=["auto", "cpu", "nvidia"], help="Subtitle render encoder")
+    process.add_argument("--resource-profile", default="balanced", choices=["background", "balanced", "maximum"], help="Background keeps the PC most responsive; maximum uses all available resources")
     process.add_argument("--publish", action="store_true")
     process.add_argument("--description", default="")
     process.add_argument("--no-source-link", action="store_true", help="Do not append the original source URL to the Bilibili description")
@@ -159,6 +168,8 @@ def cmd_download(args: Namespace) -> None:
         max_seconds=args.max_seconds,
         require_reuse_allowed=args.require_reuse_allowed,
         cookies_from_browser=args.cookies_from_browser,
+        download_quality=args.quality,
+        resource_profile=args.resource_profile,
     )
     print(f"Downloaded: {job.raw_video}")
 
@@ -179,6 +190,7 @@ def cmd_transcribe(args: Namespace) -> None:
         compute_type=args.compute_type,
         initial_prompt=args.initial_prompt,
         log=lambda message: print(message, flush=True),
+        resource_profile=args.resource_profile,
     )
     print(f"Segments: {segments_json}")
     print(f"Source SRT: {source_srt}")
@@ -219,6 +231,8 @@ def cmd_render(args: Namespace) -> None:
         outline_color=args.outline_color,
         outline=args.outline,
         shadow=args.shadow,
+        encoder=args.encoder,
+        resource_profile=args.resource_profile,
     )
     print(f"Rendered video: {rendered}")
 
@@ -255,11 +269,13 @@ def cmd_process(args: Namespace) -> None:
             i_have_rights=args.i_have_rights,
             require_reuse_allowed=args.require_reuse_allowed,
             cookies_from_browser=args.cookies_from_browser,
+            download_quality=args.download_quality,
             max_seconds=args.max_seconds,
             subtitle_source=args.subtitle_source,
             ocr_fallback_to_audio=not args.no_ocr_audio_fallback,
             whisper_model_size=args.whisper_model_size,
             source_language=args.source_language,
+            ocr_language=args.ocr_language,
             device=args.device,
             compute_type=args.compute_type,
             translator=args.translator,
@@ -275,6 +291,8 @@ def cmd_process(args: Namespace) -> None:
             subtitle_outline_color=args.outline_color,
             subtitle_outline=args.outline,
             subtitle_shadow=args.shadow,
+            render_encoder=args.render_encoder,
+            resource_profile=args.resource_profile,
             publish_to_bilibili=args.publish,
             include_source_link_in_description=not args.no_source_link,
             bilibili_browser=args.bilibili_browser,

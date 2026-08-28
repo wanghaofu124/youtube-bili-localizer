@@ -6,6 +6,7 @@ import sys
 import pytest
 
 from yblocalizer.cancellation import CancellationRequested
+from yblocalizer.runtime import CancellationRequested as RuntimeCancellationRequested
 from yblocalizer.download import download_with_ytdlp
 from yblocalizer.pipeline import request_cancellation, reset_cancellation
 from yblocalizer.util import run
@@ -53,3 +54,7 @@ def test_metadata_rejects_incomplete_or_non_http_urls(url: str) -> None:
 def test_run_terminates_known_child_process_when_cancelled() -> None:
     with pytest.raises(CancellationRequested):
         run([sys.executable, "-c", "import time; time.sleep(10)"], cancel_check=lambda: True)
+
+
+def test_legacy_and_pipeline_cancellation_use_one_exception_type() -> None:
+    assert CancellationRequested is RuntimeCancellationRequested

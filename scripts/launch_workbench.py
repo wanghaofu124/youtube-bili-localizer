@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import threading
+import webbrowser
 from pathlib import Path
 
 import webview
@@ -17,6 +18,7 @@ import webview
 _USER_DATA_ROOT = Path(os.environ.get("APPDATA") or Path.home()) / "YouTubeBiliLocalizer"
 os.environ.setdefault("YBLOCALIZER_DATA_DIR", str(_USER_DATA_ROOT))
 
+from yblocalizer.dependencies import WEBVIEW2_DOWNLOAD_URL, webview2_available
 from yblocalizer.workbench_api import ASSET_ROOT, OUTPUT_ROOT, build_server
 
 if sys.platform == "win32":
@@ -43,6 +45,10 @@ def _ensure_playwright_browsers() -> None:
         return root.exists() and bool(list(root.glob("chromium-*")) or list(root.glob("chromium_headless_shell-*")))
 
     default_root = Path(os.environ.get("LOCALAPPDATA", "")) / "ms-playwright"
+    managed_root = _USER_DATA_ROOT / "browsers" / "ms-playwright"
+    if has_browsers(managed_root):
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(managed_root)
+        return
     if has_browsers(default_root):
         if os.environ.get("PLAYWRIGHT_BROWSERS_PATH") != str(default_root):
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(default_root)
@@ -122,6 +128,17 @@ class DesktopBridge:
 
 
 def main() -> int:
+    if sys.platform == "win32" and not webview2_available():
+        import ctypes
+        choice = ctypes.windll.user32.MessageBoxW(
+            0,
+            "YouTube Bili Localizer 需要 Microsoft WebView2 才能显示桌面窗口。\n\n点击“确定”打开微软官方下载页，安装后重新启动本应用。",
+            "缺少 Microsoft WebView2",
+            0x00000001 | 0x00000030,
+        )
+        if choice == 1:
+            webbrowser.open(WEBVIEW2_DOWNLOAD_URL)
+        return 2
     # Use an OS-assigned loopback port.  A user may still have an older EXE
     # open while trying a new release; a fixed port would make the new window
     # silently attach to that older local service instead of its own backend.

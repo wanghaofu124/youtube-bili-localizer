@@ -44,7 +44,15 @@ CREATE TABLE IF NOT EXISTS jobs (
     created_at REAL,
     started_at REAL,
     finished_at REAL,
-    owner_pid INTEGER
+    owner_pid INTEGER,
+    workflow_version INTEGER DEFAULT 0,
+    current_stage TEXT,
+    next_stage TEXT,
+    auto_run INTEGER DEFAULT 0,
+    stage_states TEXT DEFAULT '{}',
+    checks TEXT DEFAULT '[]',
+    artifacts TEXT DEFAULT '{}',
+    updated_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
 """
@@ -64,8 +72,18 @@ def init_db() -> None:
         try:
             connection.executescript(_SCHEMA)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
-            if "owner_pid" not in columns:
-                connection.execute("ALTER TABLE jobs ADD COLUMN owner_pid INTEGER")
+            migrations = {
+                "owner_pid": "INTEGER", "workflow_version": "INTEGER DEFAULT 0",
+                "current_stage": "TEXT", "next_stage": "TEXT", "auto_run": "INTEGER DEFAULT 0",
+                "stage_states": "TEXT DEFAULT '{}'", "checks": "TEXT DEFAULT '[]'",
+                "artifacts": "TEXT DEFAULT '{}'", "updated_at": "REAL",
+            }
+            for name, declaration in migrations.items():
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} {declaration}")
+            connection.execute(
+                "UPDATE jobs SET created_at=COALESCE(started_at, updated_at) WHERE created_at IS NULL"
+            )
             connection.commit()
         finally:
             connection.close()
@@ -122,6 +140,14 @@ def record_job(
     created_at: float | None,
     started_at: float | None,
     finished_at: float | None,
+    workflow_version: int = 0,
+    current_stage: str | None = None,
+    next_stage: str | None = None,
+    auto_run: bool = False,
+    stage_states: dict[str, Any] | None = None,
+    checks: list[dict[str, Any]] | None = None,
+    artifacts: dict[str, Any] | None = None,
+    updated_at: float | None = None,
 ) -> None:
     with _lock:
         connection = _connect()
@@ -130,20 +156,32 @@ def record_job(
                 """
                 INSERT INTO jobs (id, material_id, source_url, title, status, stage, progress,
                                   error, output_dir, rendered_video, device, compute_type, options,
-                                  created_at, started_at, finished_at, owner_pid)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  created_at, started_at, finished_at, owner_pid,
+                                  workflow_version, current_stage, next_stage, auto_run,
+                                  stage_states, checks, artifacts, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     status=excluded.status, stage=excluded.stage, progress=excluded.progress,
                     error=excluded.error, output_dir=excluded.output_dir,
                     rendered_video=excluded.rendered_video,
-                    created_at=excluded.created_at, started_at=excluded.started_at,
-                    finished_at=excluded.finished_at, owner_pid=excluded.owner_pid
+                    device=excluded.device, compute_type=excluded.compute_type,
+                    options=excluded.options, created_at=excluded.created_at,
+                    started_at=excluded.started_at, finished_at=excluded.finished_at,
+                    owner_pid=excluded.owner_pid, workflow_version=excluded.workflow_version,
+                    current_stage=excluded.current_stage, next_stage=excluded.next_stage,
+                    auto_run=excluded.auto_run, stage_states=excluded.stage_states,
+                    checks=excluded.checks, artifacts=excluded.artifacts,
+                    updated_at=excluded.updated_at
                 """,
                 (
                     job_id, material_id, source_url, title, status, stage, progress,
                     error, output_dir, rendered_video, device, compute_type,
                     json.dumps(options, ensure_ascii=False),
-                    created_at, started_at, finished_at, os.getpid(),
+                    created_at, started_at, finished_at, os.getpid(), workflow_version,
+                    current_stage, next_stage, int(auto_run),
+                    json.dumps(stage_states or {}, ensure_ascii=False),
+                    json.dumps(checks or [], ensure_ascii=False),
+                    json.dumps(artifacts or {}, ensure_ascii=False), updated_at,
                 ),
             )
             connection.commit()
@@ -164,7 +202,8 @@ def list_jobs(limit: int | None = 50) -> list[dict[str, Any]]:
             query = (
                 "SELECT id, material_id, source_url, title, status, stage, progress, error, "
                 "output_dir, rendered_video, device, compute_type, options, "
-                "created_at, started_at, finished_at FROM jobs ORDER BY created_at DESC"
+                "created_at, started_at, finished_at, workflow_version, current_stage, next_stage, "
+                "auto_run, stage_states, checks, artifacts, updated_at FROM jobs ORDER BY created_at DESC"
             )
             rows = (
                 connection.execute(query).fetchall()
@@ -176,7 +215,8 @@ def list_jobs(limit: int | None = 50) -> list[dict[str, Any]]:
     columns = [
         "id", "material_id", "source_url", "title", "status", "stage", "progress", "error",
         "output_dir", "rendered_video", "device", "compute_type", "options",
-        "created_at", "started_at", "finished_at",
+        "created_at", "started_at", "finished_at", "workflow_version", "current_stage", "next_stage",
+        "auto_run", "stage_states", "checks", "artifacts", "updated_at",
     ]
     output: list[dict[str, Any]] = []
     for row in rows:
@@ -185,6 +225,12 @@ def list_jobs(limit: int | None = 50) -> list[dict[str, Any]]:
             item["options"] = json.loads(item["options"] or "{}")
         except (ValueError, TypeError):
             item["options"] = {}
+        for name, fallback in (("stage_states", {}), ("checks", []), ("artifacts", {})):
+            try:
+                item[name] = json.loads(item[name] or json.dumps(fallback))
+            except (ValueError, TypeError):
+                item[name] = fallback
+        item["auto_run"] = bool(item.get("auto_run"))
         output.append(item)
     return output
 

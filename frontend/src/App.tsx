@@ -1,6 +1,25 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { stageAvailability, workflowPrimaryLabel } from "./workflowState";
 
 type View = "material" | "process" | "subtitle" | "publish" | "files";
+type WorkflowStageName = "acquire" | "extract" | "translate" | "render" | "publish";
+type WorkflowStage = {
+  status: "pending" | "ready" | "running" | "completed" | "failed" | "cancelled" | "stale" | "interrupted";
+  progress: number;
+  error: string | null;
+  started_at: number | null;
+  finished_at: number | null;
+  config_fingerprint: string | null;
+};
+type PreparationCheck = {
+  id: string;
+  label: string;
+  purpose: string;
+  status: "passed" | "warning" | "blocking" | "installing";
+  message: string;
+  action?: string | null;
+  needs_recheck: boolean;
+};
 type Material = {
   id: string;
   name: string;
@@ -9,6 +28,7 @@ type Material = {
   height: number | null;
   authorized: boolean;
   is_demo: boolean;
+  source_url?: string | null;
 };
 type Cue = {
   id: number;
@@ -25,7 +45,11 @@ type Job = {
   stage: string;
   progress: number;
   logs: string[];
+  log_cursor?: number;
+  log_total?: number;
   error: string | null;
+  error_code?: string | null;
+  suggested_action?: string | null;
   result: {
     output_dir: string;
     source_srt: string;
@@ -39,12 +63,32 @@ type Job = {
   started_at: number | null;
   finished_at: number | null;
   elapsed_seconds: number;
+  workflow_version?: number;
+  stages?: Record<WorkflowStageName, WorkflowStage>;
+  checks?: PreparationCheck[];
+  current_stage?: WorkflowStageName | null;
+  next_stage?: WorkflowStageName | null;
+  can_resume?: boolean;
+  auto_run?: boolean;
+  artifacts?: Record<string, { available: boolean; name: string | null; bytes: number }>;
+  artifact_revision?: number;
+  edit_state?: string;
+  checkpoint_validation?: "pending" | "verified" | "invalid";
+  subtitle_extraction?: {
+    mode: string;
+    ocr_status: "not-requested" | "completed" | "fallback" | "failed";
+    message: string | null;
+  };
+  content_warnings?: string[];
 };
 type Options = {
   title: string;
   require_reuse_allowed: boolean;
   cookies_from_browser: string;
   cookies_file: string;
+  youtube_po_token_mode: "auto" | "off";
+  youtube_proxy: string;
+  download_quality: "720p" | "1080p" | "original";
   max_seconds: number | null;
   subtitle_source: string;
   whisper_model_size: string;
@@ -53,8 +97,11 @@ type Options = {
   ocr_interval: number;
   ocr_crop_ratio: number;
   ocr_min_chars: number;
+  ocr_language: string;
   subtitle_margin_ratio: number;
   render_crf: number;
+  render_encoder: "auto" | "cpu" | "nvidia";
+  resource_profile: "background" | "balanced" | "maximum";
   translator: string;
   target_lang: string;
   translate_model: string;
@@ -67,6 +114,12 @@ type Options = {
   subtitle_outline_color: string;
   subtitle_effect: string;
   output_dir: string;
+  description?: string;
+  tags?: string[];
+  publish_to_bilibili?: boolean;
+  include_source_link?: boolean;
+  bilibili_browser?: string;
+  close_after_fill?: boolean;
 };
 type Template = { name: string; body: string };
 type OutputFile = {
@@ -105,6 +158,22 @@ type HistoryJob = {
   created_at: number | null;
   finished_at: number | null;
 };
+type RestorableJob = {
+  id: string;
+  title: string;
+  status: string;
+  next_stage: WorkflowStageName | null;
+  updated_at: number;
+  checkpoint_validation: "pending" | "verified" | "invalid";
+};
+type TestHistoryCandidate = {
+  id: string;
+  title: string;
+  status: string;
+  output_dir: string;
+  reason: string;
+  created_at: number | null;
+};
 type Diagnostic = {
   id: string;
   label: string;
@@ -113,22 +182,44 @@ type Diagnostic = {
   message: string;
   required?: boolean;
 };
+type Dependency = Diagnostic & {
+  installable: boolean;
+  size_hint: string;
+  action_url: string | null;
+};
+type DependencyInstallJob = {
+  id: string;
+  dependency_id: string;
+  status: "queued" | "running" | "cancelling" | "cancelled" | "completed" | "failed";
+  progress: number;
+  progress_kind: "indeterminate" | "determinate";
+  message: string;
+  logs: string[];
+  error: string | null;
+  cancel_requested: boolean;
+};
 
 const defaults: Options = {
   title: "",
   require_reuse_allowed: false,
   cookies_from_browser: "",
   cookies_file: "",
+  youtube_po_token_mode: "auto",
+  youtube_proxy: "",
+  download_quality: "1080p",
   max_seconds: 10,
   subtitle_source: "audio",
   whisper_model_size: "small",
   source_language: "",
   beam_size: 5,
-  ocr_interval: 1,
+  ocr_interval: 0.5,
   ocr_crop_ratio: 0.3,
   ocr_min_chars: 3,
+  ocr_language: "eng",
   subtitle_margin_ratio: 0.055,
   render_crf: 20,
+  render_encoder: "auto",
+  resource_profile: "balanced",
   translator: "deepseek",
   target_lang: "zh-Hans",
   translate_model: "",
@@ -229,7 +320,8 @@ const formatElapsed = (seconds: number) => {
 const secondsFromDuration = (value: string, unit: "秒" | "分钟" | "小时") => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
-  return Math.round(parsed * (unit === "小时" ? 3600 : unit === "分钟" ? 60 : 1));
+  const seconds = parsed * (unit === "小时" ? 3600 : unit === "分钟" ? 60 : 1);
+  return Number.isInteger(seconds) && seconds <= 86_400 ? seconds : null;
 };
 const formatBytes = (bytes: number) => {
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -245,20 +337,52 @@ type NativeBridge = {
   choose_output_dir: () => Promise<{ path: string } | null>;
   choose_cookies_file: () => Promise<{ path: string } | null>;
 };
+
+const workflowStageMeta: Array<[WorkflowStageName, string, string]> = [
+  ["acquire", "获取素材", "下载 URL 视频；本地文件会直接登记为可用素材。"],
+  ["extract", "字幕提取", "提取音频，再按方案执行 Whisper、OCR 或合并。"],
+  ["translate", "翻译", "校正源字幕，生成中文字幕和投稿标题标签。"],
+  ["render", "渲染", "使用 FFmpeg 生成 SRT 与硬字幕成片。"],
+  ["publish", "发布辅助", "可选；上传并填表，始终停在人工提交前。"],
+];
+const stageStatusLabel: Record<string, string> = {
+  pending: "待执行", ready: "可执行", running: "运行中", completed: "已完成",
+  failed: "失败", cancelled: "已取消", stale: "需重做", interrupted: "意外中断",
+};
+
+function FieldGuide({ summary, detail, badges = [] }: { summary: string; detail: string; badges?: string[] }) {
+  return <span className="field-guide"><small>{summary}</small><span className="guide-badges">{badges.map((badge) => <i key={badge}>{badge}</i>)}</span><details><summary>？ 选择建议与影响</summary><p>{detail}</p></details></span>;
+}
 declare global {
   interface Window { pywebview?: { api?: NativeBridge } }
 }
 
+let csrfToken = "";
+
+class ApiError extends Error {
+  field?: string;
+  code?: string;
+
+  constructor(message: string, field?: string, code?: string) {
+    super(message);
+    this.name = "ApiError";
+    this.field = field;
+    this.code = code;
+  }
+}
+
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const form = options?.body instanceof FormData;
+  const method = (options?.method ?? "GET").toUpperCase();
+  const mutation = !["GET", "HEAD", "OPTIONS"].includes(method);
   const response = await fetch(path, {
     ...options,
     headers: form
-      ? options?.headers
-      : { "Content-Type": "application/json", ...(options?.headers ?? {}) },
+      ? { ...(mutation && csrfToken ? { "X-YBL-CSRF": csrfToken } : {}), ...(options?.headers ?? {}) }
+      : { "Content-Type": "application/json", ...(mutation && csrfToken ? { "X-YBL-CSRF": csrfToken } : {}), ...(options?.headers ?? {}) },
   });
-  const payload = (await response.json()) as T & { error?: string };
-  if (!response.ok) throw new Error(payload.error ?? "本地服务请求失败");
+  const payload = (await response.json()) as T & { error?: string; field?: string; code?: string };
+  if (!response.ok) throw new ApiError(payload.error ?? "本地服务请求失败", payload.field, payload.code);
   return payload;
 }
 
@@ -266,6 +390,7 @@ function App() {
   const fileInput = useRef<HTMLInputElement>(null);
   const publishFileInput = useRef<HTMLInputElement>(null);
   const video = useRef<HTMLVideoElement>(null);
+  const jobLogCursor = useRef(0);
   const [view, setView] = useState<View>("material");
   const [materials, setMaterials] = useState<Material[]>([]);
   const [materialId, setMaterialId] = useState("");
@@ -274,10 +399,11 @@ function App() {
   const [fullVideo, setFullVideo] = useState(false);
   const [durationValue, setDurationValue] = useState("10");
   const [durationUnit, setDurationUnit] = useState<"秒" | "分钟" | "小时">("秒");
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [device, setDevice] = useState("cuda");
   const [computeType, setComputeType] = useState("float16");
   const [options, setOptions] = useState<Options>(defaults);
-  const [appVersion, setAppVersion] = useState("0.2.0");
+  const [appVersion, setAppVersion] = useState("0.2.5");
   const [demoPreview, setDemoPreview] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const [cues, setCues] = useState<Cue[]>([]);
@@ -289,12 +415,15 @@ function App() {
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
+  const [dependenciesOpen, setDependenciesOpen] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [message, setMessage] = useState("正在连接本地服务…");
   const [metadata, setMetadata] = useState<{
     duration: number | null;
     license: string | null;
     view_count: number | null;
+    max_width: number | null;
+    max_height: number | null;
   } | null>(null);
   const [metadataNotice, setMetadataNotice] = useState("");
   const [metadataState, setMetadataState] = useState<
@@ -316,9 +445,12 @@ function App() {
   const [nativePublishName, setNativePublishName] = useState("");
   const [profileMessage, setProfileMessage] = useState("");
   const [showFullLogs, setShowFullLogs] = useState(false);
+  const [fullLogs, setFullLogs] = useState<string[]>([]);
+  const [fullLogsTruncated, setFullLogsTruncated] = useState(false);
   const [now, setNow] = useState(Date.now());
   const [readiness, setReadiness] = useState<string[]>([]);
   const [preflightWarnings, setPreflightWarnings] = useState<string[]>([]);
+  const [preparingJob, setPreparingJob] = useState(false);
   const [outputs, setOutputs] = useState<Outputs | null>(null);
   const [selectedOutputPaths, setSelectedOutputPaths] = useState<string[]>([]);
   const [selectedOutputTaskIds, setSelectedOutputTaskIds] = useState<string[]>([]);
@@ -328,6 +460,7 @@ function App() {
   );
   const [apiKeyConfigured, setApiKeyConfigured] = useState<boolean | null>(null);
   const [cookiesFileValid, setCookiesFileValid] = useState<boolean | null>(null);
+  const [poTokenStatus, setPoTokenStatus] = useState<{ available: boolean; browser_path: string | null } | null>(null);
   const [publishSession, setPublishSession] = useState<{
     status: string;
     message: string;
@@ -337,9 +470,15 @@ function App() {
   }>({ status: "idle", message: "", logs: [], error: null, active: false });
   const [viewedTaskId, setViewedTaskId] = useState<string | null>(null);
   const [jobHistory, setJobHistory] = useState<HistoryJob[]>([]);
+  const [restorableJobs, setRestorableJobs] = useState<RestorableJob[]>([]);
+  const [testHistoryCandidates, setTestHistoryCandidates] = useState<TestHistoryCandidate[]>([]);
+  const [selectedTestHistoryIds, setSelectedTestHistoryIds] = useState<string[]>([]);
+  const [testHistoryOpen, setTestHistoryOpen] = useState(false);
   const [historyScope, setHistoryScope] = useState<"current" | "all">("current");
   const [historyTotal, setHistoryTotal] = useState(0);
   const [diagnostics, setDiagnostics] = useState<Diagnostic[]>([]);
+  const [dependencies, setDependencies] = useState<Dependency[]>([]);
+  const [dependencyJob, setDependencyJob] = useState<DependencyInstallJob | null>(null);
   const [translationReady, setTranslationReady] = useState(true);
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const [cutStart, setCutStart] = useState("");
@@ -351,6 +490,8 @@ function App() {
   const [reorderPoints, setReorderPoints] = useState("");
   const [reorderOrder, setReorderOrder] = useState("");
   const [offsetValue, setOffsetValue] = useState("");
+  const [proxyConfigured, setProxyConfigured] = useState(false);
+  const [proxyDirty, setProxyDirty] = useState(false);
 
   const selected = materials.find((item) => item.id === materialId);
   const running = ["queued", "running", "cancelling"].includes(
@@ -391,8 +532,21 @@ function App() {
     return outputs.tasks.reduce((total, task) => total + (taskIds.has(task.id) ? task.size : task.files.filter((file) => selectedOutputPaths.includes(file.id)).reduce((sum, file) => sum + file.size, 0)), 0);
   }, [outputs, selectedOutputPaths]);
 
-  const updateOptions = <K extends keyof Options>(key: K, value: Options[K]) =>
+  const updateOptions = <K extends keyof Options>(key: K, value: Options[K]) => {
+    setFieldErrors((current) => {
+      if (!current[String(key)]) return current;
+      const next = { ...current };
+      delete next[String(key)];
+      return next;
+    });
     setOptions((current) => ({ ...current, [key]: value }));
+  };
+  const reportApiError = (error: unknown, fallback: string) => {
+    if (error instanceof ApiError && error.field) {
+      setFieldErrors((current) => ({ ...current, [error.field as string]: error.message }));
+    }
+    return error instanceof Error ? error.message : fallback;
+  };
   const loadMaterials = async () =>
     setMaterials(
       (await api<{ materials: Material[] }>("/api/materials")).materials,
@@ -414,6 +568,8 @@ function App() {
       deepseek_key_configured?: boolean;
       openai_key_configured?: boolean;
       default_output_dir?: string;
+      youtube_proxy_configured?: boolean;
+      youtube_po_token?: { available: boolean; browser_path: string | null };
     }>("/api/settings");
     const browser = settings.cookies_from_browser ?? "";
     if (["", "chrome", "edge", "firefox", "brave", "chromium"].includes(browser)) {
@@ -428,7 +584,47 @@ function App() {
         : current);
     }
     setCookiesFileValid(settings.cookies_file_valid ?? null);
+    setPoTokenStatus(settings.youtube_po_token ?? null);
     setApiKeyConfigured(Boolean(settings.deepseek_key_configured));
+    setProxyConfigured(Boolean(settings.youtube_proxy_configured));
+  };
+  const loadRestorableJobs = async () => {
+    const response = await api<{ jobs: RestorableJob[] }>("/api/jobs/restorable?limit=20");
+    setRestorableJobs(response.jobs);
+  };
+  const loadRestoredJob = async (id: string) => {
+    try {
+      const restored = await api<Job>(`/api/jobs/${id}/load`, { method: "POST", body: "{}" });
+      setJob(restored);
+      setDemoPreview(false);
+      setOptions((current) => ({
+        ...current,
+        ...restored.options,
+        cookies_file: current.cookies_file,
+        youtube_proxy: current.youtube_proxy,
+      }));
+      setDevice(restored.device);
+      setComputeType(restored.compute_type);
+      setSourceUrl(restored.material.source_url ?? "");
+      setAuthorized(restored.material.authorized);
+      setDescription(restored.options.description ?? "");
+      setTags((restored.options.tags ?? []).join(","));
+      setPublishInPipeline(Boolean(restored.options.publish_to_bilibili));
+      setIncludeSourceLink(restored.options.include_source_link ?? true);
+      setPublishBrowser(restored.options.bilibili_browser ?? "chromium");
+      setCloseAfterFill(Boolean(restored.options.close_after_fill));
+      setPreview(restored.artifacts?.rendered_video?.available ? "rendered" : "source");
+      await loadCues(restored.id);
+      setView("process");
+      setMessage(restored.edit_state === "legacy-ambiguous"
+        ? "已载入旧任务并保留现有成片；后期版本顺序无法确认，已禁用重新渲染。"
+        : restored.checkpoint_validation === "invalid"
+          ? "已载入任务，但部分检查点无效；请先运行准备检查。"
+          : "任务已载入。不会自动继续耗资源处理，请确认后再执行下一阶段。");
+      await loadRestorableJobs();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "载入任务失败");
+    }
   };
   const loadJobHistory = async () => {
     try {
@@ -452,12 +648,51 @@ function App() {
       /* A local service error is already reported by the connection state. */
     }
   };
+  const loadDependencies = async () => {
+    const response = await api<{
+      dependencies: Dependency[];
+      active_job: DependencyInstallJob | null;
+    }>("/api/dependencies");
+    setDependencies(response.dependencies);
+    setDependencyJob((current) => response.active_job ?? (current && ["completed", "failed", "cancelled"].includes(current.status) ? current : null));
+    setDiagnostics(response.dependencies.map(({ installable: _installable, size_hint: _size, action_url: _url, ...item }) => item));
+  };
+  const installDependency = async (dependency: Dependency) => {
+    if (!window.confirm(`安装“${dependency.label}”吗？\n\n用途：${dependency.purpose}\n预计占用：${dependency.size_hint}\n\n安装过程需要联网，Windows 可能显示权限提示。`)) return;
+    try {
+      const response = await api<{ job: DependencyInstallJob }>(`/api/dependencies/${dependency.id}/install`, {
+        method: "POST",
+        body: JSON.stringify({ confirmed: true }),
+      });
+      setDependencyJob(response.job);
+      setDependenciesOpen(true);
+      setMessage(response.job.message);
+      if (response.job.status === "completed") await loadDependencies();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "无法开始安装");
+    }
+  };
+  const cancelDependencyInstall = async () => {
+    if (!dependencyJob || !["queued", "running", "cancelling"].includes(dependencyJob.status)) return;
+    try {
+      const response = await api<{ job: DependencyInstallJob }>(`/api/dependencies/jobs/${dependencyJob.id}/cancel`, {
+        method: "POST",
+        body: "{}",
+      });
+      setDependencyJob(response.job);
+      setMessage(response.job.message);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "取消安装失败");
+    }
+  };
   const loadBootstrap = async () => {
     const bootstrap = await api<{
       version: string;
+      csrf_token: string;
       defaults: Options;
       capabilities: Record<string, Omit<Diagnostic, "id" | "message">>;
     }>("/api/bootstrap");
+    csrfToken = bootstrap.csrf_token;
     setAppVersion(bootstrap.version);
     setOptions((current) => ({ ...current, ...bootstrap.defaults }));
     setDiagnostics(Object.entries(bootstrap.capabilities).map(([id, item]) => ({
@@ -494,6 +729,33 @@ function App() {
       setMessage(error instanceof Error ? error.message : "清除任务历史失败");
     }
   };
+  const scanTestHistory = async () => {
+    try {
+      const response = await api<{ candidates: TestHistoryCandidate[] }>("/api/history/test-records/scan", {
+        method: "POST", body: "{}",
+      });
+      setTestHistoryCandidates(response.candidates);
+      setSelectedTestHistoryIds([]);
+      setTestHistoryOpen(true);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "扫描测试记录失败");
+    }
+  };
+  const deleteSelectedTestHistory = async () => {
+    if (!selectedTestHistoryIds.length) return;
+    if (!window.confirm(`再次确认：只删除选中的 ${selectedTestHistoryIds.length} 条测试历史记录，不删除任何视频或输出目录。`)) return;
+    try {
+      const response = await api<{ message: string }>("/api/history/test-records/delete", {
+        method: "POST",
+        body: JSON.stringify({ ids: selectedTestHistoryIds, confirmed: true }),
+      });
+      setMessage(response.message);
+      setTestHistoryOpen(false);
+      await Promise.all([loadJobHistory(), loadRestorableJobs()]);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "删除测试历史失败");
+    }
+  };
   const openHistoryPath = async (path: string) => {
     try {
       await api("/api/history/open", { method: "POST", body: JSON.stringify({ path }) });
@@ -521,6 +783,21 @@ function App() {
       /* Cues are not ready during download/transcription. */
     }
   };
+  const toggleFullLogs = async () => {
+    if (showFullLogs) {
+      setShowFullLogs(false);
+      return;
+    }
+    if (!job) return;
+    try {
+      const response = await api<{ logs: string[]; total: number; truncated: boolean }>(`/api/jobs/${job.id}/logs?limit=5000`);
+      setFullLogs(response.logs);
+      setFullLogsTruncated(response.truncated);
+      setShowFullLogs(true);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "读取完整日志失败");
+    }
+  };
   const taskOptions = () => {
     const maxSeconds = sourceUrl.trim() && !fullVideo
       ? secondsFromDuration(durationValue, durationUnit)
@@ -535,6 +812,28 @@ function App() {
       bilibili_browser: publishBrowser,
       close_after_fill: closeAfterFill,
     };
+  };
+  const validateTaskFields = () => {
+    const errors: Record<string, string> = {};
+    if (sourceUrl.trim() && !fullVideo && secondsFromDuration(durationValue, durationUnit) === null) {
+      errors.max_seconds = "读取长度必须换算为 1～86400 秒之间的整数。";
+    }
+    if (sourceUrl.trim().length > 2048) errors.source_url = "视频链接不能超过 2048 个字符。";
+    if (options.title.length > 200) errors.title = "标题不能超过 200 个字符。";
+    if ((description ?? "").length > 5000) errors.description = "简介不能超过 5000 个字符。";
+    if (options.whisper_model_size.length > 128) errors.whisper_model_size = "模型名不能超过 128 个字符。";
+    if (options.translate_model.length > 128) errors.translate_model = "模型名不能超过 128 个字符。";
+    if (options.font_name.length > 100) errors.font_name = "字体名不能超过 100 个字符。";
+    if (options.target_lang.length > 32) errors.target_lang = "目标语言不能超过 32 个字符。";
+    const parsedTags = tags.split(",").map((value) => value.trim()).filter(Boolean);
+    if (parsedTags.length > 20) errors.tags = "标签最多允许 20 个。";
+    else if (parsedTags.some((value) => value.length > 30)) errors.tags = "每个标签不能超过 30 个字符。";
+    setFieldErrors(errors);
+    if (Object.keys(errors).length) {
+      setMessage(Object.values(errors)[0]);
+      return false;
+    }
+    return true;
   };
   const loadPublishStatus = async () => {
     try {
@@ -559,8 +858,9 @@ function App() {
     }
   };
   const cookieHintMatches = (text: string | null | undefined) =>
-    !!text && /Cookies|机器人|登录验证|拦截/i.test(text);
+    !!text && /Cookies|机器人|登录验证|拦截|PO Token|HTTP 403|浏览器验证/i.test(text);
   const checkReadiness = async () => {
+    if (!validateTaskFields()) return false;
     try {
       const response = await api<{
         ready: boolean;
@@ -568,14 +868,14 @@ function App() {
         warnings: Array<{ code: string; message: string }>;
       }>("/api/preflight", {
         method: "POST",
-        body: JSON.stringify({ source_url: sourceUrl, material_id: selected?.id, authorized, device, compute_type: computeType, options: taskOptions() }),
+        body: JSON.stringify({ source_url: sourceUrl, material_id: selected?.id, authorized, device, compute_type: computeType, source_height: metadata?.max_height, options: taskOptions() }),
       });
       setReadiness(response.blocking.map((item) => item.message));
       setPreflightWarnings(response.warnings.map((item) => item.message));
       setMessage(response.ready ? (response.warnings[0]?.message ?? "基础配置可以运行。") : response.blocking.map((item) => item.message).join("；"));
       return response.ready;
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "检查配置失败");
+      setMessage(reportApiError(error, "检查配置失败"));
       return false;
     }
   };
@@ -615,24 +915,45 @@ function App() {
   const applyRecommended = () => {
     setDevice("cpu");
     setComputeType("int8");
-    setOptions((current) => ({ ...current, subtitle_source: "audio", whisper_model_size: "small", source_language: "", translator: "deepseek", target_lang: "zh-Hans", smart_translation: true, smart_subtitle_layout: true, font_name: "Microsoft YaHei", font_size: 24, subtitle_display_mode: "translated", subtitle_color: "白色", subtitle_outline_color: "黑色", subtitle_effect: "描边" }));
+    setOptions((current) => ({ ...current, download_quality: "1080p", render_encoder: "auto", resource_profile: "balanced", subtitle_source: "audio", whisper_model_size: "small", source_language: "", translator: "deepseek", target_lang: "zh-Hans", smart_translation: true, smart_subtitle_layout: true, font_name: "Microsoft YaHei", font_size: 24, subtitle_display_mode: "translated", subtitle_color: "白色", subtitle_outline_color: "黑色", subtitle_effect: "描边" }));
     setIncludeSourceLink(true);
-    setMessage("已应用推荐设置：CPU int8、音频转写与中文硬字幕；OCR 保持可选。");
+    setMessage("已应用推荐设置：最高 1080p、自动优先 NVIDIA 渲染、CPU int8 转写与中文硬字幕。");
   };
 
   useEffect(() => {
-    Promise.all([
-      loadBootstrap(),
-      loadMaterials(),
-      loadTemplates(),
-      loadSettings(),
-    ])
+    loadBootstrap()
+      .then(() => Promise.all([
+        loadMaterials(),
+        loadTemplates(),
+        loadSettings(),
+        loadDependencies(),
+        loadRestorableJobs(),
+      ]))
       .then(() => {
         setOnline(true);
         setMessage("本地服务已就绪。选择素材后即可开始处理。");
       })
       .catch(() => setMessage("未连接本地服务，请启动工作台 EXE。"));
   }, []);
+  useEffect(() => {
+    if (!dependencyJob || !["queued", "running", "cancelling"].includes(dependencyJob.status)) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const latest = await api<DependencyInstallJob>(`/api/dependencies/jobs/${dependencyJob.id}`);
+        setDependencyJob(latest);
+        setMessage(latest.message);
+        if (["completed", "failed", "cancelled"].includes(latest.status)) {
+          window.clearInterval(timer);
+          await loadDependencies();
+          if (latest.status === "completed" && job) await prepareJob();
+        }
+      } catch (error) {
+        window.clearInterval(timer);
+        setMessage(error instanceof Error ? error.message : "读取安装进度失败");
+      }
+    }, 800);
+    return () => window.clearInterval(timer);
+  }, [dependencyJob?.id, dependencyJob?.status]);
   useEffect(() => {
     if (running) setInspectorOpen(true);
     if (job?.status === "completed") {
@@ -643,20 +964,34 @@ function App() {
     }
   }, [running, job?.status]);
   useEffect(() => {
+    setShowFullLogs(false);
+    setFullLogs([]);
+    setFullLogsTruncated(false);
+  }, [job?.id]);
+  useEffect(() => {
     if (!job || !running) return;
+    jobLogCursor.current = job.log_cursor ?? 0;
+    let inFlight = false;
     const timer = window.setInterval(async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
-        const latest = await api<Job>(`/api/jobs/${job.id}`);
-        setJob(latest);
-        if (latest.progress >= 48) loadCues(latest.id);
+        const latest = await api<Job>(`/api/jobs/${job.id}?log_after=${jobLogCursor.current}&log_limit=100`);
+        jobLogCursor.current = latest.log_cursor ?? jobLogCursor.current;
+        setJob((current) => ({
+          ...latest,
+          logs: [...(current?.logs ?? []), ...latest.logs].slice(-2000),
+        }));
         if (latest.status === "failed")
           setMessage(`处理失败：${latest.error ?? "请查看检查器日志"}`);
       } catch (error) {
         setMessage(
           `读取任务失败：${error instanceof Error ? error.message : "服务不可用"}`,
         );
+      } finally {
+        inFlight = false;
       }
-    }, 750);
+    }, 1250);
     return () => window.clearInterval(timer);
   }, [job?.id, running]);
   useEffect(() => {
@@ -687,7 +1022,7 @@ function App() {
         event.preventDefault(); setView("material"); document.getElementById("source-url")?.focus(); return;
       }
       if (event.ctrlKey && event.key.toLowerCase() === "r" && !typing) {
-        event.preventDefault(); void start(); return;
+        event.preventDefault(); topAction(); return;
       }
       if (event.key === "Escape" && running) {
         event.preventDefault(); void cancel();
@@ -712,12 +1047,17 @@ function App() {
         duration: number | null;
         license: string | null;
         view_count: number | null;
+        max_width: number | null;
+        max_height: number | null;
       }>("/api/metadata", {
         method: "POST",
         body: JSON.stringify({
           url: sourceUrl,
           cookies_from_browser: options.cookies_from_browser,
           cookies_file: options.cookies_file,
+          youtube_po_token_mode: options.youtube_po_token_mode,
+          youtube_proxy: options.youtube_proxy,
+          download_quality: options.download_quality,
         }),
       });
       setMetadata(value);
@@ -782,6 +1122,11 @@ function App() {
       `状态：${job?.status ?? "-"}（${job?.stage ?? "-"} ${job?.progress ?? 0}%）`,
       `翻译器：${options.translator}${apiKeyConfigured === false ? "（DeepSeek Key 未配置）" : ""}`,
       `Cookies：${cookies}`,
+      `YouTube 浏览器验证：${options.youtube_po_token_mode === "auto" ? "开启" : "关闭"}`,
+      `YouTube 代理：${options.youtube_proxy ? "已配置（地址已隐藏）" : "未配置"}`,
+      `下载画质：${options.download_quality}`,
+      `字幕渲染：${options.render_encoder}`,
+      `资源模式：${options.resource_profile}`,
       `错误：${job?.error ?? "无"}`,
       "日志：",
       ...(job?.logs ?? []),
@@ -798,10 +1143,15 @@ function App() {
     if ((!selected && !url) || running) return;
     if (dirty && !confirmDiscardSubtitles("开始新任务会清空当前未保存的字幕修改")) return;
     if (!authorized) return setMessage("开始前请确认拥有处理或转载授权。");
-    if (url && !fullVideo && !secondsFromDuration(durationValue, durationUnit)) {
-      return setMessage("请填写有效的 URL 读取长度，或选择完整视频。");
-    }
-    if (!(await checkReadiness())) return;
+    if (!validateTaskFields()) return;
+    if (
+      url &&
+      options.download_quality === "original" &&
+      (metadata?.max_height ?? 0) >= 2160 &&
+      !window.confirm(
+        `该素材最高为 ${metadata?.max_width ?? "?"}×${metadata?.max_height ?? "?"}。原始画质会显著增加显存、CPU 和磁盘占用。\n\n建议改为 1080p。仍要继续吗？`,
+      )
+    ) return;
     try {
       const created = await api<Job>("/api/jobs", {
         method: "POST",
@@ -818,15 +1168,87 @@ function App() {
       setDemoPreview(false);
       setCues([]);
       setPreview("source");
-      setMessage(
-        url ? "正在下载视频并开始处理。" : `已开始处理：${selected?.name}`,
-      );
+      setView("process");
+      setMessage("任务草稿已保存。请确认处理方案，然后运行开始前准备检查；当前不会下载视频。 ");
     } catch (error) {
-      setMessage(
-        `无法启动：${error instanceof Error ? error.message : "未知错误"}`,
-      );
+      setMessage(`无法启动：${reportApiError(error, "未知错误")}`);
     }
   };
+  const saveWorkflowOptions = async () => {
+    if (!job || running) return job;
+    if (!validateTaskFields()) return null;
+    try {
+      const updated = await api<Job & { stale_stages?: string[] }>(`/api/jobs/${job.id}/options`, {
+        method: "PATCH",
+        body: JSON.stringify({ device, compute_type: computeType, options: taskOptions() }),
+      });
+      setJob(updated);
+      const stale = updated.stale_stages ?? [];
+      setMessage(stale.length ? `方案已保存；${stale.map((name) => workflowStageMeta.find(([id]) => id === name)?.[1] ?? name).join("、")}需要重新执行。` : "方案已保存，请运行准备检查。 ");
+      return updated;
+    } catch (error) {
+      setMessage(reportApiError(error, "保存处理方案失败"));
+      return null;
+    }
+  };
+  const prepareJob = async () => {
+    if (!job || running || preparingJob) return;
+    const saved = await saveWorkflowOptions();
+    if (!saved) return;
+    setPreparingJob(true);
+    try {
+      const prepared = await api<Job>(`/api/jobs/${job.id}/prepare`, { method: "POST", body: "{}" });
+      setJob(prepared);
+      const blockers = (prepared.checks ?? []).filter((item) => item.status === "blocking");
+      setMessage(blockers.length ? `准备检查发现 ${blockers.length} 个阻断项，请按清单修正。` : "开始前准备已通过。你可以逐阶段运行，或一键运行到渲染。 ");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "准备检查失败");
+    } finally { setPreparingJob(false); }
+  };
+  const runStage = async (stage: WorkflowStageName) => {
+    if (!job || running) return;
+    try {
+      const latest = await api<Job>(`/api/jobs/${job.id}/stages/${stage}/run`, { method: "POST", body: "{}" });
+      setJob(latest); setInspectorOpen(true);
+      setMessage(`已开始：${workflowStageMeta.find(([id]) => id === stage)?.[1] ?? stage}`);
+    } catch (error) { setMessage(error instanceof Error ? error.message : "无法启动该阶段"); }
+  };
+  const openStageResult = (stage: WorkflowStageName) => {
+    if (!job) return;
+    if (stage === "publish") { setView("publish"); return; }
+    if (stage === "render") setPreview("rendered");
+    else setPreview("source");
+    if (["extract", "translate", "render"].includes(stage)) void loadCues(job.id);
+    setView("subtitle");
+  };
+  const runAll = async () => {
+    if (!job || running) return;
+    try {
+      const latest = await api<Job>(`/api/jobs/${job.id}/run-all`, { method: "POST", body: "{}" });
+      setJob(latest); setInspectorOpen(true); setMessage("已按同一套阶段顺序运行；任一步失败都会停在该检查点。 ");
+    } catch (error) { setMessage(error instanceof Error ? error.message : "无法运行全部阶段"); }
+  };
+  const resumeJob = async () => {
+    if (!job || running) return;
+    try {
+      const latest = await api<Job>(`/api/jobs/${job.id}/resume`, { method: "POST", body: "{}" });
+      setJob(latest); setInspectorOpen(true); setMessage("已从最后一个有效检查点继续。 ");
+    } catch (error) { setMessage(error instanceof Error ? error.message : "无法恢复任务"); }
+  };
+  const topAction = () => {
+    if (running) return void cancel();
+    if (!job) return void start();
+    if (!job.checks?.length || (job.checks ?? []).some((item) => item.status === "blocking")) return void prepareJob();
+    if (job.can_resume) return void resumeJob();
+    if (job.next_stage) return void runStage(job.next_stage);
+    setView("subtitle");
+  };
+  const topActionLabel = preparingJob ? "正在检查准备…" : workflowPrimaryLabel({
+    running, hasJob: Boolean(job), hasChecks: Boolean(job?.checks?.length),
+    hasBlocking: (job?.checks ?? []).some((item) => item.status === "blocking"),
+    canResume: Boolean(job?.can_resume), nextStage: job?.next_stage ?? null,
+    stageLabel: (stage) => workflowStageMeta.find(([id]) => id === stage)?.[1] ?? "下一阶段",
+  });
   const cancel = async () => {
     if (!job) return;
     try {
@@ -850,7 +1272,7 @@ function App() {
       }
     }
     try {
-      await api<Job>(`/api/jobs/${job.id}/cues`, {
+      const savedJob = await api<Job>(`/api/jobs/${job.id}/cues`, {
         method: "PUT",
         body: JSON.stringify({
           cues: cues.map((cue) => ({
@@ -861,9 +1283,10 @@ function App() {
           })),
         }),
       });
+      setJob(savedJob);
       setHistory([]);
       setFuture([]);
-      setMessage("字幕已保存（含时间调整与删除）。 ");
+      setMessage("字幕已保存；渲染检查点已标记为需要重做，可直接点击“重新渲染”。 ");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "保存字幕失败");
     }
@@ -1070,9 +1493,12 @@ function App() {
           api_key: apiKey,
           cookies_from_browser: options.cookies_from_browser,
           cookies_file: options.cookies_file,
+          ...(proxyDirty ? { youtube_proxy: options.youtube_proxy } : {}),
         }),
       });
       setApiKey("");
+      if (proxyDirty) setProxyConfigured(Boolean(options.youtube_proxy));
+      setProxyDirty(false);
       setSettingsOpen(false);
       setMessage("本地设置已保存，密钥未回显。 ");
     } catch (error) {
@@ -1346,7 +1772,7 @@ function App() {
             <b>开始前还需安装 {diagnostics.filter((check) => check.required && !check.available).map((check) => check.label).join("、")}</b>
             <span>这里只列出默认流程的必需组件；Tesseract 等 OCR 组件按所选模式检查。</span>
           </div>
-          <button className="text-button" onClick={() => setShortcutHelpOpen(true)}>查看说明</button>
+          <button className="text-button" onClick={() => setDependenciesOpen(true)}>打开依赖中心</button>
         </section>
       )}
       <div className="form-grid two">
@@ -1355,9 +1781,11 @@ function App() {
           <input
             id="source-url"
             value={sourceUrl}
+            maxLength={2048}
             placeholder="粘贴 YouTube / B 站视频链接"
             onChange={(event) => {
               setSourceUrl(event.target.value);
+              setFieldErrors((current) => ({ ...current, source_url: "" }));
               setDemoPreview(false);
               setMetadata(null);
               setMetadataNotice("");
@@ -1366,6 +1794,7 @@ function App() {
             onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void readMetadata(); } }}
             disabled={running}
           />
+          {fieldErrors.source_url && <small className="field-error">{fieldErrors.source_url}</small>}
         </label>
         <div className="inline-actions">
           <button
@@ -1379,7 +1808,7 @@ function App() {
             onClick={start}
             disabled={running || !sourceUrl.trim()}
           >
-            下载并处理
+            保存素材并配置方案
           </button>
         </div>
       </div>
@@ -1390,7 +1819,7 @@ function App() {
           </p>
           {metadataState === "error" && cookieHintMatches(metadataNotice) && (
             <button className="cookie-hint-button" onClick={() => setSettingsOpen(true)}>
-              去设置 → YouTube Cookies 来源
+              去设置 → YouTube 访问设置
             </button>
           )}
         </div>
@@ -1404,7 +1833,17 @@ function App() {
           </span>
           <span>{metadata.license || "许可证待确认"}</span>
           <span>{metadata.view_count?.toLocaleString() || "—"} 播放</span>
+          <span>
+            {metadata.max_width && metadata.max_height
+              ? `最高 ${metadata.max_width} × ${metadata.max_height}`
+              : "分辨率未知"}
+          </span>
         </div>
+      )}
+      {metadata && options.download_quality === "original" && (metadata.max_height ?? 0) >= 2160 && (
+        <p className="metadata-notice warning">
+          这是 4K 素材。原始画质处理会明显增加负载；普通使用建议改为 1080p。
+        </p>
       )}
       <div className="divider">
         <span>或导入本地素材</span>
@@ -1443,7 +1882,7 @@ function App() {
             onClick={start}
             disabled={running || !selected}
           >
-            处理本地视频
+            保存素材并配置方案
           </button>
         </div>
       </div>
@@ -1455,16 +1894,31 @@ function App() {
           标题
           <input
             value={options.title}
+            maxLength={200}
             onChange={(event) => updateOptions("title", event.target.value)}
           />
+          {fieldErrors.title && <small className="field-error">{fieldErrors.title}</small>}
         </label>
         <label>
           URL 读取长度
           <div className="duration-control">
             <label className="check"><input type="checkbox" checked={fullVideo} disabled={!sourceUrl.trim()} onChange={(event) => setFullVideo(event.target.checked)} />完整视频</label>
-            <input type="number" min="1" value={durationValue} disabled={!sourceUrl.trim() || fullVideo} onChange={(event) => setDurationValue(event.target.value)} />
+            <input type="number" min={durationUnit === "秒" ? 1 : 1 / 60} max={durationUnit === "小时" ? 24 : durationUnit === "分钟" ? 1440 : 86400} step={durationUnit === "秒" ? 1 : durationUnit === "分钟" ? 1 / 60 : 1 / 3600} value={durationValue} disabled={!sourceUrl.trim() || fullVideo} onChange={(event) => { setDurationValue(event.target.value); setFieldErrors((current) => ({ ...current, max_seconds: "" })); }} />
             <select value={durationUnit} disabled={!sourceUrl.trim() || fullVideo} onChange={(event) => setDurationUnit(event.target.value as "秒" | "分钟" | "小时")}><option>秒</option><option>分钟</option><option>小时</option></select>
           </div>
+          {fieldErrors.max_seconds && <small className="field-error">{fieldErrors.max_seconds}</small>}
+        </label>
+        <label>
+          URL 下载画质
+          <select
+            value={options.download_quality}
+            disabled={!sourceUrl.trim() || running}
+            onChange={(event) => updateOptions("download_quality", event.target.value as Options["download_quality"])}
+          >
+            <option value="720p">720p（低负载）</option>
+            <option value="1080p">1080p（推荐）</option>
+            <option value="original">原始画质（可能为 4K）</option>
+          </select>
         </label>
         <label className="check">
           <input
@@ -1490,7 +1944,8 @@ function App() {
             if (event.target.checked) setRightsHint(false);
           }}
         />
-        我确认拥有处理、转载或发布该视频的授权/许可证
+        我声明自己拥有处理及发布该视频所需的权利或许可证
+        <small className="check-hint">程序只能记录这项声明，无法代替版权或身份核验。</small>
       </label>
       <div className="card-footer task-tools">
         <button className="secondary" onClick={() => void previewAuthorizedDemo()}>
@@ -1503,7 +1958,91 @@ function App() {
       </div>
     </section>
   );
+  const preparationBlocking = (job?.checks ?? []).some((item) => item.status === "blocking");
+  const preparationReady = Boolean(job?.checks?.length) && !preparationBlocking;
+  const handleCheckAction = (check: PreparationCheck) => {
+    const action = check.action ?? "";
+    if (/安装|模型|FFmpeg|Tesseract/.test(action)) {
+      const dependency = dependencies.find((item) => item.id === check.id || (check.id === "ffprobe" && item.id === "ffmpeg"));
+      setDependenciesOpen(true);
+      if (dependency?.installable) void installDependency(dependency);
+    }
+    else if (/设置|API/.test(action)) setSettingsOpen(true);
+    else if (/素材/.test(action)) setView("material");
+    else setMode("advanced");
+  };
+  const workflowPanel = job ? (
+    <section className="workflow-panel" aria-label="分阶段任务工作流">
+      <header className="workflow-head">
+        <div>
+          <p className="eyebrow">任务工作流</p>
+          <h2>先检查，再逐阶段运行</h2>
+          <p>已完成阶段会保留检查点。取消或关闭应用后，不会丢掉之前的有效产物。</p>
+        </div>
+        <div className="workflow-actions">
+          <button onClick={() => void saveWorkflowOptions()} disabled={running || preparingJob}>保存方案</button>
+          <button className="primary" onClick={() => void prepareJob()} disabled={running || preparingJob} title={running ? "当前阶段运行中" : undefined}>
+            {preparingJob ? "正在检查链接与环境…" : job.checks?.length ? "重新检查准备" : "检查准备"}
+          </button>
+          <button onClick={() => void runAll()} disabled={running || !preparationReady} title={!preparationReady ? "准备检查全部通过后才能运行" : undefined}>
+            一键运行到渲染
+          </button>
+        </div>
+      </header>
+      <ol className="workflow-stepper">
+        <li className="done"><span>1</span><b>素材确认</b></li>
+        <li className="done"><span>2</span><b>方案配置</b></li>
+        <li className={preparationReady ? "done" : job.checks?.length ? "attention" : ""}><span>3</span><b>环境准备</b></li>
+        {workflowStageMeta.slice(0, 4).map(([id, label], index) => (
+          <li key={id} className={job.stages?.[id]?.status === "completed" ? "done" : job.current_stage === id ? "active" : ["failed", "stale", "interrupted"].includes(job.stages?.[id]?.status ?? "") ? "attention" : ""}>
+            <span>{index + 4}</span><b>{label}</b>
+          </li>
+        ))}
+      </ol>
+      <section className="preparation-centre">
+        <div className="section-title">
+          <div><b>开始前准备</b><small>模型、工具、API、设备和磁盘问题全部在下载前显示</small></div>
+          {job.checks?.length ? <span className={preparationBlocking ? "blocking" : "passed"}>{preparationBlocking ? "存在阻断项" : "全部可运行"}</span> : <span>尚未检查</span>}
+        </div>
+        {job.checks?.length ? (
+          <div className="check-list">
+            {job.checks.map((check) => (
+              <article key={check.id} className={`prepare-check ${check.status}`}>
+                <span className="check-state" aria-hidden="true">{check.status === "passed" ? "✓" : check.status === "warning" ? "!" : check.status === "installing" ? "…" : "×"}</span>
+                <div><b>{check.label}</b><small>{check.purpose}</small><p>{check.message}</p></div>
+                {check.action && check.status !== "passed" && <button onClick={() => handleCheckAction(check)}>{check.action}</button>}
+              </article>
+            ))}
+          </div>
+        ) : <p className="empty-checks">保存当前方案后点击“检查准备”。检查不会下载视频，也不会自动安装任何组件。</p>}
+      </section>
+      <section className="stage-list">
+        {workflowStageMeta.map(([id, label, purpose], index) => {
+          const state = job.stages?.[id];
+          const availability = stageAvailability(id, Object.fromEntries(workflowStageMeta.map(([name]) => [name, job.stages?.[name]?.status])), preparationReady, running, publishInPipeline);
+          const enabled = availability.enabled;
+          const disabledReason = availability.reason;
+          return (
+            <article key={id} className={`stage-card ${state?.status ?? "pending"}`}>
+              <div className="stage-index">{index + 1}</div>
+              <div className="stage-copy"><div><b>{label}</b><span className={`stage-status ${state?.status ?? "pending"}`}>{stageStatusLabel[state?.status ?? "pending"]}</span></div><p>{purpose}</p>{state?.error && <small className="stage-error">{state.error}</small>}</div>
+              <div className="stage-action">
+                {state?.status === "completed" && id !== "publish" ? <span className="checkpoint">检查点已保存</span> : null}
+                <button onClick={() => state?.status === "running" ? void cancel() : state?.status === "completed" ? openStageResult(id) : void runStage(id)} disabled={state?.status === "running" || state?.status === "completed" ? false : !enabled} title={!["running", "completed"].includes(state?.status ?? "") && !enabled ? disabledReason : undefined}>
+                  {state?.status === "running" ? "取消当前阶段" : state?.status === "completed" ? "打开结果" : ["failed", "cancelled", "stale", "interrupted"].includes(state?.status ?? "") ? "重试" : "开始"}
+                </button>
+                {!["running", "completed"].includes(state?.status ?? "") && !enabled && disabledReason && <small>{disabledReason}</small>}
+              </div>
+            </article>
+          );
+        })}
+      </section>
+      {job.can_resume && <div className="resume-banner"><div><b>检测到上次运行被中断</b><span>已完成阶段不会重做；翻译会复用已保存批次，其他未完成阶段从头执行。</span></div><button onClick={() => void resumeJob()} disabled={!preparationReady || running}>从 {workflowStageMeta.find(([id]) => id === job.next_stage)?.[1] ?? "检查点"}继续</button></div>}
+    </section>
+  ) : null;
   const processView = (
+    <>
+    {workflowPanel}
     <section className="workspace-card">
       <header>
         <p className="eyebrow">处理配置</p>
@@ -1515,6 +2054,21 @@ function App() {
           DeepSeek API Key 未配置。请到「设置」填入 Key，或把翻译器改为「不翻译」。
         </p>
       )}
+      {job?.subtitle_extraction?.ocr_status === "fallback" && (
+        <p className="metadata-notice warning">
+          本次 OCR 没有成功，实际字幕来自 Whisper 音频转写。原因：{job.subtitle_extraction.message || "未找到可信画面字幕"}
+        </p>
+      )}
+      {job?.subtitle_extraction?.ocr_status === "completed" && (
+        <p className="metadata-notice success">
+          OCR 已实际参与本次字幕提取；模式：{job.subtitle_extraction.mode || "OCR"}。
+        </p>
+      )}
+      {job?.content_warnings?.map((warning) => (
+        <p className="metadata-notice warning" key={warning}>
+          人工复核提醒：{warning}
+        </p>
+      ))}
       {mode === "basic" ? (
         <div className="settings-grid">
           <label>
@@ -1530,6 +2084,7 @@ function App() {
               <option value="audio">仅音频转写</option>
               <option value="ocr">仅画面字幕 OCR</option>
             </select>
+            <FieldGuide summary="决定源字幕来自声音、画面文字，或两者合并。" detail="一般视频推荐仅音频；画面已有清晰外语字幕时可选 OCR；合并模式更慢且需要额外安装 Tesseract。" badges={options.subtitle_source === "audio" ? ["推荐"] : options.subtitle_source.includes("ocr") || options.subtitle_source === "merged" ? ["需要额外安装", "高负载"] : []} />
           </label>
           <label>
             翻译器
@@ -1543,6 +2098,7 @@ function App() {
               <option value="openai">OpenAI</option>
               <option value="none">不翻译</option>
             </select>
+            <FieldGuide summary="把源字幕翻译为目标语言。" detail="DeepSeek/OpenAI 会调用在线 API，可能产生少量费用；不翻译只适合保留原文或调试提取结果。" badges={options.translator === "none" ? [] : ["可能产生费用"]} />
           </label>
           <label>
             字幕排版
@@ -1556,6 +2112,30 @@ function App() {
               <option value="bilingual-source-first">原文在上 + 中文在下</option>
               <option value="bilingual-translation-first">中文在上 + 原文在下</option>
             </select>
+          </label>
+          <label>
+            字幕渲染
+            <select
+              value={options.render_encoder}
+              onChange={(event) => updateOptions("render_encoder", event.target.value as Options["render_encoder"])}
+            >
+              <option value="auto">自动（NVIDIA 优先）</option>
+              <option value="nvidia">NVIDIA NVENC</option>
+              <option value="cpu">CPU（兼容模式）</option>
+            </select>
+            <FieldGuide summary="决定最终视频由显卡还是 CPU 编码。" detail="自动模式会优先使用可用的 NVIDIA 编码器；CPU 兼容性最好但较慢。准备检查会在下载前验证。" badges={["推荐：自动"]} />
+          </label>
+          <label>
+            电脑资源占用
+            <select
+              value={options.resource_profile}
+              onChange={(event) => updateOptions("resource_profile", event.target.value as Options["resource_profile"])}
+            >
+              <option value="background">后台（最流畅，处理较慢）</option>
+              <option value="balanced">均衡（推荐）</option>
+              <option value="maximum">极速（可能影响其他软件）</option>
+            </select>
+            <FieldGuide summary="限制下载带宽和 CPU 线程，避免处理视频时整台电脑变卡。" detail="后台模式优先保证其他软件流畅；均衡模式默认保留一部分算力和网络；极速模式会尽量使用全部资源。切换模式不会让已完成阶段失效。" badges={options.resource_profile === "balanced" ? ["推荐"] : options.resource_profile === "maximum" ? ["高负载"] : ["低占用"]} />
           </label>
           <p className="mode-note">
             其余参数（模型、精度、OCR、字幕样式等）已隐藏，当前使用推荐默认值。
@@ -1598,6 +2178,7 @@ function App() {
               <option key={value}>{value}</option>
             ))}
           </select>
+          <FieldGuide summary="模型越大通常更准确，也越慢、越占显存和磁盘。" detail="small 是桌面使用的平衡选择。所选模型必须在准备中心明确安装，转写阶段不会自动联网下载。" badges={["需要预先安装"]} />
         </label>
         <label>
           源语言
@@ -1630,20 +2211,24 @@ function App() {
           翻译模型
           <input
             value={options.translate_model}
+            maxLength={128}
             placeholder="使用默认模型"
             onChange={(event) =>
               updateOptions("translate_model", event.target.value)
             }
           />
+          {fieldErrors.translate_model && <small className="field-error">{fieldErrors.translate_model}</small>}
         </label>
         <label>
           目标语言
           <input
             value={options.target_lang}
+            maxLength={32}
             onChange={(event) =>
               updateOptions("target_lang", event.target.value)
             }
           />
+          {fieldErrors.target_lang && <small className="field-error">{fieldErrors.target_lang}</small>}
         </label>
         <label>
           推理设备
@@ -1660,6 +2245,19 @@ function App() {
             <option value="cpu">CPU</option>
             <option value="auto">Auto</option>
           </select>
+          <FieldGuide summary="选择语音转写使用显卡还是处理器。" detail="CUDA 通常更快但需要 NVIDIA 显卡和正确驱动；CPU 更通用，准备检查会纠正不兼容精度。" badges={device === "cuda" ? ["高性能"] : ["兼容"]} />
+        </label>
+        <label>
+          电脑资源占用
+          <select
+            value={options.resource_profile}
+            onChange={(event) => updateOptions("resource_profile", event.target.value as Options["resource_profile"])}
+          >
+            <option value="background">后台（最流畅）</option>
+            <option value="balanced">均衡（推荐）</option>
+            <option value="maximum">极速（可能卡顿）</option>
+          </select>
+          <FieldGuide summary="统一控制下载、Whisper 与 FFmpeg 的资源上限。" detail="后台约限制下载到 2 MiB/s，并减少 CPU 线程；均衡约 6 MiB/s；极速不主动限速或限线程。Windows 下后台与均衡还会降低重型子进程优先级。" badges={options.resource_profile === "maximum" ? ["高负载"] : options.resource_profile === "balanced" ? ["推荐"] : ["低占用"]} />
         </label>
         <label>
           计算精度
@@ -1673,6 +2271,7 @@ function App() {
               ),
             )}
           </select>
+          <FieldGuide summary="控制转写速度、显存和数值精度。" detail="CUDA 推荐 float16；CPU 推荐 int8。错误组合会在下载前作为阻断项显示。" badges={computeType === "float16" ? ["CUDA 推荐"] : computeType === "int8" ? ["CPU 推荐"] : []} />
         </label>
         <label>
           转写束宽（beam_size）
@@ -1691,10 +2290,26 @@ function App() {
             value={options.ocr_interval}
             onChange={(event) => updateOptions("ocr_interval", Number(event.target.value))}
           >
-            <option value={0.5}>0.5（更密）</option>
-            <option value={1}>1（推荐）</option>
+            <option value={0.25}>0.25（短字幕，最慢）</option>
+            <option value={0.5}>0.5（推荐）</option>
+            <option value={1}>1（更快）</option>
             <option value={2}>2（更快）</option>
           </select>
+          <FieldGuide summary="决定多久读取一次画面，默认 0.5 秒可覆盖多数短字幕。" detail="字幕一闪而过时使用 0.25 秒；普通字幕推荐 0.5 秒；1～2 秒会更快，但可能漏掉短字幕。" badges={options.ocr_interval <= 0.25 ? ["高负载"] : options.ocr_interval === 0.5 ? ["推荐"] : ["可能漏短字幕"]} />
+        </label>
+        <label>
+          OCR 语言
+          <select
+            value={options.ocr_language}
+            onChange={(event) => updateOptions("ocr_language", event.target.value)}
+          >
+            <option value="eng">英文（eng）</option>
+            <option value="chi_sim">简体中文（chi_sim）</option>
+            <option value="eng+chi_sim">英文 + 简体中文</option>
+            <option value="jpn">日文（jpn）</option>
+            <option value="kor">韩文（kor）</option>
+          </select>
+          <FieldGuide summary="必须和画面中已有字幕的语言一致。" detail="准备检查会在下载前确认对应 Tesseract 语言包是否安装；缺少语言包时不会开始下载。" badges={["下载前检查"]} />
         </label>
         <label>
           OCR 识别区域
@@ -1740,6 +2355,17 @@ function App() {
             <option value={20}>20（推荐）</option>
             <option value={23}>23（平衡）</option>
             <option value={28}>28（小文件）</option>
+          </select>
+        </label>
+        <label>
+          字幕渲染编码器
+          <select
+            value={options.render_encoder}
+            onChange={(event) => updateOptions("render_encoder", event.target.value as Options["render_encoder"])}
+          >
+            <option value="auto">自动（NVIDIA 优先）</option>
+            <option value="nvidia">NVIDIA NVENC</option>
+            <option value="cpu">CPU libx264</option>
           </select>
         </label>
         <label>
@@ -1823,13 +2449,14 @@ function App() {
         </button>
         <button
           className="primary"
-          onClick={start}
-          disabled={running || (!selected && !sourceUrl.trim())}
+          onClick={() => job ? void prepareJob() : void start()}
+          disabled={running || preparingJob || (!job && !selected && !sourceUrl.trim())}
         >
-          {running ? "任务运行中" : "使用当前设置开始处理"}
+          {running ? "当前阶段运行中" : job ? "保存方案并检查准备" : "保存素材并配置方案"}
         </button>
       </footer>
     </section>
+    </>
   );
   const subtitleView = (
     <>
@@ -2036,10 +2663,12 @@ function App() {
             字体
             <input
               value={options.font_name}
+              maxLength={100}
               onChange={(event) =>
                 updateOptions("font_name", event.target.value)
               }
             />
+            {fieldErrors.font_name && <small className="field-error">{fieldErrors.font_name}</small>}
           </label>
           <label>
             字号
@@ -2047,6 +2676,7 @@ function App() {
               type="number"
               min="8"
               max="96"
+              step="1"
               value={options.font_size}
               onChange={(event) =>
                 updateOptions("font_size", Number(event.target.value || 24))
@@ -2138,7 +2768,8 @@ function App() {
             <button
               className="primary small"
               onClick={rerender}
-              disabled={!job?.result || running || dirty}
+              disabled={!job?.result || running || dirty || job?.edit_state === "legacy-ambiguous"}
+              title={job?.edit_state === "legacy-ambiguous" ? "旧任务的后期版本顺序无法确认；为保护现有成片，已禁用重新渲染" : "使用当前活动视频和字幕重新渲染"}
             >
               重新渲染
             </button>
@@ -2288,6 +2919,7 @@ function App() {
         模板内容
         <textarea
           value={templateBody}
+          maxLength={5000}
           onChange={(event) => setTemplateBody(event.target.value)}
           placeholder="模板支持 {source} 与 {custom_text}"
         />
@@ -2296,17 +2928,20 @@ function App() {
         简介
         <textarea
           value={description}
-          onChange={(event) => setDescription(event.target.value)}
+          maxLength={5000}
+          onChange={(event) => { setDescription(event.target.value); setFieldErrors((current) => ({ ...current, description: "" })); }}
           placeholder="生成后可继续人工修改"
         />
+        {fieldErrors.description && <small className="field-error">{fieldErrors.description}</small>}
       </label>
       <div className="form-grid two">
         <label>
           标签（逗号分隔）
           <input
             value={tags}
-            onChange={(event) => setTags(event.target.value)}
+            onChange={(event) => { setTags(event.target.value); setFieldErrors((current) => ({ ...current, tags: "" })); }}
           />
+          {fieldErrors.tags && <small className="field-error">{fieldErrors.tags}</small>}
         </label>
         <label>
           追加备注
@@ -2431,6 +3066,7 @@ function App() {
             </select>
           </label>
           <button onClick={() => void loadJobHistory()}>刷新</button>
+          <button onClick={() => void scanTestHistory()}>检查测试记录</button>
           <button className="history-clear" onClick={() => void clearHistory()} disabled={!historyTotal}>清除记录</button>
         </header>
         {jobHistory.length > 0 && (
@@ -2443,6 +3079,9 @@ function App() {
                 <b title={item.title}>{item.title}</b>
                 <small>{item.created_at ? new Date(item.created_at * 1000).toLocaleString() : "—"}</small>
                 <small>{item.finished_at && item.created_at ? `${Math.max(1, Math.round(item.finished_at - item.created_at))}s` : ""}</small>
+                <button onClick={() => void loadRestoredJob(item.id)} title="载入任务状态、字幕和当前产物；不会自动继续处理">
+                  载入任务
+                </button>
                 <button onClick={() => void openHistoryPath(item.output_dir || "")} disabled={!item.output_exists} title={item.output_exists ? "打开任务输出目录" : "输出目录已不存在"}>
                   打开输出
                 </button>
@@ -2514,6 +3153,9 @@ function App() {
           <button className="text-button" onClick={() => setSettingsOpen(true)}>
             设置
           </button>
+          <button className="text-button" onClick={() => setDependenciesOpen(true)}>
+            依赖
+          </button>
           <button className="text-button" onClick={() => setShortcutHelpOpen(true)}>
             帮助
           </button>
@@ -2529,13 +3171,27 @@ function App() {
           </button>
           <button
             className="primary"
-            onClick={running ? cancel : start}
-            disabled={running ? !job : !selected && !sourceUrl.trim()}
+            onClick={topAction}
+            disabled={preparingJob || (running ? !job : !job && !selected && !sourceUrl.trim())}
           >
-            {running ? "中断任务" : "开始处理"}
+            {topActionLabel}
           </button>
         </div>
       </header>
+      {restorableJobs.length > 0 && !running && (
+        <section className="restore-banner" aria-live="polite">
+          <div>
+            <b>发现 {restorableJobs.length} 个可继续任务</b>
+            <span>载入只会检查该任务的产物，不会自动开始下载、转写或渲染。</span>
+          </div>
+          <select aria-label="选择可继续任务" defaultValue="" onChange={(event) => { if (event.target.value) void loadRestoredJob(event.target.value); event.currentTarget.value = ""; }}>
+            <option value="" disabled>选择并载入…</option>
+            {restorableJobs.map((item) => (
+              <option key={item.id} value={item.id}>{item.title} · {item.next_stage ? stageStatusLabel.pending + " " + item.next_stage : item.status}</option>
+            ))}
+          </select>
+        </section>
+      )}
       <input
         ref={fileInput}
         className="hidden-input"
@@ -2611,8 +3267,19 @@ function App() {
                 </div>
                 {running && job.stage === "准备素材" && (
                   <p className="progress-hint">
-                    正在下载视频：进度来自真实网络字节。若长时间停在 12% 以下不变，可能是网络较慢或被平台拦截，可到「设置」配置 Cookies 后重试。
+                    正在准备 YouTube 媒体：首次自动浏览器验证可能需要数秒，并短暂启动最小化的 Chrome/Edge；随后进度来自真实下载字节。
                   </p>
+                )}
+                {job.stages && (
+                  <div className="inspector-stages">
+                    {workflowStageMeta.map(([id, label]) => (
+                      <div key={id} className={job.stages?.[id]?.status ?? "pending"}>
+                        <span>{job.stages?.[id]?.status === "completed" ? "✓" : job.current_stage === id ? "●" : "○"}</span>
+                        <b>{label}</b>
+                        <small>{stageStatusLabel[job.stages?.[id]?.status ?? "pending"]}</small>
+                      </div>
+                    ))}
+                  </div>
                 )}
                 <dl className="job-options">
                   <div>
@@ -2627,16 +3294,31 @@ function App() {
                     <dt>字幕源</dt>
                     <dd>{job.options.subtitle_source}</dd>
                   </div>
+                  {job.subtitle_extraction?.mode && (
+                    <div>
+                      <dt>实际提取</dt>
+                      <dd>{job.subtitle_extraction.mode}</dd>
+                    </div>
+                  )}
                   <div>
                     <dt>设备</dt>
                     <dd>
                       {job.device} · {job.compute_type}
                     </dd>
                   </div>
+                  <div>
+                    <dt>下载画质</dt>
+                    <dd>{job.options.download_quality}</dd>
+                  </div>
+                  <div>
+                    <dt>字幕渲染</dt>
+                    <dd>{job.options.render_encoder}</dd>
+                  </div>
                 </dl>
                 <section className="compact-log">
-                  <div className="log-head"><p className="eyebrow">{showFullLogs ? "完整日志" : "最近日志"}</p><div className="log-actions"><CopyButton text={buildDebugText()} label="复制调试信息" /><button onClick={() => setShowFullLogs((value) => !value)}>{showFullLogs ? "收起" : `查看全部 ${job.logs.length} 行`}</button></div></div>
-                  {(showFullLogs ? job.logs : job.logs
+                  <div className="log-head"><p className="eyebrow">{showFullLogs ? "完整日志" : "最近日志"}</p><div className="log-actions"><CopyButton text={buildDebugText()} label="复制调试信息" /><button onClick={() => void toggleFullLogs()}>{showFullLogs ? "收起" : `查看完整日志${job.log_total ? `（${job.log_total} 行）` : ""}`}</button></div></div>
+                  {showFullLogs && fullLogsTruncated && <p>日志较长，仅显示最近 5000 行。</p>}
+                  {(showFullLogs ? fullLogs : job.logs
                     .slice(-8)
                     .reverse()).map((line, index) => (
                       <p key={`${line}-${index}`}>{line}</p>
@@ -2645,11 +3327,12 @@ function App() {
                 {job.error && (
                   <div className="error-block">
                     <p className="error">{job.error}</p>
+                    {job.suggested_action && <p className="error-suggestion">建议：{job.suggested_action}</p>}
                     <div className="error-actions">
                       <CopyButton text={job.error} label="复制错误" />
                       {cookieHintMatches(job.error) && (
                         <button className="cookie-hint-button" onClick={() => setSettingsOpen(true)}>
-                          去设置 → YouTube Cookies 来源
+                          去设置 → YouTube 访问设置
                         </button>
                       )}
                     </div>
@@ -2740,9 +3423,113 @@ function App() {
           <p className="cookies-hint">
             提示：Chrome / Edge 130 及以上版本对 Cookies 做了应用绑定加密，无法直接读取，所以这里只保留 Firefox 选项；Chrome 用户请用浏览器插件（如 Get cookies.txt LOCALLY）导出 cookies.txt 后选择下面的文件。两种来源二选一。
           </p>
+          <label>
+            YouTube 自动浏览器验证
+            <select
+              value={options.youtube_po_token_mode}
+              onChange={(event) => updateOptions("youtube_po_token_mode", event.target.value as "auto" | "off")}
+            >
+              <option value="auto">开启（推荐，自动获取 PO Token）</option>
+              <option value="off">关闭（仅使用 yt-dlp 常规模式）</option>
+            </select>
+            <small className={`drawer-note ${poTokenStatus && !poTokenStatus.available ? "warn" : ""}`}>
+              {poTokenStatus?.available
+                ? `验证组件已就绪${poTokenStatus.browser_path ? "，已检测到 Chrome/Edge" : "；运行时将自动查找 Chrome/Edge"}。首次请求可能短暂启动一个最小化浏览器。`
+                : "当前未检测到验证组件；程序会退回常规模式。公开发行版应通过“修复安装”补齐该组件。"}
+            </small>
+          </label>
+          <label>
+            YouTube 代理（可选，仅当前运行）
+            <input
+              type="password"
+              value={options.youtube_proxy}
+              autoComplete="off"
+              placeholder={proxyConfigured && !proxyDirty ? "本机已配置；输入新地址可覆盖，留空不会改动" : "例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"}
+              onChange={(event) => { updateOptions("youtube_proxy", event.target.value); setProxyDirty(true); }}
+            />
+            <small className="drawer-note">
+              同一地址用于元数据、视频、封面和浏览器验证；只保存在本机设置，不会写入任务历史或日志。
+            </small>
+          </label>
           <button className="primary" onClick={saveSettings}>
-            保存本地设置
+            保存本地设置并应用本次访问参数
           </button>
+        </div>
+      )}
+      {testHistoryOpen && (
+        <div className="modal-backdrop" role="presentation">
+          <section className="template-modal test-history-modal" role="dialog" aria-modal="true" aria-label="测试历史清理">
+            <header>
+              <div><p className="eyebrow">安全清理</p><h2>pytest 测试历史记录</h2></div>
+              <button onClick={() => setTestHistoryOpen(false)} aria-label="关闭">×</button>
+            </header>
+            <p>这里只列出输出目录严格位于 pytest 临时目录中的记录。删除仅影响历史列表，不会删除视频、字幕或目录。</p>
+            <div className="test-history-list">
+              {testHistoryCandidates.length ? testHistoryCandidates.map((item) => (
+                <label key={item.id}>
+                  <input type="checkbox" checked={selectedTestHistoryIds.includes(item.id)} onChange={(event) => setSelectedTestHistoryIds((current) => event.target.checked ? [...current, item.id] : current.filter((id) => id !== item.id))} />
+                  <span><b>{item.title}</b><small>{item.reason}</small><code>{item.output_dir}</code></span>
+                </label>
+              )) : <div className="empty-editor"><b>没有符合规则的测试记录</b><span>普通任务不会出现在这里。</span></div>}
+            </div>
+            <footer>
+              <button onClick={() => setTestHistoryOpen(false)}>取消</button>
+              <button className="danger" disabled={!selectedTestHistoryIds.length} onClick={() => void deleteSelectedTestHistory()}>删除选中的历史记录</button>
+            </footer>
+          </section>
+        </div>
+      )}
+      {dependenciesOpen && (
+        <div className="modal-backdrop" role="presentation">
+          <section className="template-modal dependency-modal" role="dialog" aria-modal="true" aria-label="依赖中心">
+            <header>
+              <div><p className="eyebrow">首次使用</p><h2>依赖中心</h2></div>
+              <button onClick={() => setDependenciesOpen(false)} aria-label="关闭依赖中心">×</button>
+            </header>
+            <p className="dependency-intro">默认流程只强制需要 FFmpeg。模型、OCR 与投稿浏览器按你实际使用的功能安装；已经安装的组件不会重复下载。</p>
+            <div className="dependency-list">
+              {dependencies.map((dependency) => {
+                const active = dependencyJob?.dependency_id === dependency.id && ["queued", "running", "cancelling"].includes(dependencyJob.status);
+                return (
+                  <article className={`dependency-row ${dependency.available ? "available" : "missing"}`} key={dependency.id}>
+                    <span className="dependency-state" aria-hidden="true">{dependency.available ? "✓" : dependency.required ? "!" : "＋"}</span>
+                    <div>
+                      <div className="dependency-title"><b>{dependency.label}</b><small>{dependency.required ? "默认流程必需" : "按需安装"} · {dependency.size_hint}</small></div>
+                      <p>{dependency.purpose}</p>
+                      <small>{active ? dependencyJob?.message : dependency.message}</small>
+                      {active && <div className={`dependency-progress ${dependencyJob?.progress_kind === "indeterminate" ? "indeterminate" : ""}`}><i style={dependencyJob?.progress_kind === "determinate" ? { width: `${dependencyJob?.progress ?? 0}%` } : undefined} /></div>}
+                      {dependencyJob?.dependency_id === dependency.id && dependencyJob.status === "failed" && (
+                        <p className="dependency-error">{dependencyJob.error}</p>
+                      )}
+                    </div>
+                    <div className="dependency-actions">
+                      {dependency.available ? <span>可用</span> : dependency.installable ? (
+                        <button className="primary small" disabled={Boolean(dependencyJob && ["queued", "running", "cancelling"].includes(dependencyJob.status))} onClick={() => void installDependency(dependency)}>
+                          {active ? dependencyJob?.status === "cancelling" ? "取消中" : "安装中" : dependencyJob?.dependency_id === dependency.id && ["failed", "cancelled"].includes(dependencyJob.status) ? "重试" : "安装"}
+                        </button>
+                      ) : dependency.action_url ? (
+                        <a href={dependency.action_url} target="_blank" rel="noreferrer">安装说明</a>
+                      ) : <span>需手动安装</span>}
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+            {dependencyJob && dependencyJob.logs.length > 0 && (
+              <details className="dependency-logs"><summary>安装日志</summary>{dependencyJob.logs.map((line, index) => <p key={`${index}-${line}`}>{line}</p>)}</details>
+            )}
+            {dependencyJob && ["queued", "running", "cancelling"].includes(dependencyJob.status) && (
+              <div className="dependency-cancel-row">
+                <span>{dependencyJob.status === "cancelling" ? "正在结束当前安装步骤…" : "安装期间仍可安全取消；外部安装进程会一并关闭。"}</span>
+                <button className="danger" disabled={dependencyJob.status === "cancelling"} onClick={() => void cancelDependencyInstall()}>取消安装</button>
+              </div>
+            )}
+            <footer>
+              <span className="dependency-note">组件安装到当前 Windows 用户环境，不会写入项目仓库。</span>
+              <button onClick={() => void loadDependencies()}>重新检测</button>
+              <button className="primary" onClick={() => setDependenciesOpen(false)}>完成</button>
+            </footer>
+          </section>
         </div>
       )}
       {shortcutHelpOpen && (
@@ -2751,11 +3538,12 @@ function App() {
             <header><div><p className="eyebrow">使用帮助</p><h2>开始前检查与快捷键</h2></div><button onClick={() => setShortcutHelpOpen(false)} aria-label="关闭帮助">×</button></header>
             <section className="help-section">
               <b>本机依赖</b>
-              {diagnostics.length ? diagnostics.map((check) => <p key={check.id} className={check.available ? "help-ok" : "help-missing"}><strong>{check.available ? "✓" : "!"} {check.label}</strong> · {check.purpose}<br /><span>{check.message}</span></p>) : <p>正在检测 FFmpeg、Node.js 与 Tesseract…</p>}
+              {diagnostics.length ? diagnostics.map((check) => <p key={check.id} className={check.available ? "help-ok" : "help-missing"}><strong>{check.available ? "✓" : "!"} {check.label}</strong> · {check.purpose}<br /><span>{check.message}</span></p>) : <p>正在检测本机组件…</p>}
+              <button onClick={() => { setShortcutHelpOpen(false); setDependenciesOpen(true); }}>打开依赖中心</button>
             </section>
             <section className="help-section">
               <b>快捷键</b>
-              <dl className="shortcut-list"><div><dt>Ctrl + O</dt><dd>选择本地视频（先确认授权）</dd></div><div><dt>Ctrl + L</dt><dd>回到素材区并聚焦视频链接</dd></div><div><dt>Ctrl + R</dt><dd>开始处理（输入框中不会触发）</dd></div><div><dt>Esc</dt><dd>请求中断正在运行的任务</dd></div></dl>
+              <dl className="shortcut-list"><div><dt>Ctrl + O</dt><dd>选择本地视频（先确认授权）</dd></div><div><dt>Ctrl + L</dt><dd>回到素材区并聚焦视频链接</dd></div><div><dt>Ctrl + R</dt><dd>执行顶部主操作（检查准备 / 继续下一阶段）</dd></div><div><dt>Esc</dt><dd>只中断当前运行阶段，保留已完成检查点</dd></div></dl>
             </section>
             <footer><button className="primary" onClick={() => setShortcutHelpOpen(false)}>知道了</button></footer>
           </section>
