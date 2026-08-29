@@ -77,7 +77,7 @@ if (-not (Test-Path -LiteralPath $BuildPython)) {
 if ($LASTEXITCODE -ne 0) { throw "isolated build dependency installation failed" }
 
 $Excluded = @(
-    "torch", "torchvision", "torchaudio", "onnxruntime", "pyarrow", "pandas", "scipy",
+    "torch", "torchvision", "torchaudio", "pyarrow", "pandas", "scipy",
     "matplotlib", "pytest", "IPython", "jupyter", "notebook", "tensorboard"
 )
 $Arguments = @(
@@ -106,10 +106,40 @@ $Arguments += @(
     "--specpath", $BuildRoot,
     (Join-Path $ProjectRoot "scripts\launch_workbench.py")
 )
-& $BuildPython @Arguments
-if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
+$OriginalPath = $env:PATH
+$PythonRoot = Split-Path -Parent $PythonExe
+$env:PATH = @(
+    (Join-Path $VenvRoot "Scripts"),
+    $PythonRoot,
+    (Join-Path $env:SystemRoot "System32"),
+    $env:SystemRoot,
+    (Join-Path $env:SystemRoot "System32\Wbem")
+) -join [System.IO.Path]::PathSeparator
+try {
+    & $BuildPython @Arguments
+    if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
+}
+finally {
+    $env:PATH = $OriginalPath
+}
+
+$CollectToc = Join-Path $BuildRoot "pyinstaller\$AppName\COLLECT-00.toc"
+if (Test-Path -LiteralPath $CollectToc) {
+    $TocText = Get-Content -Raw -LiteralPath $CollectToc
+    if ($TocText -match "(?i)[\\/]Java[\\/].*MSVCP140\.dll") {
+        throw "Unsafe MSVCP140.dll source detected in release build: Java runtime"
+    }
+}
 
 $AppExe = Join-Path $AppRoot "$AppName.exe"
+$OnnxRuntimeDll = Join-Path $AppRoot "_internal\onnxruntime\capi\onnxruntime_providers_shared.dll"
+if (-not (Test-Path -LiteralPath $OnnxRuntimeDll)) {
+    throw "ONNX Runtime is missing from the release; Whisper VAD cannot run."
+}
+$NativeSmoke = Start-Process -FilePath $AppExe -ArgumentList @("--whisper-worker", "--native-smoke-test") -WindowStyle Hidden -Wait -PassThru
+if ($NativeSmoke.ExitCode -ne 0) {
+    throw "Frozen Whisper native dependency smoke test failed with exit code $($NativeSmoke.ExitCode)."
+}
 if ($SigningThumbprint) {
     $SignTool = Get-Command signtool.exe -ErrorAction SilentlyContinue
     if (-not $SignTool) {
@@ -128,14 +158,14 @@ if ($Signature.Status -ne "Valid") {
     Write-Warning "Release is unsigned. Public releases should use -SigningThumbprint and -RequireSignature."
 }
 
-foreach ($forbidden in @("torch", "onnxruntime", "pyarrow")) {
+foreach ($forbidden in @("torch", "pyarrow")) {
     if (Get-ChildItem -LiteralPath $AppRoot -Recurse -Directory -ErrorAction SilentlyContinue | Where-Object Name -EQ $forbidden) {
         throw "Forbidden package leaked into release: $forbidden"
     }
 }
 $size = (Get-ChildItem -LiteralPath $AppRoot -Recurse -File | Measure-Object Length -Sum).Sum
-$limit = 350MB
-if ($size -gt $limit) { throw "Release is $([math]::Round($size / 1MB, 1)) MB; limit is 350 MB" }
+$limit = 400MB
+if ($size -gt $limit) { throw "Release is $([math]::Round($size / 1MB, 1)) MB; limit is 400 MB" }
 
 New-Item -ItemType Directory -Path $ReleaseRoot -Force | Out-Null
 Compress-Archive -LiteralPath $AppRoot -DestinationPath $ZipPath -CompressionLevel Optimal -Force

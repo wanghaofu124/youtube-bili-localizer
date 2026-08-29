@@ -9,14 +9,18 @@ import threading
 import webbrowser
 from pathlib import Path
 
-import webview
-
 # Set the data root before importing any application modules.  Some modules
 # load publishing-template helpers at import time; relying on the process
 # working directory here makes a double-clicked EXE try to create `data` in
 # a protected directory such as C:\\Windows\\System32.
 _USER_DATA_ROOT = Path(os.environ.get("APPDATA") or Path.home()) / "YouTubeBiliLocalizer"
 os.environ.setdefault("YBLOCALIZER_DATA_DIR", str(_USER_DATA_ROOT))
+
+if __name__ == "__main__" and len(sys.argv) >= 2 and sys.argv[1] == "--whisper-worker":
+    from yblocalizer.whisper_worker import main as whisper_worker_main
+    raise SystemExit(whisper_worker_main(sys.argv[2:]))
+
+import webview
 
 from yblocalizer.dependencies import WEBVIEW2_DOWNLOAD_URL, webview2_available
 from yblocalizer.workbench_api import ASSET_ROOT, OUTPUT_ROOT, build_server

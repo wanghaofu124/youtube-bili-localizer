@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import os
 import re
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -15,6 +21,31 @@ LogFn = Callable[[str], None]
 
 
 def transcribe_audio(
+    audio_path: Path,
+    segments_json: Path,
+    srt_path: Path,
+    model_size: str = "tiny",
+    language: str | None = None,
+    device: str = "cpu",
+    compute_type: str = "int8",
+    initial_prompt: str | None = None,
+    beam_size: int = 5,
+    log: LogFn | None = None,
+    cancel_check: Callable[[], None] | None = None,
+    resource_profile: str = "balanced",
+) -> list[Segment]:
+    if (getattr(sys, "frozen", False) or os.environ.get("YBLOCALIZER_FORCE_WHISPER_WORKER") == "1") and os.environ.get("YBLOCALIZER_WHISPER_WORKER") != "1":
+        return _transcribe_audio_isolated(
+            audio_path, segments_json, srt_path, model_size, language, device,
+            compute_type, initial_prompt, beam_size, log, cancel_check, resource_profile,
+        )
+    return _transcribe_audio_in_process(
+        audio_path, segments_json, srt_path, model_size, language, device,
+        compute_type, initial_prompt, beam_size, log, cancel_check, resource_profile,
+    )
+
+
+def _transcribe_audio_in_process(
     audio_path: Path,
     segments_json: Path,
     srt_path: Path,
@@ -91,6 +122,137 @@ def transcribe_audio(
     save_segments(segments_json, segments)
     write_srt(srt_path, segments, display_mode="source")
     return segments
+
+
+def _transcribe_audio_isolated(
+    audio_path: Path,
+    segments_json: Path,
+    srt_path: Path,
+    model_size: str,
+    language: str | None,
+    device: str,
+    compute_type: str,
+    initial_prompt: str | None,
+    beam_size: int,
+    log: LogFn | None,
+    cancel_check: Callable[[], None] | None,
+    resource_profile: str,
+) -> list[Segment]:
+    logger = log or (lambda _message: None)
+    check = cancel_check or legacy_check_cancelled
+    segments_json.parent.mkdir(parents=True, exist_ok=True)
+    control_dir = Path(tempfile.mkdtemp(prefix=".whisper-worker-", dir=segments_json.parent))
+    try:
+        attempts = [(device, compute_type)]
+        if device.strip().lower() in {"cuda", "auto"}:
+            attempts.append(("cpu", "int8"))
+        last_error: RuntimeError | None = None
+        for index, (attempt_device, attempt_compute) in enumerate(attempts):
+            if index:
+                logger("Whisper 子进程异常退出，主程序仍在运行；正在改用 CPU / int8 重试。")
+            try:
+                items, temporary_json, temporary_srt = _run_whisper_worker(
+                    control_dir, audio_path, model_size, language, attempt_device,
+                    attempt_compute, initial_prompt, beam_size, logger, check, resource_profile,
+                )
+            except RuntimeError as exc:
+                last_error = exc
+                continue
+            temporary_json.replace(segments_json)
+            temporary_srt.replace(srt_path)
+            return items
+        raise last_error or RuntimeError("Whisper 子进程未能启动。")
+    finally:
+        shutil.rmtree(control_dir, ignore_errors=True)
+
+
+def _run_whisper_worker(
+    control_dir: Path,
+    audio_path: Path,
+    model_size: str,
+    language: str | None,
+    device: str,
+    compute_type: str,
+    initial_prompt: str | None,
+    beam_size: int,
+    logger: LogFn,
+    check: Callable[[], None],
+    resource_profile: str,
+) -> tuple[list[Segment], Path, Path]:
+    request_path = control_dir / f"request-{device}.json"
+    result_path = control_dir / f"result-{device}.json"
+    events_path = control_dir / f"events-{device}.jsonl"
+    diagnostic_path = control_dir / f"diagnostic-{device}.log"
+    temporary_json = control_dir / f"segments-{device}.json"
+    temporary_srt = control_dir / f"subtitles-{device}.srt"
+    request_path.write_text(json.dumps({
+        "audio_path": str(audio_path),
+        "segments_json": str(temporary_json),
+        "srt_path": str(temporary_srt),
+        "result_path": str(result_path),
+        "events_path": str(events_path),
+        "model_size": model_size,
+        "language": language,
+        "device": device,
+        "compute_type": compute_type,
+        "initial_prompt": initial_prompt,
+        "beam_size": beam_size,
+        "resource_profile": resource_profile,
+    }, ensure_ascii=False), encoding="utf-8")
+    if getattr(sys, "frozen", False):
+        command = [sys.executable, "--whisper-worker", str(request_path)]
+    else:
+        command = [sys.executable, "-m", "yblocalizer.whisper_worker", str(request_path)]
+    event_offset = 0
+    with diagnostic_path.open("w", encoding="utf-8", errors="replace") as diagnostic:
+        process = subprocess.Popen(command, stdout=diagnostic, stderr=subprocess.STDOUT, text=True)
+        try:
+            while process.poll() is None:
+                check()
+                event_offset = _forward_worker_events(events_path, event_offset, logger)
+                time.sleep(0.1)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+        event_offset = _forward_worker_events(events_path, event_offset, logger)
+    if process.returncode != 0:
+        code = process.returncode & 0xFFFFFFFF
+        detail = ""
+        if result_path.is_file():
+            try:
+                detail = str(json.loads(result_path.read_text(encoding="utf-8")).get("error") or "")
+            except (OSError, ValueError):
+                pass
+        if detail:
+            raise RuntimeError(f"Whisper 转写失败：{detail}；主程序和已下载素材均已保留。")
+        raise RuntimeError(f"Whisper 转写子进程异常退出（0x{code:08X}），主程序和已下载素材均已保留。")
+    if not result_path.is_file() or not temporary_json.is_file() or not temporary_srt.is_file():
+        raise RuntimeError("Whisper 转写子进程未生成完整结果，已保留原有检查点。")
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    if result.get("status") != "completed":
+        raise RuntimeError(f"Whisper 转写失败：{result.get('error') or '未知错误'}")
+    from .models import load_segments
+    return load_segments(temporary_json), temporary_json, temporary_srt
+
+
+def _forward_worker_events(path: Path, offset: int, logger: LogFn) -> int:
+    if not path.is_file():
+        return offset
+    with path.open("r", encoding="utf-8") as handle:
+        handle.seek(offset)
+        for line in handle:
+            try:
+                message = json.loads(line).get("message")
+            except ValueError:
+                message = None
+            if message:
+                logger(str(message))
+        return handle.tell()
 
 
 def _clean_initial_prompt(initial_prompt: str | None) -> str | None:
