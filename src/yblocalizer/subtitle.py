@@ -1,9 +1,51 @@
 from __future__ import annotations
 
+from html import unescape
 from pathlib import Path
 import re
 
 from .models import Segment
+
+
+_SRT_TIMING = re.compile(
+    r"(?P<start>\d{1,2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*"
+    r"(?P<end>\d{1,2}:\d{2}:\d{2}[,.]\d{3})"
+)
+
+
+def read_srt_segments(path: Path, max_seconds: float | None = None) -> list[Segment]:
+    """Read external SRT data into normalized pipeline segments."""
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    output: list[Segment] = []
+    for block in re.split(r"\r?\n\s*\r?\n", text.strip()):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        timing_index = next((index for index, line in enumerate(lines) if "-->" in line), -1)
+        if timing_index < 0:
+            continue
+        match = _SRT_TIMING.search(lines[timing_index])
+        if not match:
+            continue
+        start = _parse_srt_timestamp(match.group("start"))
+        end = _parse_srt_timestamp(match.group("end"))
+        if max_seconds is not None:
+            if start >= max_seconds:
+                continue
+            end = min(end, max_seconds)
+        caption = " ".join(lines[timing_index + 1 :])
+        caption = unescape(re.sub(r"<[^>]+>", "", caption))
+        caption = re.sub(r"\s+", " ", caption).strip()
+        if not caption or end <= start:
+            continue
+        if output and caption == output[-1].text and start <= output[-1].end + 0.15:
+            output[-1].end = max(output[-1].end, end)
+            continue
+        output.append(Segment(round(start, 3), round(end, 3), caption))
+    return output
+
+
+def _parse_srt_timestamp(value: str) -> float:
+    hours, minutes, seconds = value.replace(",", ".").split(":")
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
 def format_srt_timestamp(seconds: float) -> str:

@@ -159,6 +159,88 @@ def _format_for_quality(quality: str) -> str:
     )
 
 
+def _is_youtube_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
+
+
+def _platform_subtitle_languages(source_language: str | None) -> list[str]:
+    language = (source_language or "en").strip().lower().replace("_", "-")
+    base = language.split("-", 1)[0] or "en"
+    return list(dict.fromkeys((language, base, f"{base}-orig")))
+
+
+def _downloaded_subtitle_path(info: dict, work_dir: Path, video_id: str) -> Path | None:
+    requested = info.get("requested_subtitles") or {}
+    if isinstance(requested, dict):
+        for item in requested.values():
+            if not isinstance(item, dict):
+                continue
+            filepath = str(item.get("filepath") or "").strip()
+            if filepath:
+                candidate = Path(filepath)
+                if not candidate.is_absolute():
+                    candidate = work_dir / candidate
+                if candidate.is_file() and candidate.suffix.lower() == ".srt":
+                    return candidate
+    candidates = sorted(
+        work_dir.glob(f"{video_id}.*.srt"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def _try_download_platform_subtitles(
+    yt_dlp_module,
+    url: str,
+    work_dir: Path,
+    outtmpl: str,
+    video_id: str,
+    source_language: str | None,
+    cookies_from_browser: str | None,
+    cookies_file: str | None,
+    proxy: str | None,
+    po_token_mode: str,
+    check: Callable[[], None],
+    log: Callable[[str], None] | None,
+) -> Path | None:
+    """Download optional captions without making video acquisition depend on them."""
+    options = {
+        "outtmpl": outtmpl,
+        "noplaylist": True,
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": _platform_subtitle_languages(source_language),
+        "subtitlesformat": "srt/best",
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 10,
+        "retries": 0,
+        "extractor_retries": 0,
+    }
+    options.update(_js_runtime_opts())
+    options.update(_youtube_access_opts(proxy, po_token_mode))
+    if cookies_file:
+        options["cookiefile"] = cookies_file
+    elif cookies_from_browser:
+        options["cookiesfrombrowser"] = (cookies_from_browser,)
+    try:
+        check()
+        with yt_dlp_module.YoutubeDL(options) as ydl:
+            subtitle_info = ydl.extract_info(url, download=True)
+        check()
+    except Exception as exc:
+        # Cancellation must remain authoritative. Any other subtitle-only
+        # network error is a warning because Whisper is the real fallback.
+        check()
+        if log:
+            log(f"平台字幕获取失败，已保留原视频并将自动回退 Whisper：{exc}")
+        return None
+    return _downloaded_subtitle_path(subtitle_info or {}, work_dir, video_id)
+
+
 def _max_video_size(info: dict) -> tuple[int | None, int | None]:
     candidates: list[tuple[int, int]] = []
     for item in info.get("formats") or []:
@@ -290,6 +372,9 @@ def download_with_ytdlp(
     progress: Callable[[float], None] | None = None,
     cancel_check: Callable[[], None] | None = None,
     resource_profile: str = "balanced",
+    source_language: str | None = None,
+    prefer_platform_subtitles: bool = True,
+    log: Callable[[str], None] | None = None,
 ) -> VideoJob:
     check = cancel_check or legacy_check_cancelled
     profile = normalize_resource_profile(resource_profile)
@@ -380,6 +465,12 @@ def download_with_ytdlp(
 
     thumbnail_url = _best_thumbnail_url(info)
     thumbnail_path = _download_thumbnail(thumbnail_url, work_dir, video_id, proxy) if thumbnail_url else None
+    source_subtitles = None
+    if prefer_platform_subtitles and _is_youtube_url(url):
+        source_subtitles = _try_download_platform_subtitles(
+            yt_dlp, url, work_dir, outtmpl, video_id, source_language,
+            cookies_from_browser, cookies_file, proxy, po_token_mode, check, log,
+        )
 
     job = VideoJob(
         job_id=work_dir.name,
@@ -389,6 +480,7 @@ def download_with_ytdlp(
         title=title or info.get("title"),
         description=info.get("description"),
         raw_video=video_files[0],
+        source_subtitles=source_subtitles,
         license=info.get("license"),
         view_count=info.get("view_count"),
         webpage_url=info.get("webpage_url") or url,

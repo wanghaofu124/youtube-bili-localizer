@@ -13,13 +13,14 @@ from typing import Any, Callable
 from . import dependencies
 from .download import download_with_ytdlp, import_local_video
 from .media import extract_audio
-from .models import VideoJob, load_segments, save_segments
+from .models import Segment, VideoJob, load_segments, save_segments
 from .ocr_subtitle import extract_ocr_subtitles
+from .performance import translation_worker_limit
 from .publish_bili import assist_publish
 from .publish_text import ensure_source_link
 from .render import burn_subtitles
 from .runtime import CancellationRequested, PipelineContext, PipelineStage
-from .subtitle import write_srt
+from .subtitle import read_srt_segments, write_srt
 from .subtitle_merge import merge_audio_ocr_segments
 from .transcribe import transcribe_audio
 from .translate import (
@@ -40,7 +41,7 @@ STAGE_LABELS = {
 }
 STAGE_PROGRESS = {"acquire": 8, "extract": 28, "translate": 62, "render": 84, "publish": 96}
 CONFIG_INVALIDATION: tuple[tuple[frozenset[str], str], ...] = (
-    (frozenset({"source", "source_kind", "output_dir", "cookies_from_browser", "cookies_file", "youtube_po_token_mode", "youtube_proxy", "download_quality", "max_seconds", "require_reuse_allowed"}), "acquire"),
+    (frozenset({"source", "source_kind", "output_dir", "cookies_from_browser", "cookies_file", "youtube_po_token_mode", "youtube_proxy", "download_quality", "max_seconds", "require_reuse_allowed", "prefer_platform_subtitles"}), "acquire"),
     (frozenset({"subtitle_source", "ocr_fallback_to_audio", "whisper_model_size", "source_language", "beam_size", "device", "compute_type", "ocr_interval", "ocr_crop_ratio", "ocr_min_chars", "ocr_language"}), "extract"),
     (frozenset({"translator", "target_lang", "translate_model", "batch_size", "smart_translation", "smart_subtitle_layout"}), "translate"),
     (frozenset({"font_name", "font_size", "subtitle_display_mode", "subtitle_color", "subtitle_outline_color", "subtitle_outline", "subtitle_shadow", "subtitle_margin_ratio", "render_crf", "render_encoder"}), "render"),
@@ -53,6 +54,7 @@ class WorkflowArtifacts:
     original_video: str | None = None
     raw_video: str | None = None
     audio: str | None = None
+    platform_subtitles: str | None = None
     source_segments: str | None = None
     source_srt: str | None = None
     translated_segments: str | None = None
@@ -91,7 +93,7 @@ class WorkflowArtifacts:
 
     def public_summary(self) -> dict[str, dict[str, Any]]:
         output: dict[str, dict[str, Any]] = {}
-        for name in ("original_video", "raw_video", "audio", "source_segments", "source_srt", "translated_segments", "translated_srt", "publish_metadata", "rendered_video", "thumbnail_path"):
+        for name in ("original_video", "raw_video", "audio", "platform_subtitles", "source_segments", "source_srt", "translated_segments", "translated_srt", "publish_metadata", "rendered_video", "thumbnail_path"):
             path = self.path(name)
             output[name] = {
                 "available": bool(path and path.is_file()),
@@ -149,7 +151,9 @@ def run_acquire(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx:
             cookies_file=options.cookies_file, po_token_mode=options.youtube_po_token_mode,
             proxy=options.youtube_proxy, download_quality=options.download_quality,
             resource_profile=options.resource_profile,
-            progress=progress, cancel_check=ctx.check_cancelled,
+            source_language=options.source_language,
+            prefer_platform_subtitles=getattr(options, "prefer_platform_subtitles", True),
+            progress=progress, cancel_check=ctx.check_cancelled, log=log,
         )
     elif options.source_kind == "file":
         job = import_local_video(Path(options.source), work_dir=work_dir, title=options.title)
@@ -159,6 +163,7 @@ def run_acquire(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx:
         raise RuntimeError("No raw video was prepared.")
     artifacts.original_video = str(job.raw_video)
     artifacts.raw_video = str(job.raw_video)
+    artifacts.platform_subtitles = str(job.source_subtitles) if job.source_subtitles else None
     artifacts.revision = 0
     artifacts.last_edit = None
     artifacts.edit_state = "clean"
@@ -213,19 +218,39 @@ def run_extract(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx:
         raise RuntimeError("原视频检查点无效，请先重新获取素材。")
     source_segments, source_srt = work_dir / "segments.source.json", work_dir / "source.srt"
     audio: Path | None = artifacts.path("audio")
-    if options.subtitle_source != "ocr":
-        _emit(ctx, PipelineStage.AUDIO, 16, "正在提取音频", log)
-        audio = _extract_audio(raw_video, work_dir / "audio.wav", ctx)
-        artifacts.audio = str(audio)
-    ctx.check_cancelled()
     used_ocr = False
     items: list[Any] = []
+    mode = options.subtitle_source
+    platform_items: list[Any] = []
+    platform_path = artifacts.path("platform_subtitles")
+    if getattr(options, "prefer_platform_subtitles", True) and mode in {"audio", "auto", "merged"} and platform_path and platform_path.is_file():
+        try:
+            platform_items = read_srt_segments(platform_path, max_seconds=options.max_seconds)
+        except (OSError, ValueError) as exc:
+            log(f"平台字幕无法读取，已回退 Whisper：{exc}")
+        else:
+            if platform_items:
+                log(f"检测到平台字幕（{len(platform_items)} 条），本次跳过 Whisper 语音转写。")
+            else:
+                log("平台字幕为空，已回退 Whisper 语音转写。")
+
+    def ensure_audio() -> Path:
+        nonlocal audio
+        if not audio or not audio.is_file():
+            _emit(ctx, PipelineStage.AUDIO, 16, "正在提取音频", log)
+            audio = _extract_audio(raw_video, work_dir / "audio.wav", ctx)
+            artifacts.audio = str(audio)
+        return audio
 
     def transcribe(target_json: Path, target_srt: Path) -> list[Any]:
-        if not audio:
-            raise RuntimeError("Audio was not extracted.")
+        if platform_items:
+            copied = [Segment(item.start, item.end, item.text) for item in platform_items]
+            save_segments(target_json, copied)
+            write_srt(target_srt, copied, display_mode="source")
+            return copied
+        source_audio = ensure_audio()
         return transcribe_audio(
-            audio, segments_json=target_json, srt_path=target_srt,
+            source_audio, segments_json=target_json, srt_path=target_srt,
             model_size=options.whisper_model_size, language=options.source_language,
             device=options.device, compute_type=options.compute_type, initial_prompt=None,
             beam_size=options.beam_size, log=log, cancel_check=ctx.check_cancelled,
@@ -241,9 +266,8 @@ def run_extract(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx:
             progress=progress,
         )
 
-    mode = options.subtitle_source
     if mode == "merged":
-        _emit(ctx, PipelineStage.TRANSCRIBING, 28, "正在转写并读取画面文字", log)
+        _emit(ctx, PipelineStage.TRANSCRIBING, 28, "正在整理平台字幕并读取画面文字" if platform_items else "正在转写并读取画面文字", log)
         audio_items = transcribe(work_dir / "segments.audio.json", work_dir / "audio.srt")
         try:
             ocr_items = ocr(work_dir / "segments.ocr.json", work_dir / "ocr.srt")
@@ -260,7 +284,10 @@ def run_extract(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx:
         if offset is not None and 0.12 <= abs(offset) <= 3.0:
             _shift_segments(audio_items, offset); log(f"Audio timeline corrected by {offset:+.2f}s using OCR anchors.")
         items = merge_audio_ocr_segments(audio_items, ocr_items)
-        artifacts.subtitle_extraction_mode = "merged" if used_ocr else "audio-fallback"
+        if platform_items:
+            artifacts.subtitle_extraction_mode = "platform+ocr" if used_ocr else "platform"
+        else:
+            artifacts.subtitle_extraction_mode = "merged" if used_ocr else "audio-fallback"
         save_segments(source_segments, items); write_srt(source_srt, items, display_mode="source")
     elif mode == "ocr":
         _emit(ctx, PipelineStage.OCR, 28, "正在读取画面字幕", log)
@@ -273,16 +300,15 @@ def run_extract(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx:
             if not options.ocr_fallback_to_audio:
                 raise
             log(f"OCR 识别失败，已明确切换为 Whisper 音频转写。原因：{exc}")
-            audio = _extract_audio(raw_video, work_dir / "audio.wav", ctx); artifacts.audio = str(audio)
             items = transcribe(source_segments, source_srt)
-            artifacts.subtitle_extraction_mode = "audio-fallback"
+            artifacts.subtitle_extraction_mode = "platform-fallback" if platform_items else "audio-fallback"
         else:
             artifacts.ocr_status, artifacts.ocr_message = "completed", None
             artifacts.subtitle_extraction_mode = "ocr"
     else:
-        _emit(ctx, PipelineStage.TRANSCRIBING, 28, "正在语音转写", log)
+        _emit(ctx, PipelineStage.TRANSCRIBING, 28, "正在整理平台字幕" if platform_items else "正在语音转写", log)
         items = transcribe(source_segments, source_srt)
-        artifacts.subtitle_extraction_mode = "audio"
+        artifacts.subtitle_extraction_mode = "platform" if platform_items else "audio"
         artifacts.ocr_status, artifacts.ocr_message = "not-requested", None
         if not items and (mode == "auto" or options.ocr_fallback_to_audio):
             try:
@@ -303,7 +329,6 @@ def run_extract(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx:
 
 
 def run_translate(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx: PipelineContext, log: Callable[[str], None], progress: Callable[[float], None] | None = None) -> WorkflowArtifacts:
-    del progress
     source_segments = artifacts.path("source_segments")
     if not source_segments or not validate_segments(source_segments):
         raise RuntimeError("源字幕检查点无效，请先重新提取字幕。")
@@ -336,13 +361,18 @@ def run_translate(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ct
         smart_layout=options.smart_subtitle_layout,
         checkpoint_path=work_dir / "translation_checkpoint.json",
         cancel_check=ctx.check_cancelled,
+        max_workers=translation_worker_limit(options.resource_profile),
+        progress=progress,
     )
     ctx.check_cancelled()
+    # Publishing copy is not part of subtitle translation.  Avoid a second LLM
+    # round trip unless the user explicitly enabled the publish stage.
+    metadata_provider = options.translator if options.publish_to_bilibili else "none"
     try:
         metadata = generate_publish_metadata(
             source_title=options.title or artifacts.title, source_description=artifacts.description,
             source_segments=source_items, translated_segments=translated_items,
-            provider=options.translator, target_lang=options.target_lang, model=options.translate_model,
+            provider=metadata_provider, target_lang=options.target_lang, model=options.translate_model,
         )
         ctx.check_cancelled()
     except Exception as exc:

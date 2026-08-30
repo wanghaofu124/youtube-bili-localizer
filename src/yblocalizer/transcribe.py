@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import ctypes
 import shutil
 import subprocess
 import sys
@@ -12,7 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 from .cancellation import check_cancelled as legacy_check_cancelled
-from .dependencies import require_whisper_model
+from .dependencies import require_whisper_model, resolve_command
 from .models import Segment, save_segments
 from .performance import cpu_thread_limit, normalize_resource_profile
 from .subtitle import write_srt
@@ -395,22 +396,126 @@ def _dedupe_attempts(attempts: list[tuple[str, str, str]]) -> list[tuple[str, st
     return output
 
 
-def _prepend_nvidia_cuda_dll_paths() -> None:
+def _nvidia_cuda_dll_directories() -> list[Path]:
+    roots: list[Path] = []
+    explicit_directories: list[Path] = []
     try:
         import nvidia
     except ImportError:
-        return
-    root = Path(nvidia.__file__).parent
-    candidates = [
-        root / "cuda_runtime" / "bin",
-        root / "cublas" / "bin",
-        root / "cudnn" / "bin",
-    ]
+        pass
+    else:
+        roots.extend(Path(item) for item in getattr(nvidia, "__path__", ()))
+        module_file = getattr(nvidia, "__file__", None)
+        if module_file:
+            roots.append(Path(module_file).parent)
+
+    configured = os.environ.get("YBLOCALIZER_CUDA_DLL_DIR", "").strip()
+    if configured:
+        explicit_directories.append(Path(configured))
+
+    # The onedir application intentionally does not bundle ~1.7 GB of optional
+    # NVIDIA libraries. Reuse an existing Python CUDA runtime when present so a
+    # developer or power user does not have to copy DLLs into the application.
+    if os.name == "nt":
+        try:
+            import winreg
+
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                for access in (winreg.KEY_READ, winreg.KEY_READ | winreg.KEY_WOW64_32KEY, winreg.KEY_READ | winreg.KEY_WOW64_64KEY):
+                    try:
+                        with winreg.OpenKey(hive, r"Software\Python\PythonCore", 0, access) as python_core:
+                            index = 0
+                            while True:
+                                try:
+                                    version = winreg.EnumKey(python_core, index)
+                                except OSError:
+                                    break
+                                index += 1
+                                try:
+                                    with winreg.OpenKey(python_core, version + r"\InstallPath", 0, access) as install_key:
+                                        install_root = Path(str(winreg.QueryValue(install_key, None)))
+                                except OSError:
+                                    continue
+                                roots.append(install_root / "Lib" / "site-packages" / "nvidia")
+                    except OSError:
+                        continue
+
+        except ImportError:
+            pass
+
+        toolkit = Path(os.environ.get("ProgramFiles", "")) / "NVIDIA GPU Computing Toolkit" / "CUDA"
+        if toolkit.is_dir():
+            roots.extend(path for path in toolkit.glob("v*/bin") if path.is_dir())
+
+    candidates: list[Path] = list(explicit_directories)
+    for root in roots:
+        if root.name.lower() == "bin":
+            candidates.append(root)
+        else:
+            candidates.extend([
+                root / "cuda_runtime" / "bin",
+                root / "cublas" / "bin",
+                root / "cudnn" / "bin",
+            ])
+    return list(dict.fromkeys(path for path in candidates if path.is_dir()))
+
+
+def _prepend_nvidia_cuda_dll_paths() -> None:
+    candidates = _nvidia_cuda_dll_directories()
     existing = os.environ.get("PATH", "")
-    parts = [str(path) for path in candidates if path.exists()]
+    parts = [str(path) for path in candidates]
     if not parts:
         return
     current_lower = {item.lower() for item in existing.split(os.pathsep) if item}
     missing = [item for item in parts if item.lower() not in current_lower]
     if missing:
         os.environ["PATH"] = os.pathsep.join(missing + [existing])
+
+
+def cuda_runtime_status() -> dict[str, object]:
+    """Verify the CUDA libraries that faster-whisper actually loads.
+
+    ``nvidia-smi`` only proves that a display driver sees the GPU.  It does not
+    prove that cuBLAS/cuDNN are installed, which previously let preparation pass
+    and then fail several minutes later in transcription.
+    """
+    if resolve_command("nvidia-smi") is None:
+        return {
+            "available": False,
+            "missing": ["NVIDIA driver"],
+            "message": "未检测到 NVIDIA 显卡驱动（nvidia-smi）。",
+        }
+
+    _prepend_nvidia_cuda_dll_paths()
+    if os.name == "nt":
+        required = (
+            "cublas64_12.dll", "cublasLt64_12.dll",
+            "cudnn64_9.dll", "cudnn_ops64_9.dll",
+        )
+        loader = ctypes.WinDLL
+    else:
+        required = ("libcublas.so.12", "libcudnn.so.9")
+        loader = ctypes.CDLL
+
+    search_dirs = _nvidia_cuda_dll_directories()
+    missing: list[str] = []
+    for name in required:
+        resolved = shutil.which(name)
+        if not resolved:
+            resolved = next((str(path / name) for path in search_dirs if (path / name).is_file()), None)
+        try:
+            loader(resolved or name)
+        except (OSError, TypeError):
+            missing.append(name)
+
+    if missing:
+        return {
+            "available": False,
+            "missing": missing,
+            "message": "显卡驱动可用，但缺少或无法加载 CUDA 转写运行库：" + "、".join(missing) + "。",
+        }
+    return {
+        "available": True,
+        "missing": [],
+        "message": "NVIDIA 驱动、cuBLAS 和 cuDNN 均可加载。",
+    }

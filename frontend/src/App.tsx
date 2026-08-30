@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { stageAvailability, workflowPrimaryLabel } from "./workflowState";
+import { videoLibraryCategory, videoLibraryMatches, type VideoLibraryCategory } from "./videoLibrary";
 
-type View = "material" | "process" | "subtitle" | "publish" | "files";
+type View = "material" | "library" | "process" | "subtitle" | "publish" | "files";
 type WorkflowStageName = "acquire" | "extract" | "translate" | "render" | "publish";
 type WorkflowStage = {
   status: "pending" | "ready" | "running" | "completed" | "failed" | "cancelled" | "stale" | "interrupted";
@@ -91,6 +92,7 @@ type Options = {
   download_quality: "720p" | "1080p" | "original";
   max_seconds: number | null;
   subtitle_source: string;
+  prefer_platform_subtitles: boolean;
   whisper_model_size: string;
   source_language: string;
   beam_size: number;
@@ -121,6 +123,16 @@ type Options = {
   bilibili_browser?: string;
   close_after_fill?: boolean;
 };
+
+function mergeRestoredOptions(current: Options, restored: Partial<Options> | null | undefined): Options {
+  const merged = { ...current } as Record<string, unknown>;
+  for (const [key, value] of Object.entries(restored ?? {})) {
+    // Persisted jobs intentionally store sensitive/optional settings as null.
+    // Keep the live local/default value instead of letting null escape into form state.
+    if (value !== null && value !== undefined) merged[key] = value;
+  }
+  return merged as Options;
+}
 type Template = { name: string; body: string };
 type OutputFile = {
   id: string;
@@ -209,6 +221,7 @@ const defaults: Options = {
   download_quality: "1080p",
   max_seconds: 10,
   subtitle_source: "audio",
+  prefer_platform_subtitles: true,
   whisper_model_size: "small",
   source_language: "",
   beam_size: 5,
@@ -235,6 +248,7 @@ const defaults: Options = {
 };
 const nav: Array<[View, string, string]> = [
   ["material", "素材", "链接、本地视频与授权"],
+  ["library", "任务库", "待处理、可继续与成片"],
   ["process", "处理", "识别、翻译与推理"],
   ["subtitle", "字幕", "预览、编辑与渲染"],
   ["publish", "发布", "B 站投稿辅助"],
@@ -474,8 +488,10 @@ function App() {
   const [testHistoryCandidates, setTestHistoryCandidates] = useState<TestHistoryCandidate[]>([]);
   const [selectedTestHistoryIds, setSelectedTestHistoryIds] = useState<string[]>([]);
   const [testHistoryOpen, setTestHistoryOpen] = useState(false);
-  const [historyScope, setHistoryScope] = useState<"current" | "all">("current");
+  const [historyScope, setHistoryScope] = useState<"current" | "all">("all");
   const [historyTotal, setHistoryTotal] = useState(0);
+  const [libraryFilter, setLibraryFilter] = useState<"all" | VideoLibraryCategory>("all");
+  const [libraryQuery, setLibraryQuery] = useState("");
   const [diagnostics, setDiagnostics] = useState<Diagnostic[]>([]);
   const [dependencies, setDependencies] = useState<Dependency[]>([]);
   const [dependencyJob, setDependencyJob] = useState<DependencyInstallJob | null>(null);
@@ -531,6 +547,45 @@ function App() {
     const taskIds = new Set(selectedOutputPaths.filter((path) => outputs.tasks.some((task) => task.id === path)));
     return outputs.tasks.reduce((total, task) => total + (taskIds.has(task.id) ? task.size : task.files.filter((file) => selectedOutputPaths.includes(file.id)).reduce((sum, file) => sum + file.size, 0)), 0);
   }, [outputs, selectedOutputPaths]);
+  const librarySourceJobs = useMemo(() => {
+    const rows = [...jobHistory];
+    if (job) {
+      const current: HistoryJob = {
+        id: job.id,
+        title: job.options.title || job.material.name || "未命名任务",
+        status: job.status,
+        stage: job.stage,
+        progress: job.progress,
+        error: job.error,
+        output_dir: job.result?.output_dir ?? null,
+        rendered_video: job.result?.rendered_video ?? null,
+        output_exists: Boolean(job.result?.output_dir),
+        rendered_exists: Boolean(job.result?.rendered_video),
+        created_at: job.started_at,
+        finished_at: job.finished_at,
+      };
+      const currentIndex = rows.findIndex((item) => item.id === job.id);
+      if (currentIndex >= 0) rows[currentIndex] = { ...rows[currentIndex], ...current };
+      else rows.unshift(current);
+    }
+    return rows;
+  }, [jobHistory, job]);
+  const libraryJobs = useMemo(() => {
+    const resumableIds = new Set(restorableJobs.map((item) => item.id));
+    return librarySourceJobs.filter((item) => {
+      const category = videoLibraryCategory(item, resumableIds.has(item.id));
+      return (libraryFilter === "all" || category === libraryFilter)
+        && videoLibraryMatches(item, libraryQuery);
+    });
+  }, [librarySourceJobs, restorableJobs, libraryFilter, libraryQuery]);
+  const libraryCounts = useMemo(() => {
+    const resumableIds = new Set(restorableJobs.map((item) => item.id));
+    const counts: Record<VideoLibraryCategory, number> = { active: 0, attention: 0, completed: 0 };
+    for (const item of librarySourceJobs) {
+      counts[videoLibraryCategory(item, resumableIds.has(item.id))] += 1;
+    }
+    return counts;
+  }, [librarySourceJobs, restorableJobs]);
 
   const updateOptions = <K extends keyof Options>(key: K, value: Options[K]) => {
     setFieldErrors((current) => {
@@ -598,8 +653,7 @@ function App() {
       setJob(restored);
       setDemoPreview(false);
       setOptions((current) => ({
-        ...current,
-        ...restored.options,
+        ...mergeRestoredOptions(current, restored.options),
         cookies_file: current.cookies_file,
         youtube_proxy: current.youtube_proxy,
       }));
@@ -607,6 +661,14 @@ function App() {
       setComputeType(restored.compute_type);
       setSourceUrl(restored.material.source_url ?? "");
       setAuthorized(restored.material.authorized);
+      if (restored.material.source_url) {
+        const restoredLimit = restored.options?.max_seconds;
+        setFullVideo(restoredLimit === null);
+        if (typeof restoredLimit === "number" && Number.isInteger(restoredLimit) && restoredLimit > 0) {
+          setDurationValue(String(restoredLimit));
+          setDurationUnit("秒");
+        }
+      }
       setDescription(restored.options.description ?? "");
       setTags((restored.options.tags ?? []).join(","));
       setPublishInPipeline(Boolean(restored.options.publish_to_bilibili));
@@ -616,8 +678,11 @@ function App() {
       setPreview(restored.artifacts?.rendered_video?.available ? "rendered" : "source");
       await loadCues(restored.id);
       setView("process");
+      const completedStageCount = Object.values(restored.stages ?? {}).filter((stage) => stage.status === "completed").length;
       setMessage(restored.edit_state === "legacy-ambiguous"
         ? "已载入旧任务并保留现有成片；后期版本顺序无法确认，已禁用重新渲染。"
+        : restored.status === "draft" && completedStageCount === 0
+          ? "任务草稿已载入。请运行准备检查；当前不会自动下载或占用大量电脑资源。"
         : restored.checkpoint_validation === "invalid"
           ? "已载入任务，但部分检查点无效；请先运行准备检查。"
           : "任务已载入。不会自动继续耗资源处理，请确认后再执行下一阶段。");
@@ -629,7 +694,7 @@ function App() {
   const loadJobHistory = async () => {
     try {
       const query = new URLSearchParams({
-        limit: "50",
+        limit: "200",
         scope: historyScope,
         output_dir: options.output_dir,
       });
@@ -915,7 +980,7 @@ function App() {
   const applyRecommended = () => {
     setDevice("cpu");
     setComputeType("int8");
-    setOptions((current) => ({ ...current, download_quality: "1080p", render_encoder: "auto", resource_profile: "balanced", subtitle_source: "audio", whisper_model_size: "small", source_language: "", translator: "deepseek", target_lang: "zh-Hans", smart_translation: true, smart_subtitle_layout: true, font_name: "Microsoft YaHei", font_size: 24, subtitle_display_mode: "translated", subtitle_color: "白色", subtitle_outline_color: "黑色", subtitle_effect: "描边" }));
+    setOptions((current) => ({ ...current, download_quality: "1080p", render_encoder: "auto", resource_profile: "balanced", subtitle_source: "audio", prefer_platform_subtitles: true, whisper_model_size: "small", source_language: "", translator: "deepseek", target_lang: "zh-Hans", smart_translation: true, smart_subtitle_layout: true, font_name: "Microsoft YaHei", font_size: 24, subtitle_display_mode: "translated", subtitle_color: "白色", subtitle_outline_color: "黑色", subtitle_effect: "描边" }));
     setIncludeSourceLink(true);
     setMessage("已应用推荐设置：最高 1080p、自动优先 NVIDIA 渲染、CPU int8 转写与中文硬字幕。");
   };
@@ -999,6 +1064,7 @@ function App() {
       loadOutputs().catch((error) => setMessage(String(error)));
       void loadJobHistory();
     }
+    if (view === "library") void Promise.all([loadJobHistory(), loadRestorableJobs()]);
     if (view === "publish") void loadPublishSession();
   }, [view, historyScope, options.output_dir]);
   useEffect(() => {
@@ -2388,6 +2454,16 @@ function App() {
         <label className="check">
           <input
             type="checkbox"
+            checked={options.prefer_platform_subtitles}
+            onChange={(event) =>
+              updateOptions("prefer_platform_subtitles", event.target.checked)
+            }
+          />
+          优先使用 YouTube 字幕（更快；没有时自动转写）
+        </label>
+        <label className="check">
+          <input
+            type="checkbox"
             checked={options.smart_translation}
             onChange={(event) =>
               updateOptions("smart_translation", event.target.checked)
@@ -2430,7 +2506,7 @@ function App() {
             {cues.map((cue) => (
               <article key={cue.id} className="result-row">
                 <span className={`src-kind ${cue.kind ?? "audio"}`}>
-                  {cue.kind === "ocr" ? "画面文字" : cue.kind === "merged" ? "合并" : "语音"}
+                  {cue.kind === "ocr" ? "画面文字" : cue.kind === "merged" ? "合并" : cue.kind === "platform" ? "平台字幕" : "语音"}
                 </span>
                 <div>
                   <p className="result-source" title={cue.source}>{cue.source}</p>
@@ -3014,6 +3090,94 @@ function App() {
       </div>}
     </section>
   );
+  const libraryView = (
+    <section className="workspace-card library-view">
+      <header className="library-header">
+        <div>
+          <p className="eyebrow">视频任务库</p>
+          <h1>所有视频都在这里</h1>
+          <p>汇总待处理、处理中、可继续和已完成任务。同一时间只运行一个耗资源阶段。</p>
+        </div>
+        <div className="library-header-actions">
+          <button onClick={() => void Promise.all([loadJobHistory(), loadRestorableJobs()])}>刷新</button>
+          <button className="primary" onClick={() => setView("material")}>添加视频</button>
+        </div>
+      </header>
+      <div className="library-summary" aria-label="任务数量摘要">
+        <button className={libraryFilter === "all" ? "selected" : ""} onClick={() => setLibraryFilter("all")}>
+          <b>{librarySourceJobs.length}</b><span>全部</span>
+        </button>
+        <button className={libraryFilter === "active" ? "selected active" : "active"} onClick={() => setLibraryFilter("active")}>
+          <b>{libraryCounts.active}</b><span>处理中</span>
+        </button>
+        <button className={libraryFilter === "attention" ? "selected attention" : "attention"} onClick={() => setLibraryFilter("attention")}>
+          <b>{libraryCounts.attention}</b><span>待处理 / 可继续</span>
+        </button>
+        <button className={libraryFilter === "completed" ? "selected completed" : "completed"} onClick={() => setLibraryFilter("completed")}>
+          <b>{libraryCounts.completed}</b><span>已完成</span>
+        </button>
+      </div>
+      <div className="library-tools">
+        <label>
+          搜索任务
+          <input value={libraryQuery} onChange={(event) => setLibraryQuery(event.target.value)} placeholder="输入视频标题、阶段或错误信息" />
+        </label>
+        <label>
+          显示范围
+          <select value={historyScope} onChange={(event) => setHistoryScope(event.target.value as "current" | "all")}>
+            <option value="all">全部输出目录</option>
+            <option value="current">当前输出目录</option>
+          </select>
+        </label>
+        <small>{historyTotal > 200 ? `共 ${historyTotal} 条，当前显示最近 200 条` : `共 ${historyTotal} 条任务记录`}</small>
+      </div>
+      <div className="video-library-list" aria-live="polite">
+        {libraryJobs.length ? libraryJobs.map((item) => {
+          const resumable = restorableJobs.some((candidate) => candidate.id === item.id);
+          const category = videoLibraryCategory(item, resumable);
+          const isCurrent = job?.id === item.id;
+          const statusText = category === "active"
+            ? item.status === "cancelling" ? "正在取消" : "处理中"
+            : category === "completed"
+              ? "已完成"
+              : resumable ? "可继续" : item.status === "failed" ? "失败" : item.status === "cancelled" ? "已取消" : "待处理";
+          return (
+            <article className={`video-library-row ${category}`} key={item.id}>
+              <div className="video-library-icon" aria-hidden="true">▶</div>
+              <div className="video-library-main">
+                <div className="video-library-title">
+                  <b title={item.title}>{item.title}</b>
+                  {isCurrent && <span className="current-task">当前任务</span>}
+                </div>
+                <div className="video-library-meta">
+                  <span className={`library-status ${category}`}>{statusText}</span>
+                  <span>{item.stage || "等待配置"}</span>
+                  <span>{item.created_at ? new Date(item.created_at * 1000).toLocaleString() : "时间未知"}</span>
+                </div>
+                {(category === "active" || (item.progress > 0 && item.progress < 100)) && (
+                  <div className="library-progress" aria-label={`处理进度 ${item.progress}%`}><i style={{ width: `${item.progress}%` }} /></div>
+                )}
+                {item.error && <small className="library-error" title={item.error}>{item.error}</small>}
+              </div>
+              <div className="video-library-actions">
+                <button className={resumable || category === "active" ? "primary small" : ""} onClick={() => isCurrent && running ? setView("process") : void loadRestoredJob(item.id)}>
+                  {isCurrent && running ? "查看进度" : resumable ? "继续处理" : category === "completed" ? "打开任务" : "检查任务"}
+                </button>
+                <button onClick={() => void openHistoryPath(item.rendered_video || "")} disabled={!item.rendered_exists} title={item.rendered_exists ? "打开最终成片" : "尚未生成成片"}>成片</button>
+                <button onClick={() => void openHistoryPath(item.output_dir || "")} disabled={!item.output_exists} title={item.output_exists ? "打开该任务的输出目录" : "输出目录不存在"}>文件</button>
+              </div>
+            </article>
+          );
+        }) : (
+          <div className="empty-editor library-empty">
+            <b>{libraryQuery || libraryFilter !== "all" ? "没有匹配的任务" : "任务库还是空的"}</b>
+            <span>{libraryQuery || libraryFilter !== "all" ? "试试清除搜索或切换到“全部”。" : "添加一个链接或本地视频后，任务会出现在这里。"}</span>
+            {!libraryQuery && libraryFilter === "all" && <button className="primary" onClick={() => setView("material")}>添加第一个视频</button>}
+          </div>
+        )}
+      </div>
+    </section>
+  );
   const viewedTask = outputs?.tasks.find((task) => task.id === viewedTaskId) ?? null;
   const filesView = (
     <section className="workspace-card files-view">
@@ -3237,6 +3401,7 @@ function App() {
         </nav>
         <section className="main-workspace">
           {view === "material" && materialView}
+          {view === "library" && libraryView}
           {view === "process" && processView}
           {view === "subtitle" && subtitleView}
           {view === "publish" && publishView}

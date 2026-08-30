@@ -13,11 +13,13 @@ from yblocalizer.workflow import (
     invalidate_downstream,
     invalidation_stage,
     new_stage_states,
+    run_extract,
     validate_media,
     validate_segments,
     validate_srt,
 )
-from yblocalizer.workbench_api import WorkbenchJobs
+from yblocalizer.runtime import PipelineContext
+from yblocalizer.workbench_api import WorkbenchJobs, _restored_created_at
 
 
 @pytest.fixture(autouse=True)
@@ -95,6 +97,41 @@ def test_media_validation_uses_the_managed_ffprobe_path(
 def test_transcription_refuses_to_download_a_missing_model(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="不会自动下载模型"):
         require_whisper_model("small", tmp_path)
+
+
+def test_platform_subtitles_skip_audio_extraction_and_whisper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = tmp_path / "raw.mp4"
+    raw.write_bytes(b"video")
+    platform = tmp_path / "demo.en.srt"
+    platform.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nHello world\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("yblocalizer.workflow.validate_media", lambda *_args: True)
+    monkeypatch.setattr(
+        "yblocalizer.workflow._extract_audio",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("audio extraction must be skipped")),
+    )
+    monkeypatch.setattr(
+        "yblocalizer.workflow.transcribe_audio",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Whisper must be skipped")),
+    )
+    options = SimpleNamespace(
+        subtitle_source="audio", prefer_platform_subtitles=True, max_seconds=None,
+        whisper_model_size="small", source_language="en", device="cuda", compute_type="float16",
+        beam_size=5, resource_profile="balanced", ocr_fallback_to_audio=False,
+    )
+
+    artifacts = run_extract(
+        options, tmp_path,
+        WorkflowArtifacts(raw_video=str(raw), platform_subtitles=str(platform)),
+        PipelineContext(), lambda _line: None,
+    )
+
+    assert artifacts.subtitle_extraction_mode == "platform"
+    assert artifacts.audio is None
+    assert json.loads((tmp_path / "segments.source.json").read_text(encoding="utf-8"))[0]["text"] == "Hello world"
 
 
 def test_job_creation_only_creates_a_draft_and_local_source_is_ready(tmp_path: Path) -> None:
@@ -213,6 +250,11 @@ def test_restore_reads_summaries_without_probing_every_job(tmp_path: Path, monke
     restored = WorkbenchJobs(restore=True)
     rows = restored.restorable()
     assert any(row["id"] == created.id and row["checkpoint_validation"] == "pending" for row in rows)
+
+
+def test_undated_legacy_jobs_sort_behind_real_recent_jobs() -> None:
+    assert _restored_created_at({"created_at": None, "started_at": None, "updated_at": None}) == 0
+    assert _restored_created_at({"created_at": None, "started_at": 123.5, "updated_at": 456}) == 123.5
 
 
 def test_ambiguous_legacy_edits_preserve_existing_render_and_block_rerender(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

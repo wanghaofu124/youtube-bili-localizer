@@ -122,6 +122,7 @@ def build_parser() -> ArgumentParser:
         choices=["auto", "audio", "ocr", "merged"],
         help="Use auto detection, audio transcription, OCR, or merged audio+OCR subtitles",
     )
+    process.add_argument("--no-platform-subtitles", action="store_true", help="Always use Whisper/OCR even when YouTube subtitles are available")
     process.add_argument("--no-ocr-audio-fallback", action="store_true", help="Disable subtitle-source fallback between OCR and audio transcription")
     process.add_argument("--whisper-model-size", default="small")
     process.add_argument("--source-language", default=None)
@@ -131,7 +132,7 @@ def build_parser() -> ArgumentParser:
     process.add_argument("--translator", default="none", choices=["none", "openai", "deepseek"])
     process.add_argument("--target-lang", default="zh-Hans")
     process.add_argument("--translate-model", default=None, help="Translator model. Defaults depend on provider.")
-    process.add_argument("--batch-size", type=int, default=25)
+    process.add_argument("--batch-size", type=int, default=40)
     process.add_argument("--no-smart-translation", action="store_true", help="Disable context-aware subtitle translation prompts")
     process.add_argument("--no-smart-layout", action="store_true", help="Disable automatic subtitle line wrapping")
     process.add_argument("--font-name", default="Microsoft YaHei")
@@ -272,6 +273,7 @@ def cmd_process(args: Namespace) -> None:
             download_quality=args.download_quality,
             max_seconds=args.max_seconds,
             subtitle_source=args.subtitle_source,
+            prefer_platform_subtitles=not args.no_platform_subtitles,
             ocr_fallback_to_audio=not args.no_ocr_audio_fallback,
             whisper_model_size=args.whisper_model_size,
             source_language=args.source_language,

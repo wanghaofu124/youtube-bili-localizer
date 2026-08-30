@@ -125,7 +125,7 @@ def _strict_text(value: Any, field: str, maximum: int, *, allow_none: bool = Fal
 def _validate_strict_source(source: dict[str, Any]) -> None:
     bool_fields = (
         "require_reuse_allowed", "smart_translation", "smart_subtitle_layout",
-        "publish_to_bilibili", "include_source_link", "close_after_fill",
+        "publish_to_bilibili", "include_source_link", "close_after_fill", "prefer_platform_subtitles",
     )
     for field in bool_fields:
         if field in source:
@@ -211,7 +211,8 @@ def default_options(output_dir: str = "outputs/workbench_demo") -> dict[str, Any
         "youtube_po_token_mode": "auto", "youtube_proxy": "",
         "download_quality": "1080p", "render_encoder": "auto",
         "resource_profile": "balanced",
-        "subtitle_source": "audio", "whisper_model_size": "small", "source_language": "",
+        "subtitle_source": "audio", "prefer_platform_subtitles": True,
+        "whisper_model_size": "small", "source_language": "",
         "beam_size": 5, "ocr_interval": 0.5, "ocr_crop_ratio": 0.30, "ocr_min_chars": 3,
         "ocr_language": "eng",
         "subtitle_margin_ratio": 0.055, "render_crf": 20,
@@ -287,6 +288,7 @@ def normalize_options(value: Any, output_dir: str, *, strict: bool = True) -> di
         "download_quality": download_quality, "render_encoder": render_encoder,
         "resource_profile": resource_profile,
         "max_seconds": max_seconds, "subtitle_source": subtitle_source,
+        "prefer_platform_subtitles": raw["prefer_platform_subtitles"] if strict else bool(raw["prefer_platform_subtitles"]),
         "whisper_model_size": str(raw["whisper_model_size"]),
         "source_language": _text(raw["source_language"]) or None,
         "beam_size": int(raw["beam_size"]) if strict else max(1, min(10, int(raw["beam_size"]))),

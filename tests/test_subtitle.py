@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from yblocalizer.models import Segment, save_segments
-from yblocalizer.subtitle import format_segment_text, format_srt_timestamp, segments_to_srt, write_srt
+from yblocalizer.subtitle import format_segment_text, format_srt_timestamp, read_srt_segments, segments_to_srt, write_srt
 
 
 def test_format_srt_timestamp_clamps_and_rounds() -> None:
@@ -21,6 +21,23 @@ def test_bilingual_translation_first_and_cjk_layout() -> None:
 def test_srt_keeps_sequence_and_time_alignment() -> None:
     output = segments_to_srt([Segment(0, 1.2, "hello", "你好")], smart_layout=False)
     assert output == "1\n00:00:00,000 --> 00:00:01,200\n你好\n"
+
+
+def test_external_srt_is_normalized_trimmed_and_deduplicated(tmp_path: Path) -> None:
+    subtitle = tmp_path / "demo.en.srt"
+    subtitle.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n<i>Hello &amp; welcome</i>\n\n"
+        "2\n00:00:01,050 --> 00:00:02,000\nHello &amp; welcome\n\n"
+        "3\n00:00:02,000 --> 00:00:04,000\nNext line\n",
+        encoding="utf-8",
+    )
+
+    segments = read_srt_segments(subtitle, max_seconds=3)
+
+    assert [(item.start, item.end, item.text) for item in segments] == [
+        (0.0, 2.0, "Hello & welcome"),
+        (2.0, 3, "Next line"),
+    ]
 
 
 def test_atomic_subtitle_writes_preserve_old_files_and_remove_temporary_files(

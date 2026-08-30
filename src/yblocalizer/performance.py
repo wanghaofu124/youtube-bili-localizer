@@ -47,6 +47,11 @@ def download_rate_limit(profile: str) -> int | None:
     return None
 
 
+def translation_worker_limit(profile: str) -> int:
+    """Bound paid API concurrency without turning translation into a request storm."""
+    return 1 if normalize_resource_profile(profile) == "background" else 2
+
+
 def lower_process_priority(process: subprocess.Popen[Any], profile: str = "balanced") -> None:
     """Keep heavy child tools responsive to cancellation without starving the UI."""
     if os.name != "nt" or normalize_resource_profile(profile) == "maximum":

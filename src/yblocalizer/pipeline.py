@@ -62,6 +62,7 @@ class PipelineOptions:
     resource_profile: str = "balanced"
     max_seconds: int | None = None
     subtitle_source: str = "audio"
+    prefer_platform_subtitles: bool = True
     ocr_fallback_to_audio: bool = True
     whisper_model_size: str = "small"
     source_language: str | None = None
@@ -78,7 +79,7 @@ class PipelineOptions:
     translator: str = "deepseek"
     target_lang: str = "zh-Hans"
     translate_model: str | None = None
-    batch_size: int = 25
+    batch_size: int = 40
     smart_translation: bool = True
     smart_subtitle_layout: bool = True
     font_name: str = "Microsoft YaHei"

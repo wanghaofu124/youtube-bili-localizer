@@ -81,6 +81,7 @@ from .render import render_encoder_status
 from .performance import ffmpeg_thread_args
 from .storage import delete_paths, format_bytes, scan_outputs
 from .subtitle import write_srt
+from .transcribe import cuda_runtime_status
 from .util import run as run_command
 from . import db as job_db
 from .workflow import (
@@ -599,6 +600,17 @@ class PublishSession:
         }
 
 
+def _restored_created_at(record: dict[str, Any]) -> float:
+    for key in ("created_at", "started_at", "updated_at"):
+        try:
+            value = float(record.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value) and value > 0:
+            return value
+    return 0.0
+
+
 class WorkbenchJobs:
     """Application service for live workbench jobs and persisted snapshots."""
 
@@ -649,7 +661,10 @@ class WorkbenchJobs:
                 raw_video=artifacts.path("raw_video"), rendered_video=artifacts.path("rendered_video"),
                 edited_segments=artifacts.path("translated_segments") if (artifacts.path("translated_segments") and ".edited." in artifacts.path("translated_segments").name) else None,
                 started_at=record.get("started_at"), finished_at=record.get("finished_at"),
-                created_at=float(record.get("created_at") or time.time()),
+                # Undated legacy/test rows must not masquerade as newly-created
+                # tasks and push the user's real recent jobs out of the first
+                # page of the recovery picker.
+                created_at=_restored_created_at(record),
                 workflow_version=int(record.get("workflow_version") if record.get("workflow_version") is not None else 0),
                 current_stage=current, next_stage=str(record.get("next_stage") or "") or None,
                 auto_run=bool(record.get("auto_run")), stages=merged_states,
@@ -903,7 +918,8 @@ class WorkbenchJobs:
             youtube_po_token_mode=options["youtube_po_token_mode"], youtube_proxy=options["youtube_proxy"],
             download_quality=options["download_quality"], max_seconds=options["max_seconds"] if source_url else None,
             resource_profile=options["resource_profile"],
-            subtitle_source=options["subtitle_source"], ocr_fallback_to_audio=True,
+            subtitle_source=options["subtitle_source"],
+            prefer_platform_subtitles=options["prefer_platform_subtitles"], ocr_fallback_to_audio=True,
             whisper_model_size=options["whisper_model_size"], source_language=options["source_language"],
             beam_size=options["beam_size"], ocr_interval=options["ocr_interval"],
             ocr_crop_ratio=options["ocr_crop_ratio"], ocr_min_chars=options["ocr_min_chars"],
@@ -1119,8 +1135,13 @@ class WorkbenchJobs:
         connection_ready, connection_message = _probe_translation_service(provider) if key_ready else (False, f"缺少 {provider} API Key。")
         add("translator", "翻译服务", "生成中文字幕并校正表达", "passed" if connection_ready else "blocking", connection_message, "打开设置" if not connection_ready else None)
         if job.device == "cuda":
-            cuda_ready = resolve_command("nvidia-smi") is not None
-            add("cuda", "CUDA 设备", "使用显卡加速 Whisper 转写", "passed" if cuda_ready else "blocking", "已检测到 NVIDIA CUDA 设备。" if cuda_ready else "未检测到可用 NVIDIA 显卡或驱动。", "改用 CPU" if not cuda_ready else None)
+            cuda = cuda_runtime_status()
+            cuda_ready = bool(cuda["available"])
+            add(
+                "cuda", "CUDA 转写运行库", "使用显卡加速 Whisper 转写",
+                "passed" if cuda_ready else "blocking", str(cuda["message"]),
+                "改用 CPU" if not cuda_ready else None,
+            )
         encoder = job.options["render_encoder"]
         encoders = render_encoder_status()
         encoder_ready = encoders["nvidia"] if encoder == "nvidia" else encoders["cpu"] or (encoder == "auto" and encoders["nvidia"])
@@ -1392,6 +1413,7 @@ class WorkbenchJobs:
                 for segment in load_segments(path):
                     (ocr_texts if name.startswith("segments.ocr") else audio_texts).add(segment.text.strip())
         output: list[dict[str, Any]] = []
+        platform_mode = job.artifacts.subtitle_extraction_mode.startswith("platform")
         for index, item in enumerate(translated):
             raw_source = item.text
             stripped = raw_source.strip()
@@ -1400,7 +1422,7 @@ class WorkbenchJobs:
             elif stripped in audio_texts and stripped not in ocr_texts:
                 kind = "audio"
             else:
-                kind = "merged"
+                kind = "platform" if platform_mode else "merged"
             output.append({
                 "id": index, "start": item.start, "end": item.end,
                 "source": raw_source,

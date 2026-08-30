@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 import hashlib
 import json
@@ -53,13 +54,15 @@ def translate_segments_file(
     provider: str = "none",
     target_lang: str = "zh-Hans",
     model: str | None = None,
-    batch_size: int = 25,
+    batch_size: int = 40,
     validate_language: bool = True,
     display_mode: str = "translated",
     smart_translation: bool = True,
     smart_layout: bool = True,
     checkpoint_path: Path | None = None,
     cancel_check: Callable[[], None] | None = None,
+    max_workers: int = 1,
+    progress: Callable[[float], None] | None = None,
 ) -> list[Segment]:
     segments = load_segments(input_json)
     translated = translate_segments(
@@ -71,6 +74,8 @@ def translate_segments_file(
         smart_translation=smart_translation,
         checkpoint_path=checkpoint_path,
         cancel_check=cancel_check,
+        max_workers=max_workers,
+        progress=progress,
     )
     if validate_language:
         validate_target_language(translated, target_lang=target_lang, provider=provider)
@@ -84,10 +89,12 @@ def translate_segments(
     provider: str = "none",
     target_lang: str = "zh-Hans",
     model: str | None = None,
-    batch_size: int = 25,
+    batch_size: int = 40,
     smart_translation: bool = True,
     checkpoint_path: Path | None = None,
     cancel_check: Callable[[], None] | None = None,
+    max_workers: int = 1,
+    progress: Callable[[float], None] | None = None,
 ) -> list[Segment]:
     if cancel_check:
         cancel_check()
@@ -106,6 +113,8 @@ def translate_segments(
             smart_translation=smart_translation,
             checkpoint_path=checkpoint_path,
             cancel_check=cancel_check,
+            max_workers=max_workers,
+            progress=progress,
         )
     if provider == "deepseek":
         return _translate_chat_provider(
@@ -119,6 +128,8 @@ def translate_segments(
             smart_translation=smart_translation,
             checkpoint_path=checkpoint_path,
             cancel_check=cancel_check,
+            max_workers=max_workers,
+            progress=progress,
         )
     raise ValueError(f"Unknown translator provider: {provider}")
 
@@ -127,7 +138,7 @@ def correct_source_segments(
     segments: list[Segment],
     provider: str = "none",
     model: str | None = None,
-    batch_size: int = 25,
+    batch_size: int = 40,
     source_title: str | None = None,
     source_description: str | None = None,
     cancel_check: Callable[[], None] | None = None,
@@ -204,7 +215,10 @@ def generate_publish_metadata(
 
 
 def _source_correction_enabled() -> bool:
-    value = os.getenv("YB_SOURCE_CORRECTION", "1").strip().lower()
+    # Smart translation already asks the model to resolve obvious ASR/OCR mistakes
+    # from the surrounding context.  Running a separate correction pass doubles
+    # request latency and cost, so keep the expensive second pass opt-in.
+    value = os.getenv("YB_SOURCE_CORRECTION", "0").strip().lower()
     return value not in {"0", "false", "no", "off"}
 
 
@@ -429,9 +443,10 @@ def _translate_chat_provider(
     smart_translation: bool,
     checkpoint_path: Path | None,
     cancel_check: Callable[[], None] | None,
+    max_workers: int,
+    progress: Callable[[float], None] | None,
 ) -> list[Segment]:
     client = _chat_client(api_key_env=api_key_env, base_url=base_url)
-    output: list[Segment] = []
     full_context = _source_context_lines(segments)
     review_enabled = smart_translation and _translation_review_enabled()
     fingerprint = hashlib.sha256(json.dumps({
@@ -441,9 +456,11 @@ def _translate_chat_provider(
         "translation_review": review_enabled,
     }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
     checkpoint = _load_translation_checkpoint(checkpoint_path, fingerprint)
+    completed: dict[int, list[str]] = {}
+    pending: list[tuple[int, list[Segment]]] = []
+    completed_count = 0
+
     for start in range(0, len(segments), batch_size):
-        if cancel_check:
-            cancel_check()
         batch = segments[start : start + batch_size]
         cached = checkpoint["batches"].get(str(start))
         if isinstance(cached, list) and len(cached) == len(batch) and all(isinstance(item, str) for item in cached):
@@ -457,8 +474,18 @@ def _translate_chat_provider(
                 checkpoint["batches"].pop(str(start), None)
                 _save_translation_checkpoint(checkpoint_path, checkpoint)
             else:
-                output.extend(cached_output)
+                completed[start] = cached
+                completed_count += len(batch)
                 continue
+
+        pending.append((start, batch))
+
+    if progress:
+        progress(1.0 if not segments else completed_count / len(segments))
+
+    def translate_one(start: int, batch: list[Segment]) -> tuple[int, list[str]]:
+        if cancel_check:
+            cancel_check()
         subtitle_data = _subtitle_data_json(batch)
         if smart_translation:
             context_window = _context_window(segments, batch_start=start, batch_count=len(batch), radius=6)
@@ -524,18 +551,76 @@ def _translate_chat_provider(
                 full_context=full_context,
                 context_window=context_window,
             )
-        batch_output = [
-            Segment(segment.start, segment.end, segment.text, translated)
-            for segment, translated in zip(batch, translations)
-        ]
+        return start, translations
+
+    worker_count = max(1, min(2, int(max_workers or 1), len(pending) or 1))
+
+    def commit_batch(start: int, batch: list[Segment], translations: list[str]) -> None:
+        nonlocal completed_count
+        batch_output = [Segment(segment.start, segment.end, segment.text, translated) for segment, translated in zip(batch, translations)]
         if checkpoint_path:
             validate_target_language(batch_output, target_lang=target_lang, provider=provider_name)
+        completed[start] = translations
         checkpoint["batches"][str(start)] = translations
         _save_translation_checkpoint(checkpoint_path, checkpoint)
+        completed_count += len(batch)
+        if progress:
+            progress(1.0 if not segments else completed_count / len(segments))
         if cancel_check:
             cancel_check()
-        output.extend(batch_output)
-        time.sleep(0.2)
+
+    if worker_count == 1:
+        for start, batch in pending:
+            batch_start, translations = translate_one(start, batch)
+            commit_batch(batch_start, batch, translations)
+            time.sleep(0.2)
+    elif pending:
+        # Keep at most two requests in flight. Results may arrive out of order,
+        # but checkpoint writes and final assembly happen on this thread so the
+        # subtitle timeline remains deterministic and resumable.
+        executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="subtitle-translate")
+        pending_iter = iter(pending)
+        active: dict[Any, tuple[int, list[Segment]]] = {}
+
+        def fill_slots() -> None:
+            while len(active) < worker_count:
+                try:
+                    start, batch = next(pending_iter)
+                except StopIteration:
+                    return
+                active[executor.submit(translate_one, start, batch)] = (start, batch)
+
+        fill_slots()
+        try:
+            while active:
+                if cancel_check:
+                    cancel_check()
+                done, _ = wait(tuple(active), return_when=FIRST_COMPLETED)
+                for future in done:
+                    expected_start, batch = active.pop(future)
+                    batch_start, translations = future.result()
+                    if batch_start != expected_start:
+                        raise RuntimeError("Translation batch identity mismatch.")
+                    commit_batch(batch_start, batch, translations)
+                fill_slots()
+        except BaseException:
+            for future in active:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True)
+
+    output: list[Segment] = []
+    for start in range(0, len(segments), batch_size):
+        batch = segments[start : start + batch_size]
+        translations = completed.get(start)
+        if not isinstance(translations, list) or len(translations) != len(batch):
+            raise RuntimeError(f"Translation batch {start} did not complete.")
+        output.extend(
+            Segment(segment.start, segment.end, segment.text, translated)
+            for segment, translated in zip(batch, translations)
+        )
     return output
 
 
@@ -687,7 +772,22 @@ def _chat_client(api_key_env: str, base_url: str | None):
         from openai import OpenAI
     except ImportError as exc:
         raise RuntimeError("openai is not installed. Run: pip install -r requirements.txt") from exc
-    return OpenAI(api_key=api_key, base_url=base_url) if base_url else OpenAI(api_key=api_key)
+    try:
+        timeout = max(15.0, min(300.0, float(os.getenv("YB_LLM_TIMEOUT_SECONDS", "90"))))
+    except ValueError:
+        timeout = 90.0
+    try:
+        max_retries = max(0, min(3, int(os.getenv("YB_LLM_MAX_RETRIES", "1"))))
+    except ValueError:
+        max_retries = 1
+    options: dict[str, Any] = {
+        "api_key": api_key,
+        "timeout": timeout,
+        "max_retries": max_retries,
+    }
+    if base_url:
+        options["base_url"] = base_url
+    return OpenAI(**options)
 
 
 def _parse_publish_metadata(text: str) -> PublishMetadata:

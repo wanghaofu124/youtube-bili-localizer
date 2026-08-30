@@ -57,6 +57,62 @@ def test_pipeline_happy_path_with_mocked_integrations(monkeypatch: pytest.Monkey
     assert (result.work_dir / "publish_metadata.json").is_file()
 
 
+def test_non_publish_pipeline_uses_local_metadata_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    raw_video = tmp_path / "input.mp4"
+    raw_video.write_bytes(b"video")
+    seen_providers: list[str] = []
+
+    monkeypatch.setattr("yblocalizer.pipeline.timestamp_id", lambda: "job-fast-translation")
+    monkeypatch.setattr(
+        "yblocalizer.workflow.import_local_video",
+        lambda path, work_dir, title=None: VideoJob(
+            "test", str(path), "file", work_dir, title=title, raw_video=raw_video
+        ),
+    )
+    monkeypatch.setattr("yblocalizer.workflow.extract_audio", lambda _video, output: output)
+
+    def fake_transcribe(_audio, **kwargs):
+        items = [Segment(0, 1, "hello")]
+        from yblocalizer.models import save_segments
+        from yblocalizer.subtitle import write_srt
+        save_segments(kwargs["segments_json"], items)
+        write_srt(kwargs["srt_path"], items, display_mode="source")
+        return items
+
+    def fake_translate(_source, *, output_json, output_srt, **_kwargs):
+        items = [Segment(0, 1, "hello", "你好")]
+        from yblocalizer.models import save_segments
+        from yblocalizer.subtitle import write_srt
+        save_segments(output_json, items)
+        write_srt(output_srt, items)
+        return items
+
+    def fake_metadata(**kwargs):
+        seen_providers.append(kwargs["provider"])
+        return PublishMetadata("测试", ["中文字幕"])
+
+    def fake_render(_video, _subtitle, output, **_kwargs):
+        output.write_bytes(b"rendered")
+        return output
+
+    monkeypatch.setattr("yblocalizer.workflow.transcribe_audio", fake_transcribe)
+    monkeypatch.setattr("yblocalizer.workflow.translate_segments_file", fake_translate)
+    monkeypatch.setattr("yblocalizer.workflow.generate_publish_metadata", fake_metadata)
+    monkeypatch.setattr("yblocalizer.workflow.burn_subtitles", fake_render)
+    monkeypatch.setattr("yblocalizer.workflow.validate_media", lambda *_: True)
+
+    run_pipeline(
+        PipelineOptions(
+            source=str(raw_video), source_kind="file", output_dir=tmp_path / "outputs",
+            i_have_rights=True, translator="deepseek", publish_to_bilibili=False,
+        )
+    )
+
+    assert seen_providers == ["none"]
+
+
 def test_pipeline_errors_when_ocr_and_audio_have_no_text(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     raw_video = tmp_path / "input.mp4"
     raw_video.write_bytes(b"video")

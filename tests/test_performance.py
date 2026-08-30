@@ -8,7 +8,7 @@ import sys
 import pytest
 
 from yblocalizer.download import download_with_ytdlp
-from yblocalizer.performance import cpu_thread_limit, download_rate_limit, ffmpeg_thread_args
+from yblocalizer.performance import cpu_thread_limit, download_rate_limit, ffmpeg_thread_args, translation_worker_limit
 from yblocalizer.render import burn_subtitles
 from yblocalizer.transcribe import transcribe_audio
 from yblocalizer.workbench_api import DemoJob, Material, WorkbenchJobs
@@ -39,6 +39,9 @@ def test_resource_profiles_have_explicit_cpu_and_network_limits() -> None:
     assert cpu_thread_limit("background") <= cpu_thread_limit("balanced") <= cpu_thread_limit("maximum")
     assert ffmpeg_thread_args("balanced")[0] == "-threads"
     assert ffmpeg_thread_args("maximum") == []
+    assert translation_worker_limit("background") == 1
+    assert translation_worker_limit("balanced") == 2
+    assert translation_worker_limit("maximum") == 2
 
 
 def test_balanced_download_applies_rate_limit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -65,6 +68,82 @@ def test_balanced_download_applies_rate_limit(monkeypatch: pytest.MonkeyPatch, t
     download_with_ytdlp("https://example.test/video", tmp_path, resource_profile="balanced")
 
     assert captured["ratelimit"] == 6 * 1024 * 1024
+
+
+def test_youtube_download_requests_platform_subtitles(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict = {}
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            captured.update(options)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def extract_info(self, url: str, download: bool):
+            assert download is True
+            (tmp_path / "demo.mp4").write_bytes(b"video")
+            (tmp_path / "demo.en.srt").write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8"
+            )
+            return {
+                "id": "demo", "title": "Demo", "webpage_url": url,
+                "requested_subtitles": {"en": {"filepath": "demo.en.srt"}},
+            }
+
+    monkeypatch.setattr("yblocalizer.download.po_token_provider_status", lambda: {"available": False, "browser_path": None})
+    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
+
+    job = download_with_ytdlp(
+        "https://www.youtube.com/watch?v=demo", tmp_path,
+        source_language="en", prefer_platform_subtitles=True,
+    )
+
+    assert captured["writesubtitles"] is True
+    assert captured["writeautomaticsub"] is True
+    assert captured["subtitlesformat"] == "srt/best"
+    assert job.source_subtitles == tmp_path / "demo.en.srt"
+
+
+def test_platform_subtitle_timeout_keeps_downloaded_video(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    instances = 0
+
+    class FakeYoutubeDL:
+        def __init__(self, _options):
+            nonlocal instances
+            instances += 1
+            self.instance = instances
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def extract_info(self, url: str, download: bool):
+            assert download is True
+            if self.instance == 2:
+                raise RuntimeError("subtitle request timed out")
+            (tmp_path / "demo.mp4").write_bytes(b"video")
+            return {"id": "demo", "title": "Demo", "webpage_url": url}
+
+    monkeypatch.setattr("yblocalizer.download.po_token_provider_status", lambda: {"available": False, "browser_path": None})
+    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
+    logs: list[str] = []
+
+    job = download_with_ytdlp(
+        "https://www.youtube.com/watch?v=demo", tmp_path,
+        prefer_platform_subtitles=True, log=logs.append,
+    )
+
+    assert job.raw_video == tmp_path / "demo.mp4"
+    assert job.source_subtitles is None
+    assert any("回退 Whisper" in line for line in logs)
 
 
 def test_balanced_render_limits_ffmpeg_threads(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
