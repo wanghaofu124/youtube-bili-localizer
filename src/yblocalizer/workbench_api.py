@@ -7,6 +7,7 @@ and never sees API keys, cookies, or arbitrary absolute paths.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import hmac
 import ipaddress
@@ -45,8 +46,16 @@ os.environ.setdefault("YBLOCALIZER_DATA_DIR", str(_DEFAULT_USER_DATA_ROOT))
 _DEFAULT_USER_DATA_ROOT.mkdir(parents=True, exist_ok=True)
 load_dotenv(_DEFAULT_USER_DATA_ROOT / ".env")
 
-from .download import YouTubeAccessError, get_video_metadata, po_token_provider_status
-from .dependencies import DependencyManager, dependency_statuses, require_whisper_model, resolve_command
+from .download import DownloadProposalMismatch, DownloadResolutionMismatch, YouTubeAccessError, get_video_metadata, po_token_provider_status
+from .dependencies import (
+    OLLAMA_MODEL_TAGS,
+    DependencyManager,
+    clear_dependency_cache,
+    dependency_statuses,
+    ollama_local_status,
+    require_whisper_model,
+    resolve_command,
+)
 from .models import Segment, load_segments, save_segments
 from .ocr_subtitle import available_ocr_languages
 from .pipeline import (
@@ -76,13 +85,14 @@ from .runtime import CancellationRequested, CancellationToken, PipelineContext, 
 from .job_service import transition_job
 from .publish_bili import assist_publish, open_upload_page
 from .publish_text import build_bilibili_description, delete_custom_template, get_all_templates, save_custom_template
+from .translate import generate_publish_metadata, save_publish_metadata
 from .render import burn_subtitles
 from .render import render_encoder_status
 from .performance import ffmpeg_thread_args
-from .storage import delete_paths, format_bytes, scan_outputs
+from .storage import delete_paths, format_bytes, resolve_task_title, scan_outputs
 from .subtitle import write_srt
-from .transcribe import cuda_runtime_status
-from .util import run as run_command
+from .transcribe import WhisperCudaOutOfMemory, cuda_runtime_status
+from .util import allocate_job_folder_name, run as run_command
 from . import db as job_db
 from .workflow import (
     WORKFLOW_STAGES,
@@ -90,6 +100,7 @@ from .workflow import (
     STAGE_LABELS as WORKFLOW_STAGE_LABELS,
     WorkflowArtifacts,
     atomic_write_manifest,
+    commit_rendered_candidate,
     invalidate_downstream,
     invalidation_stage,
     new_stage_states,
@@ -101,6 +112,14 @@ from .workflow import (
 )
 
 LOGGER = logging.getLogger("yblocalizer.workbench")
+JOB_ID_PATTERN = r"(?=[^/]{1,128}(?:/|$))[\w-]+(?:\.[\w-]+)*"
+
+
+def _safe_job_id(value: object) -> bool:
+    if not isinstance(value, str) or len(value) > 128 or not re.fullmatch(JOB_ID_PATTERN, value):
+        return False
+    stem = value.split(".", 1)[0].upper()
+    return stem not in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
 
 
 def _runtime_root() -> Path:
@@ -130,6 +149,18 @@ DEMO_VIDEO = ASSET_ROOT / "demo" / "authorized-demo-10s.mp4"
 OUTPUT_ROOT = USER_DATA_ROOT / "outputs" / "workbench_demo"
 UPLOAD_ROOT = USER_DATA_ROOT / "outputs" / "workbench_uploads"
 MEDIA_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+
+
+def _read_publish_metadata(path: Path | None) -> dict[str, Any]:
+    title, tags = "", []
+    if path and path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            title = str(data.get("title") or "").strip()
+            tags = [str(tag).strip() for tag in (data.get("tags") or []) if str(tag).strip()]
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    return {"title": title, "tags": tags, "has_metadata": bool(title or tags)}
 MAX_JSON_BODY = 1024 * 1024
 MAX_URL_LENGTH = 2048
 MAX_HTTP_CONNECTIONS = 32
@@ -140,6 +171,10 @@ class PayloadReadError(InputValidationError):
     def __init__(self, message: str, *, status: HTTPStatus, code: str) -> None:
         super().__init__(message, code=code)
         self.status = status
+
+
+class ActiveTaskDeletionError(RuntimeError):
+    """Deletion conflicts with a currently running task."""
 
 
 def _validate_public_http_url(value: Any, field: str = "source_url") -> str:
@@ -213,6 +248,29 @@ def _resolve_output_root(value: str) -> Path:
     return path.resolve() if path.is_absolute() else (PROJECT_ROOT / path).resolve()
 
 
+def _path_contains_reparse(path: Path) -> bool:
+    """Return true for symlinks/junctions anywhere in a deletion target."""
+    try:
+        candidates = [path]
+        current = path.parent
+        while current != current.parent:
+            candidates.append(current)
+            current = current.parent
+        if path.is_dir():
+            candidates.extend(path.rglob("*"))
+        for candidate in candidates:
+            if candidate.is_symlink():
+                return True
+            try:
+                if int(candidate.stat(follow_symlinks=False).st_file_attributes) & 0x400:
+                    return True
+            except (AttributeError, FileNotFoundError):
+                pass
+        return False
+    except OSError:
+        return True
+
+
 def _public_options(options: dict[str, Any]) -> dict[str, Any]:
     return options_for_public(options)
 
@@ -226,21 +284,47 @@ def _cookies_file_has_login(path: Path) -> bool:
     return "\tSID\t" in text or "\tHSID\t" in text or "LOGIN_INFO" in text
 
 
-def _probe_translation_service(provider: str) -> tuple[bool, str]:
+def _probe_translation_service(provider: str, model: str | None = None) -> tuple[bool, str]:
     """Perform a small authenticated models request before media download."""
     normalized = provider.strip().lower()
     if normalized == "none":
         return True, "未启用在线翻译，不需要 API 连接。"
+    if normalized == "ollama":
+        local = ollama_local_status()
+        if not local["runtime_available"]:
+            return False, str(local["runtime_message"])
+        selected_model = model or "qwen3.5:4b"
+        model_id = next((key for key, tag in OLLAMA_MODEL_TAGS.items() if tag == selected_model), None)
+        if not model_id or not local["models"].get(model_id, False):
+            return False, f"本地模型 {selected_model} 尚未下载；请在依赖中心下载后重新检查。"
+        return True, f"Ollama 与本地模型 {selected_model} 可用；翻译请求只发送到本机。"
     key_name = "DEEPSEEK_API_KEY" if normalized == "deepseek" else "OPENAI_API_KEY"
     api_key = os.getenv(key_name, "").strip()
     if not api_key:
         return False, f"缺少 {provider} API Key。"
+    default_model = os.getenv(
+        "DEEPSEEK_TRANSLATE_MODEL" if normalized == "deepseek" else "OPENAI_TRANSLATE_MODEL",
+        "deepseek-v4-flash" if normalized == "deepseek" else "gpt-4.1-mini",
+    )
+    expected_model = model or default_model
     endpoint = "https://api.deepseek.com/models" if normalized == "deepseek" else "https://api.openai.com/v1/models"
     request = Request(endpoint, headers={"Authorization": f"Bearer {api_key}", "User-Agent": "YouTubeBiliLocalizer/preflight"})
     try:
         with urlopen(request, timeout=8) as response:
             if 200 <= int(response.status) < 300:
-                return True, "API Key 与网络连接验证通过。"
+                try:
+                    payload = json.loads(response.read().decode("utf-8"))
+                    ids = {str(item.get("id")) for item in (payload.get("data") or []) if isinstance(item, dict)}
+                except (ValueError, UnicodeDecodeError, TypeError):
+                    ids = set()
+                compatible_ids = {expected_model}
+                if normalized == "deepseek":
+                    compatible_ids.add({"deepseek-v4-flash": "deepseek-flash"}.get(expected_model, expected_model))
+                if expected_model and ids and not compatible_ids.intersection(ids):
+                    return False, f"翻译服务已连接，但模型 {expected_model} 不在 /models 返回列表中。"
+                if expected_model and not ids:
+                    return False, "翻译服务 /models 返回无效，无法核验所选模型。"
+                return True, "API Key、模型与网络连接验证通过。"
             return False, f"翻译服务返回 HTTP {response.status}。"
     except HTTPError as exc:
         if exc.code in {401, 403}:
@@ -410,9 +494,19 @@ def stage_from_log(message: str) -> tuple[str, int]:
 
 
 def _classify_job_error(exc: Exception) -> tuple[str, str]:
+    if isinstance(exc, DownloadResolutionMismatch):
+        return exc.code, "实际文件画质与下载器选择不一致，应用已停止，不会继续处理低清素材；请重试获取素材。"
+    if isinstance(exc, DownloadProposalMismatch):
+        return exc.code, str(exc)
+    if isinstance(exc, WhisperCudaOutOfMemory):
+        return exc.code, "CUDA 显存不足，未自动切换设备。可确认后改用 CPU / int8，或选择已安装的较小模型，仅重新提取字幕。"
     if isinstance(exc, YouTubeAccessError):
         return exc.code, exc.suggested_action
     text = str(exc).lower()
+    if "429" in text or "rate limit" in text or "too many requests" in text:
+        return "translator_rate_limited", "翻译服务的有界自动重试已用尽。等待一会儿后，只重试翻译阶段；不会重复下载或转写。"
+    if "产物校验失败" in text:
+        return "stage_output_invalid", "本阶段结果未保存为完成检查点。查看完整日志后重试该阶段；之前有效的阶段成果会保留。"
     if "ffmpeg" in text:
         return "ffmpeg_unavailable", "安装 FFmpeg 并加入 PATH，然后重新运行配置检查。"
     if "api key" in text or "authentication" in text:
@@ -422,6 +516,31 @@ def _classify_job_error(exc: Exception) -> tuple[str, str]:
     if "cuda" in text or "out of memory" in text:
         return "compute_failed", "切换到 CPU + int8，或选择更小的 Whisper 模型。"
     return "pipeline_failed", "打开完整日志查看失败阶段，修正配置后重试。"
+
+
+def _carry_quality_baseline(proposal: dict[str, Any], previous: dict[str, Any] | None) -> dict[str, Any]:
+    """A repeated preparation must not silently forget an earlier 4K promise."""
+    updated = dict(proposal)
+    old = previous or {}
+    previous_width = int(old.get("baseline_width") or old.get("width") or 0)
+    previous_height = int(old.get("baseline_height") or old.get("height") or 0)
+    width, height = int(updated.get("width") or 0), int(updated.get("height") or 0)
+    updated["baseline_width"] = max(previous_width, width)
+    updated["baseline_height"] = max(previous_height, height)
+    if width < updated["baseline_width"] or height < updated["baseline_height"]:
+        updated["requires_consent"] = True
+    return updated
+
+
+def _recovery_for_error(exc: Exception, stage: str | None, job: "DemoJob") -> dict[str, Any] | None:
+    if stage == "extract" and job.device == "cuda" and isinstance(exc, WhisperCudaOutOfMemory):
+        return {
+            "id": "retry_extract_with_lower_resource",
+            "stage": "extract",
+            "requires_confirmation": True,
+            "impact": "可切换为 CPU / int8（速度可能变慢），或改用已安装的较小 Whisper 模型；只重新提取字幕，不重新下载视频。",
+        }
+    return None
 
 
 def public_path(path: Path | None) -> str | None:
@@ -551,11 +670,17 @@ class DemoJob:
             first_requested = max(first_sequence, int(log_after) + 1)
             offset = max(0, first_requested - first_sequence)
             public_logs = self.logs[offset:offset + limit] if limit else []
+        recovery = next((
+            self.stages.get(stage, {}).get("recovery")
+            for stage in WORKFLOW_STAGES
+            if self.stages.get(stage, {}).get("status") == "failed"
+            and self.stages.get(stage, {}).get("recovery")
+        ), None)
         return {
             "id": self.id, "status": self.status, "stage": self.stage, "progress": self.progress,
             "logs": public_logs, "log_cursor": self.log_sequence, "log_total": self.log_sequence,
             "error": self.error, "error_code": self.error_code,
-            "suggested_action": self.suggested_action, "result": self.result,
+            "suggested_action": self.suggested_action, "recovery": recovery, "result": self.result,
             "device": self.device, "compute_type": self.compute_type, "material": material,
             "options": _public_options(self.options),
             "started_at": self.started_at,
@@ -566,7 +691,7 @@ class DemoJob:
             "checks": self.checks,
             "current_stage": self.current_stage,
             "next_stage": self.next_stage,
-            "can_resume": self.status == "interrupted" or any(row.get("status") == "interrupted" for row in self.stages.values()),
+            "can_resume": any(self.stages[name].get("status") == "interrupted" for name in WORKFLOW_STAGES[:4]),
             "auto_run": self.auto_run,
             "artifacts": self.artifacts.public_summary(),
             "subtitle_extraction": {
@@ -578,6 +703,9 @@ class DemoJob:
             "artifact_revision": self.artifacts.revision,
             "edit_state": self.artifacts.edit_state,
             "checkpoint_validation": self.checkpoint_validation,
+            "publish_copy": _read_publish_metadata(self.artifacts.path("publish_metadata")),
+            "quality_proposal": self.options.get("quality_proposal"),
+            "quality_consent": bool(self.options.get("quality_consent")),
         }
 
 
@@ -616,13 +744,17 @@ class WorkbenchJobs:
 
     def __init__(self, *, restore: bool = False) -> None:
         demo_duration, demo_width, demo_height = _probe_media(DEMO_VIDEO)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._jobs: dict[str, DemoJob] = {}
         self._materials: dict[str, Material] = {
             "demo": Material("demo", DEMO_VIDEO, "authorized-demo-10s.mp4", demo_duration or 10, demo_width or 1280, demo_height or 720, True, True)
         }
         self._running_id: str | None = None
+        self._preparing_ids: set[str] = set()
         self._worker: threading.Thread | None = None
+        # IDs removed from history remain tombstoned for this process.  This
+        # prevents a late worker persist from resurrecting a just-deleted row.
+        self._deleted_history_ids: set[str] = set()
         self._native_publish_files: dict[str, Path] = {}
         self._publish_session = PublishSession()
         if restore:
@@ -668,7 +800,10 @@ class WorkbenchJobs:
                 workflow_version=int(record.get("workflow_version") if record.get("workflow_version") is not None else 0),
                 current_stage=current, next_stage=str(record.get("next_stage") or "") or None,
                 auto_run=bool(record.get("auto_run")), stages=merged_states,
-                checks=record.get("checks") if isinstance(record.get("checks"), list) else [], artifacts=artifacts,
+                # Preparation checks describe a previous process/environment;
+                # never trust them after restart.  Keep the persisted snapshot
+                # intact in storage, but require an explicit prepare call.
+                checks=[], artifacts=artifacts,
             )
             if job.work_dir and any((artifacts.source_srt, artifacts.translated_srt, artifacts.rendered_video)):
                 job.result = {
@@ -733,9 +868,10 @@ class WorkbenchJobs:
         return material
 
     def _persist(self, job: DemoJob) -> None:
-        """Write job history to SQLite. Failures are logged, never fatal."""
-        try:
-            with self._lock:
+        """Write SQLite authoritatively; manifest is only a rebuildable mirror."""
+        with self._lock:
+                if job.id in self._deleted_history_ids:
+                    return
                 snapshot = {
                     "job_id": job.id,
                     "material_id": job.material.id,
@@ -762,23 +898,26 @@ class WorkbenchJobs:
                     "artifacts": job.artifacts.to_dict(),
                     "updated_at": time.time(),
                 }
-            job_db.record_job(**snapshot)
-            if job.work_dir:
-                atomic_write_manifest(job.work_dir / "job_manifest.json", {
-                    "workflow_version": job.workflow_version,
-                    "job_id": job.id,
-                    "status": job.status,
-                    "current_stage": job.current_stage,
-                    "next_stage": job.next_stage,
-                    "auto_run": job.auto_run,
-                    "stages": job.stages,
-                    "checks": job.checks,
-                    "artifacts": job.artifacts.to_dict(),
-                    "options": options_for_storage(job.options),
-                    "updated_at": time.time(),
-                })
-        except Exception as exc:  # pragma: no cover - storage must never break tasks
-            LOGGER.exception("Could not persist job %s: %s", job.id, exc)
+                # Keep the DB write under the same lock as the tombstone
+                # check; otherwise a worker could upsert after deletion.
+                job_db.record_job(**snapshot)
+                if job.work_dir:
+                    try:
+                        atomic_write_manifest(job.work_dir / "job_manifest.json", {
+                        "workflow_version": job.workflow_version,
+                        "job_id": job.id,
+                        "status": job.status,
+                        "current_stage": job.current_stage,
+                        "next_stage": job.next_stage,
+                        "auto_run": job.auto_run,
+                        "stages": job.stages,
+                        "checks": job.checks,
+                        "artifacts": job.artifacts.to_dict(),
+                        "options": options_for_storage(job.options),
+                        "updated_at": time.time(),
+                        })
+                    except Exception as exc:
+                        LOGGER.warning("Could not mirror manifest for %s: %s", job.id, exc)
 
     def publish_session(self) -> PublishSession:
         with self._lock:
@@ -800,12 +939,16 @@ class WorkbenchJobs:
             if session.status in {"idle", "finished"}:
                 session.status = "running"
             lowered = message.lower()
-            if "pre-submit" in lowered or "reached the pre-submit step" in lowered:
+            # Only flip to waiting_review on confirmed pre-submit readiness.
+            # Progress heartbeats may contain "上传完成" while the form is still filling.
+            if (
+                "pre-submit" in lowered
+                or "reached the pre-submit step" in lowered
+                or "尚未正式投稿" in message
+                or "已尽量填好" in message
+            ):
                 session.status = "waiting_review"
                 session.message = "已到人工提交前：请检查分区、声明、封面与简介，确认无误后手动投稿。"
-            elif "already uploaded" in lowered or "upload complete" in lowered:
-                session.status = "waiting_review"
-                session.message = "视频已上传，等待你在页面中确认后手动投稿。"
             else:
                 session.message = message
 
@@ -817,7 +960,11 @@ class WorkbenchJobs:
         """Return light-weight summaries; checkpoint probing is intentionally lazy."""
         with self._lock:
             jobs = sorted(self._jobs.values(), key=lambda item: item.created_at, reverse=True)
-            rows = [job for job in jobs if job.status in {"draft", "ready", "failed", "cancelled", "interrupted"} or job.next_stage]
+            rows = [
+                job for job in jobs
+                if (job.status in {"draft", "ready", "failed", "cancelled", "interrupted"} or job.next_stage)
+                and self._job_is_restorable(job)
+            ]
             return [{
                 "id": job.id,
                 "title": str(job.options.get("title") or job.material.name),
@@ -827,11 +974,23 @@ class WorkbenchJobs:
                 "checkpoint_validation": job.checkpoint_validation,
             } for job in rows[:max(1, min(100, limit))]]
 
+    @staticmethod
+    def _job_is_restorable(job: DemoJob) -> bool:
+        """Hide library restore actions for jobs whose outputs were already wiped."""
+        if job.material.source_url:
+            return True
+        if job.work_dir and job.work_dir.exists():
+            return True
+        if job.raw_video and Path(job.raw_video).expanduser().is_file():
+            return True
+        raw = job.artifacts.path("raw_video")
+        return bool(raw and raw.is_file())
+
     def load(self, job_id: str) -> DemoJob:
         job = self.get(job_id)
         if not job:
             raise RuntimeError("Task not found.")
-        if job.status in {"running", "cancelling"}:
+        if job.status in {"running", "preparing", "cancelling"}:
             raise RuntimeError("任务仍在运行，不能重复载入。")
         self._verify_checkpoints(job)
         self._persist(job)
@@ -841,8 +1000,183 @@ class WorkbenchJobs:
         with self._lock:
             for job_id in job_ids:
                 job = self._jobs.get(job_id)
-                if job and job.status not in {"running", "cancelling"}:
+                if job and job.status not in {"running", "preparing", "cancelling"}:
                     self._jobs.pop(job_id, None)
+                self._deleted_history_ids.add(job_id)
+
+    @staticmethod
+    def _history_fingerprint(plan: dict[str, Any]) -> str:
+        payload = json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def history_delete_plan(self, job_ids: list[str], mode: str, *, allow_many: bool = False) -> dict[str, Any]:
+        """Build a validated, side-effect-free plan for history deletion."""
+        mode = str(mode).strip().lower()
+        if mode not in {"record_only", "record_and_outputs"}:
+            raise ValueError("Deletion mode must be record_only or record_and_outputs.")
+        if not isinstance(job_ids, list) or not job_ids or (not allow_many and len(job_ids) > 200):
+            raise ValueError("Choose between 1 and 200 task IDs.")
+        if any(
+            not _safe_job_id(value)
+            for value in job_ids
+        ):
+            raise ValueError("Task IDs contain an invalid value.")
+        if len(set(job_ids)) != len(job_ids):
+            raise ValueError("Task IDs must not contain duplicates.")
+        ids = list(job_ids)
+        with self._lock:
+            records = {str(row["id"]): row for row in job_db.list_jobs(None)}
+            missing = [job_id for job_id in ids if job_id not in records]
+            if missing:
+                raise RuntimeError("Some selected tasks no longer exist; refresh the task library.")
+            active = []
+            for job_id in ids:
+                row = records[job_id]
+                live = self._jobs.get(job_id)
+                if row.get("status") in {"queued", "running", "preparing", "cancelling"} or (live and live.status in {"queued", "running", "preparing", "cancelling"}) or self._running_id == job_id:
+                    active.append(job_id)
+            if active:
+                raise RuntimeError("运行中的任务不能删除，请先取消并等待当前阶段结束。")
+            rows: list[dict[str, Any]] = []
+            for job_id in ids:
+                row = records[job_id]
+                item: dict[str, Any] = {"id": job_id, "title": row.get("title") or "未命名任务", "status": row.get("status") or "unknown", "output_dir": str(row.get("output_dir") or ""), "files": [], "bytes": 0, "disposition": "record_only_required", "reason": "未选择删除输出。"}
+                if mode == "record_and_outputs":
+                    output_text = item["output_dir"]
+                    stored_options = row.get("options")
+                    configured_value = stored_options.get("output_dir") if isinstance(stored_options, dict) else None
+                    reason = None
+                    if not output_text:
+                        reason = "历史任务没有输出目录，仅删除记录。"
+                    elif not isinstance(configured_value, str) or not configured_value.strip():
+                        reason = "缺少可信输出根配置，仅删除记录。"
+                    else:
+                        output = Path(output_text).expanduser()
+                        resolved = output.resolve()
+                        configured_root = _resolve_output_root(configured_value)
+                        expected = (configured_root / job_id).resolve()
+                        if resolved == configured_root or resolved != expected:
+                            reason = "输出路径与当前配置根或任务 ID 不匹配，仅删除记录。"
+                        elif self._history_output_conflict(resolved, job_id, records.values()):
+                            reason = "输出目录与其他任务共享或嵌套，仅删除记录。"
+                        elif self._local_material_is_protected(row, resolved):
+                            reason = "输出包含受保护的本地素材，仅删除记录。"
+                        elif _path_contains_reparse(output):
+                            reason = "输出目录包含符号链接或 reparse point，仅删除记录。"
+                        else:
+                            manifest = resolved / "job_manifest.json"
+                            if manifest.exists():
+                                try:
+                                    data = json.loads(manifest.read_text(encoding="utf-8"))
+                                except (OSError, ValueError, json.JSONDecodeError):
+                                    reason = "任务清单无法验证，仅删除记录。"
+                                else:
+                                    if str(data.get("job_id") or "") != job_id:
+                                        reason = "任务清单与任务 ID 不一致，仅删除记录。"
+                            if reason is None:
+                                item["disposition"] = "verified_files"
+                                item["reason"] = "已验证任务目录、清单和所有权，可删除输出。"
+                                if resolved.is_dir():
+                                    for file in sorted(resolved.rglob("*")):
+                                        if file.is_file():
+                                            size = file.stat().st_size
+                                            item["files"].append({"path": file.relative_to(resolved).as_posix(), "name": file.name, "size": size, "mtime_ns": file.stat().st_mtime_ns})
+                                            item["bytes"] += size
+                    if reason is not None:
+                        item["reason"] = reason
+                rows.append(item)
+            plan: dict[str, Any] = {"mode": mode, "job_ids": ids, "tasks": rows, "task_count": len(rows), "file_count": sum(len(row["files"]) for row in rows), "bytes": sum(row["bytes"] for row in rows), "verified_files_count": sum(row["disposition"] == "verified_files" for row in rows), "record_only_required_count": sum(row["disposition"] == "record_only_required" for row in rows)}
+            plan["fingerprint"] = self._history_fingerprint(plan)
+            return plan
+
+    @staticmethod
+    def _history_output_conflict(path: Path, job_id: str, records: Any) -> bool:
+        for row in records:
+            other_id = str(row.get("id") or "")
+            if other_id == job_id or not row.get("output_dir"):
+                continue
+            try:
+                other = Path(str(row["output_dir"])).expanduser().resolve()
+                if other == path or path in other.parents or other in path.parents:
+                    return True
+            except OSError:
+                return True
+        return False
+
+    def _local_material_is_protected(self, record: dict[str, Any], output: Path) -> bool:
+        """Never recursively delete a directory that may contain an imported source."""
+        if str(record.get("source_url") or "").strip():
+            return False
+        values: list[str] = []
+        artifacts = record.get("artifacts")
+        if isinstance(artifacts, dict):
+            for key in ("original_video", "source"):
+                value = artifacts.get(key)
+                if isinstance(value, str) and value.strip():
+                    values.append(value)
+        live = self._jobs.get(str(record.get("id") or ""))
+        if live and live.material.path:
+            values.append(str(live.material.path))
+        for value in values:
+            try:
+                candidate = Path(value).expanduser().resolve()
+                if candidate == output or output in candidate.parents:
+                    return True
+            except OSError:
+                return True
+        return False
+
+    def output_paths_active(self, paths: list[Path]) -> bool:
+        """Check output targets against persisted and live active task state."""
+        targets = [path.expanduser().resolve() for path in paths]
+        with self._lock:
+            active_dirs: list[Path] = []
+            for record in job_db.list_jobs(None):
+                if record.get("status") not in {"queued", "running", "preparing", "cancelling"} or not record.get("output_dir"):
+                    continue
+                active_dirs.append(Path(str(record["output_dir"])).expanduser().resolve())
+            for job in self._jobs.values():
+                if job.status in {"queued", "running", "preparing", "cancelling"} and job.work_dir:
+                    active_dirs.append(job.work_dir.expanduser().resolve())
+            if self._running_id and self._running_id in self._jobs and self._jobs[self._running_id].work_dir:
+                active_dirs.append(self._jobs[self._running_id].work_dir.expanduser().resolve())
+        return any(target == active or active in target.parents for target in targets for active in active_dirs)
+
+    def delete_history(self, job_ids: list[str], mode: str, fingerprint: str | None = None, *, allow_many: bool = False) -> dict[str, Any]:
+        with self._lock:
+            plan = self.history_delete_plan(job_ids, mode, allow_many=allow_many)
+            if mode == "record_and_outputs" and not fingerprint:
+                raise ValueError("Output deletion requires a non-empty preview fingerprint.")
+            if fingerprint and not hmac.compare_digest(str(fingerprint), str(plan["fingerprint"])):
+                raise RuntimeError("删除预览已过期，请刷新后重新确认。")
+            results: list[dict[str, Any]] = []
+            deleted_bytes = 0
+            for row in plan["tasks"]:
+                job_id = row["id"]
+                output_removed = False
+                try:
+                    if mode == "record_and_outputs" and row.get("disposition") == "verified_files":
+                        output = Path(row["output_dir"]).expanduser()
+                        if output.exists():
+                            delete_paths([output], output.parent)
+                        output_removed = True
+                    if job_db.delete_jobs([job_id]) != 1:
+                        raise RuntimeError("任务记录已发生变化，请刷新后重试。")
+                except Exception as exc:
+                    LOGGER.exception("Failed to delete history item %s", job_id)
+                    results.append({
+                        "id": job_id, "title": row["title"],
+                        "status": "partial" if output_removed or mode == "record_and_outputs" else "failed",
+                        "record_removed": False, "bytes": 0, "error": str(exc),
+                    })
+                    continue
+                self._deleted_history_ids.add(job_id)
+                self._jobs.pop(job_id, None)
+                bytes_removed = row["bytes"] if mode == "record_and_outputs" else 0
+                deleted_bytes += bytes_removed
+                results.append({"id": job_id, "title": row["title"], "status": "deleted", "record_removed": True, "bytes": bytes_removed, "error": None})
+            deleted_ids = [item["id"] for item in results if item["record_removed"]]
+            return {**plan, "deleted": len(deleted_ids), "deleted_ids": deleted_ids, "deleted_bytes": deleted_bytes, "results": results}
 
     def full_logs(self, job_id: str, limit: int = 5000) -> dict[str, Any]:
         job = self.get(job_id)
@@ -864,8 +1198,13 @@ class WorkbenchJobs:
             material = self._materials.get(material_id)
             if material is None or material.path is None or not material.path.exists():
                 raise RuntimeError("所选素材不存在或已被删除，请重新选择素材。")
-            job_id = uuid.uuid4().hex[:12]
             output_root = _resolve_output_root(options["output_dir"])
+            job_id = allocate_job_folder_name(
+                output_root,
+                title=str(options.get("title") or material.name or ""),
+                source_url=getattr(material, "source_url", None),
+                source_name=material.name,
+            )
             job = DemoJob(job_id, material, device, compute_type, options, output_root, work_dir=output_root / job_id)
             job.work_dir.mkdir(parents=True, exist_ok=True)
             job.artifacts.source, job.artifacts.source_kind = str(material.path), "file"
@@ -895,8 +1234,13 @@ class WorkbenchJobs:
                 duration_seconds=None, width=None, height=None, authorized=True,
                 source_url=source_url,
             )
-            job_id = uuid.uuid4().hex[:12]
             output_root = _resolve_output_root(options["output_dir"])
+            job_id = allocate_job_folder_name(
+                output_root,
+                title=str(options.get("title") or ""),
+                source_url=source_url,
+                source_name=host,
+            )
             job = DemoJob(job_id, material, device, compute_type, options, output_root, work_dir=output_root / job_id)
             job.work_dir.mkdir(parents=True, exist_ok=True)
             job.artifacts.source, job.artifacts.source_kind = source_url, "url"
@@ -917,9 +1261,11 @@ class WorkbenchJobs:
             cookies_from_browser=options["cookies_from_browser"], cookies_file=options["cookies_file"],
             youtube_po_token_mode=options["youtube_po_token_mode"], youtube_proxy=options["youtube_proxy"],
             download_quality=options["download_quality"], max_seconds=options["max_seconds"] if source_url else None,
+            quality_proposal=options.get("quality_proposal"),
             resource_profile=options["resource_profile"],
             subtitle_source=options["subtitle_source"],
-            prefer_platform_subtitles=options["prefer_platform_subtitles"], ocr_fallback_to_audio=True,
+            prefer_platform_subtitles=options["prefer_platform_subtitles"] and options["subtitle_source"] in {"auto", "merged"},
+            ocr_fallback_to_audio=options["subtitle_source"] == "auto",
             whisper_model_size=options["whisper_model_size"], source_language=options["source_language"],
             beam_size=options["beam_size"], ocr_interval=options["ocr_interval"],
             ocr_crop_ratio=options["ocr_crop_ratio"], ocr_min_chars=options["ocr_min_chars"],
@@ -981,12 +1327,17 @@ class WorkbenchJobs:
                     first_invalid = first_invalid or stage
             elif first_invalid is None and row.get("status") != "completed":
                 first_invalid = stage
-        job.next_stage = first_invalid
+        publish_pending = not first_invalid and job.options.get("publish_to_bilibili") and job.stages["publish"].get("status") != "completed"
+        job.next_stage = first_invalid or ("publish" if publish_pending else None)
         job.raw_video, job.rendered_video = job.artifacts.path("raw_video"), job.artifacts.path("rendered_video")
         job.edited_segments = job.artifacts.path("translated_segments") if job.artifacts.revision else None
         job.checkpoint_validation = "verified" if not first_invalid else "invalid"
         if not first_invalid and validate_stage("render", job.artifacts):
-            job.status, job.stage, job.progress = "completed", "处理完成", 100
+            if publish_pending:
+                if job.status not in {"failed", "cancelled", "interrupted"}:
+                    job.status, job.stage, job.progress = "ready", "成片完成，待投稿辅助", 100
+            else:
+                job.status, job.stage, job.progress = "completed", "处理完成", 100
 
     def _migrate_legacy_artifacts(self, job: DemoJob) -> None:
         """Upgrade v1 pointers conservatively; ambiguity never overwrites a deliverable."""
@@ -1048,19 +1399,54 @@ class WorkbenchJobs:
                 artifacts.edit_state, artifacts.last_edit = "legacy-ambiguous", "legacy"
         job.workflow_version = WORKFLOW_VERSION
 
+    @staticmethod
+    def _prepare_required_stages(job: DemoJob) -> set[str]:
+        """Return checks needed for the first incomplete workflow path."""
+        required: set[str] = set()
+        first_pending: int | None = None
+        for index, stage in enumerate(WORKFLOW_STAGES[:4]):
+            if job.stages.get(stage, {}).get("status") != "completed":
+                first_pending = index
+                break
+        if first_pending is not None:
+            required.update(WORKFLOW_STAGES[first_pending:4])
+        if job.options.get("publish_to_bilibili") and job.stages.get("publish", {}).get("status") != "completed":
+            required.add("publish")
+        return required
+
     def prepare(self, job_id: str) -> DemoJob:
-        job = self.get(job_id)
-        if not job:
-            raise RuntimeError("Task not found.")
-        if job.status in {"running", "cancelling"}:
-            raise RuntimeError("当前阶段仍在运行，不能同时执行准备检查。")
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                raise RuntimeError("Task not found.")
+            if self._running_id == job_id or job.status in {"running", "cancelling", "preparing"} or job_id in self._preparing_ids:
+                raise RuntimeError("当前阶段或准备检查仍在运行，不能同时执行准备检查。")
+            job.cancellation.reset()
+            self._preparing_ids.add(job_id)
+            job.status, job.stage = "preparing", "正在检查准备"
+            self._persist(job)
+        try:
+            return self._prepare_reserved(job)
+        finally:
+            with self._lock:
+                self._preparing_ids.discard(job_id)
+                if job.cancellation.cancelled:
+                    job.status, job.stage = "cancelled", "准备检查已取消"
+                    job.checks = []
+                elif job.status == "preparing":
+                    job.status, job.stage = "draft", "准备检查未完成"
+                self._persist(job)
+
+    def _prepare_reserved(self, job: DemoJob) -> DemoJob:
         load_dotenv(USER_DATA_ROOT / ".env", override=True)
+        self._verify_checkpoints(job)
+        required_stages = self._prepare_required_stages(job)
         payload = {
             "source_url": job.material.source_url or "", "material_id": job.material.id,
             "authorized": job.material.authorized, "device": job.device, "compute_type": job.compute_type,
             "source_height": job.material.height or 0, "options": job.options,
         }
-        base = preflight(payload, str(job.output_root))
+        base = preflight(payload, str(job.output_root), required_stages=required_stages)
         checks: list[dict[str, Any]] = []
 
         def add(check_id: str, label: str, purpose: str, status: str, message: str, action: str | None = None) -> None:
@@ -1070,11 +1456,17 @@ class WorkbenchJobs:
             })
 
         for item in base["blocking"]:
-            add(item["code"], "配置检查", "确保任务可以按当前设置运行", "blocking", item["message"], "修正设置")
+            local_dependency = item["code"] == "ollama-runtime" or item["code"] in OLLAMA_MODEL_TAGS
+            add(
+                item["code"], "本地翻译模型" if local_dependency else "配置检查",
+                "检查 Ollama 与所选模型是否已在本机就绪" if local_dependency else "确保任务可以按当前设置运行",
+                "blocking", item["message"], "打开依赖中心" if local_dependency else "修正设置",
+            )
         for item in base["warnings"]:
             add(item["code"], "配置提醒", "提前说明可能影响结果的条件", "warning", item["message"], "查看设置")
-        add("source", "素材与授权", "确认素材来源、授权和处理范围", "passed" if job.material.authorized else "blocking", "素材与授权已确认。" if job.material.authorized else "请先确认处理授权。", "返回素材")
-        if job.material.source_url:
+        if "acquire" in required_stages:
+            add("source", "素材与授权", "确认素材来源、授权和处理范围", "passed" if job.material.authorized else "blocking", "素材与授权已确认。" if job.material.authorized else "请先确认处理授权。", "返回素材")
+        if "acquire" in required_stages and job.material.source_url:
             scope = "完整视频" if job.options["max_seconds"] is None else f"前 {job.options['max_seconds']} 秒"
             add("download-scope", "下载范围与画质", "控制网络、磁盘和后续处理负载", "passed", f"将获取{scope}，画质上限为 {job.options['download_quality']}。")
             cookies_file = job.options.get("cookies_file")
@@ -1100,15 +1492,35 @@ class WorkbenchJobs:
                 job.material.name = metadata.title or job.material.name
                 job.material.duration_seconds = metadata.duration
                 job.material.width, job.material.height = metadata.max_width, metadata.max_height
-                add("source-access", "链接访问测试", "在下载媒体前验证链接、登录会话和网络出口", "passed", f"链接可访问：{metadata.title or job.material.name}。")
-        ffmpeg = resolve_command("ffmpeg")
-        ffprobe = resolve_command("ffprobe")
-        add("ffmpeg", "FFmpeg", "提取音频并渲染字幕", "passed" if ffmpeg else "blocking", "已检测到 FFmpeg。" if ffmpeg else "缺少 FFmpeg。", "安装 FFmpeg")
-        add("ffprobe", "媒体检查器", "验证下载和检查点文件没有损坏", "passed" if ffprobe else "blocking", "已检测到 ffprobe。" if ffprobe else "缺少 ffprobe；通常随 FFmpeg 一起安装。", "安装 FFmpeg")
+                proposal = getattr(metadata, "quality_proposal", None)
+                if proposal:
+                    previous = job.options.get("quality_proposal")
+                    proposal = _carry_quality_baseline(proposal, previous if isinstance(previous, dict) else None)
+                    proposal["fingerprint"] = self._quality_fingerprint(job, proposal)
+                    job.options["quality_proposal"] = proposal
+                    if not isinstance(previous, dict) or previous.get("fingerprint") != proposal["fingerprint"]:
+                        job.options["quality_consent"] = False
+                    if not proposal.get("width") or not proposal.get("height"):
+                        job.options.pop("quality_proposal", None)
+                        job.options.pop("quality_consent", None)
+                        add("source-access", "链接访问测试", "在下载媒体前验证链接、登录会话和网络出口", "blocking", "链接可访问，但无法确定可下载的视频流；请重新读取链接或检查访问设置。", "返回素材")
+                    else:
+                        add("source-access", "链接访问测试", "在下载媒体前验证链接、登录会话和网络出口", "passed", f"链接可访问：{metadata.title or job.material.name}。")
+                elif hasattr(metadata, "quality_proposal"):
+                    add("source-access", "链接访问测试", "在下载媒体前验证链接、登录会话和网络出口", "blocking", "无法确定服务器拟下载的视频流；请重新读取链接。", "返回素材")
+                else:
+                    add("source-access", "链接访问测试", "在下载媒体前验证链接、登录会话和网络出口", "passed", f"链接可访问：{metadata.title or job.material.name}。")
+        if required_stages & {"extract", "render"}:
+            ffmpeg = resolve_command("ffmpeg")
+            ffprobe = resolve_command("ffprobe")
+            add("ffmpeg", "FFmpeg", "提取音频并渲染字幕", "passed" if ffmpeg else "blocking", "已检测到 FFmpeg。" if ffmpeg else "缺少 FFmpeg。", "安装 FFmpeg")
+            add("ffprobe", "媒体检查器", "验证下载和检查点文件没有损坏", "passed" if ffprobe else "blocking", "已检测到 ffprobe。" if ffprobe else "缺少 ffprobe；通常随 FFmpeg 一起安装。", "安装 FFmpeg")
         mode = job.options["subtitle_source"]
-        needs_whisper = mode in {"audio", "auto", "merged"} or mode == "ocr"
-        if needs_whisper:
+        needs_whisper = mode in {"audio", "auto", "merged"}
+        whisper_check_id: str | None = None
+        if "extract" in required_stages and needs_whisper:
             size = job.options["whisper_model_size"]
+            whisper_check_id = f"whisper-{size}"
             try:
                 require_whisper_model(size, USER_DATA_ROOT)
             except RuntimeError as exc:
@@ -1116,7 +1528,7 @@ class WorkbenchJobs:
                 add(f"whisper-{size}", f"Whisper {size}", "把语音转换成带时间轴的源字幕", "blocking", str(exc), action)
             else:
                 add(f"whisper-{size}", f"Whisper {size}", "把语音转换成带时间轴的源字幕", "passed", "模型文件完整。")
-        if mode in {"ocr", "merged"}:
+        if "extract" in required_stages and mode in {"ocr", "merged"}:
             tesseract = resolve_command("tesseract")
             add("tesseract", "Tesseract OCR", "读取画面中已有的字幕文字", "passed" if tesseract else "blocking", "OCR 引擎可用。" if tesseract else "当前字幕来源需要 OCR，但未安装 Tesseract。", "安装 Tesseract")
             if tesseract:
@@ -1129,12 +1541,16 @@ class WorkbenchJobs:
                     f"已选择 {language}，语言数据完整。" if not missing else f"缺少语言包：{', '.join(missing)}。当前已安装：{', '.join(sorted(installed)) or '未知'}。",
                     "更改 OCR 语言" if missing else None,
                 )
-        provider = job.options["translator"]
-        key_name = "DEEPSEEK_API_KEY" if provider == "deepseek" else "OPENAI_API_KEY" if provider == "openai" else ""
-        key_ready = not key_name or bool(os.getenv(key_name))
-        connection_ready, connection_message = _probe_translation_service(provider) if key_ready else (False, f"缺少 {provider} API Key。")
-        add("translator", "翻译服务", "生成中文字幕并校正表达", "passed" if connection_ready else "blocking", connection_message, "打开设置" if not connection_ready else None)
-        if job.device == "cuda":
+        if "translate" in required_stages:
+            provider = job.options["translator"]
+            key_name = "DEEPSEEK_API_KEY" if provider == "deepseek" else "OPENAI_API_KEY" if provider == "openai" else ""
+            key_ready = not key_name or bool(os.getenv(key_name))
+            if provider != "ollama" or not any(item["code"] == "ollama-runtime" or item["code"] in OLLAMA_MODEL_TAGS for item in base["blocking"]):
+                connection_ready, connection_message = _probe_translation_service(
+                    provider, job.options.get("translate_model"),
+                ) if key_ready else (False, f"缺少 {provider} API Key。")
+                add("translator", "翻译服务", "生成中文字幕并校正表达", "passed" if connection_ready else "blocking", connection_message, "打开设置" if not connection_ready else None)
+        if "extract" in required_stages and needs_whisper and job.device == "cuda":
             cuda = cuda_runtime_status()
             cuda_ready = bool(cuda["available"])
             add(
@@ -1142,31 +1558,51 @@ class WorkbenchJobs:
                 "passed" if cuda_ready else "blocking", str(cuda["message"]),
                 "改用 CPU" if not cuda_ready else None,
             )
-        encoder = job.options["render_encoder"]
-        encoders = render_encoder_status()
-        encoder_ready = encoders["nvidia"] if encoder == "nvidia" else encoders["cpu"] or (encoder == "auto" and encoders["nvidia"])
-        add("encoder", "渲染编码器", "把中文字幕烧录到最终视频", "passed" if encoder_ready else "blocking", "渲染编码器可用。" if encoder_ready else "当前渲染编码器不可用。", "更改编码器")
-        try:
-            job.output_root.mkdir(parents=True, exist_ok=True)
-            probe = job.output_root / ".write-test"
-            probe.write_bytes(b"ok"); probe.unlink()
-            free = shutil.disk_usage(job.output_root).free
-            estimate = max(512 * 1024 * 1024, int((job.material.duration_seconds or job.options.get("max_seconds") or 600) * 8 * 1024 * 1024))
-            disk_status = "passed" if free >= estimate else "blocking"
-            add("output", "输出空间", "保存原视频、中间字幕和最终成片", disk_status, f"可用 {format_bytes(free)}，预计至少需要 {format_bytes(estimate)}。", "更改输出目录" if disk_status == "blocking" else None)
-        except OSError as exc:
-            add("output", "输出目录", "保存任务产物", "blocking", f"输出目录不可写：{exc}", "更改输出目录")
+        if "render" in required_stages:
+            encoder = job.options["render_encoder"]
+            encoders = render_encoder_status()
+            encoder_ready = encoders["nvidia"] if encoder == "nvidia" else encoders["cpu"] or (encoder == "auto" and encoders["nvidia"])
+            add("encoder", "渲染编码器", "把中文字幕烧录到最终视频", "passed" if encoder_ready else "blocking", "渲染编码器可用。" if encoder_ready else "当前渲染编码器不可用。", "更改编码器")
+        if "publish" in required_stages:
+            add("publish", "投稿配置", "确认投稿辅助可以安全打开", "warning", "发布阶段将另行检查登录状态和浏览器配置。", "打开投稿辅助")
+        if required_stages & {"acquire", "extract", "render"}:
+            try:
+                job.output_root.mkdir(parents=True, exist_ok=True)
+                probe = job.output_root / ".write-test"
+                probe.write_bytes(b"ok"); probe.unlink()
+                free = shutil.disk_usage(job.output_root).free
+                # URL jobs may be clipped by max_seconds, while local imports must
+                # reserve space for their actual duration regardless of that UI
+                # option.  Keep a conservative fallback when metadata is absent.
+                if job.material.source_url:
+                    duration = job.material.duration_seconds or job.options.get("max_seconds") or 600
+                    max_seconds = job.options.get("max_seconds")
+                    if max_seconds and job.material.duration_seconds:
+                        duration = min(duration, max_seconds)
+                else:
+                    duration = job.material.duration_seconds or 600
+                estimate = max(512 * 1024 * 1024, int(duration * 8 * 1024 * 1024))
+                disk_status = "passed" if free >= estimate else "blocking"
+                add("output", "输出空间", "保存原视频、中间字幕和最终成片", disk_status, f"可用 {format_bytes(free)}，预计至少需要 {format_bytes(estimate)}。", "更改输出目录" if disk_status == "blocking" else None)
+            except OSError as exc:
+                add("output", "输出目录", "保存任务产物", "blocking", f"输出目录不可写：{exc}", "更改输出目录")
+        if not checks:
+            add("checkpoints", "已完成阶段", "确认现有检查点仍可继续使用", "passed", "已完成阶段的检查点仍然有效。")
         # Deduplicate the older preflight messages when a richer named check exists.
-        rich_ids = {"ffmpeg", "tesseract", "ocr-language", "translator", "cuda", "encoder", "output", "source"} | {f"whisper-{size}" for size in ("tiny", "base", "small", "medium", "large-v3")}
+        rich_ids = {"ffmpeg", "tesseract", "ocr-language", "translator", "cuda", "encoder", "output", "source"}
+        if whisper_check_id:
+            rich_ids.add(whisper_check_id)
         checks = [row for index, row in enumerate(checks) if row["id"] not in rich_ids or index == max(i for i, item in enumerate(checks) if item["id"] == row["id"])]
         with self._lock:
+            if job.cancellation.cancelled or job.id not in self._preparing_ids:
+                return job
             job.checks = checks
             blocking = any(row["status"] == "blocking" for row in checks)
-            job.status, job.stage = ("draft", "准备检查未通过") if blocking else ("ready", "准备完成")
             job.error = None
-            self._verify_checkpoints(job)
-            if job.status != "completed":
-                job.status = "draft" if blocking else "ready"
+            if blocking:
+                job.status, job.stage = "draft", "准备检查未通过"
+            elif job.status != "completed":
+                job.status, job.stage = "ready", "准备完成"
         self._persist(job)
         return job
 
@@ -1174,17 +1610,23 @@ class WorkbenchJobs:
         job = self.get(job_id)
         if not job:
             raise RuntimeError("Task not found.")
-        if job.status in {"running", "cancelling"}:
+        if job.status in {"running", "cancelling", "preparing"}:
             raise RuntimeError("请先取消当前阶段，再修改方案。")
         old = {**job.options, "device": job.device, "compute_type": job.compute_type}
         incoming = payload.get("options")
         if incoming is not None and not isinstance(incoming, dict):
             raise ValueError("options must be an object.")
+        internal_quality = {key: job.options.get(key) for key in ("quality_proposal", "quality_consent") if key in job.options}
         options = _safe_options({**job.options, **(incoming or {})})
         device, compute = _validate_device_precision(
             payload.get("device", job.device), payload.get("compute_type", job.compute_type),
         )
         new = {**options, "device": device, "compute_type": compute}
+        # These server-owned fields are intentionally outside the public
+        # options schema; preserve them across unrelated style patches.
+        for key, value in internal_quality.items():
+            new[key] = value
+        options.update({key: value for key, value in internal_quality.items()})
         changed_fields = {name for name in set(old) | set(new) if old.get(name) != new.get(name)}
         stale: list[str] = []
         first = invalidation_stage(changed_fields)
@@ -1196,11 +1638,37 @@ class WorkbenchJobs:
                 job.work_dir = job.output_root / job.id
                 job.work_dir.mkdir(parents=True, exist_ok=True)
             job.options, job.device, job.compute_type = options, device, compute
+            if changed_fields & {"download_quality", "max_seconds", "require_reuse_allowed", "cookies_file", "cookies_from_browser", "youtube_proxy", "youtube_po_token_mode"}:
+                job.options.pop("quality_proposal", None)
+                job.options.pop("quality_consent", None)
             if first:
-                job.checks = []
                 stale = invalidate_downstream(job.stages, first)
                 job.next_stage = first
-                job.status, job.stage = "draft", "设置已更新，请重新检查准备"
+                job.error_code = None
+                job.suggested_action = None
+                # CC reuse is enforced at download time, not during prepare. Keep
+                # existing checks so unchecking the box can retry immediately.
+                if changed_fields <= {"require_reuse_allowed"} and job.checks:
+                    blocking = any(row.get("status") == "blocking" for row in job.checks)
+                    job.status = "draft" if blocking else "ready"
+                    job.stage = (
+                        "已开启仅接受 CC reuse allowed，可重新获取素材"
+                        if options["require_reuse_allowed"]
+                        else "已关闭 CC 限制，可重新获取素材"
+                    )
+                elif first in {"render", "publish"} and job.checks:
+                    # Subtitle style / publish copy changes must not wipe the
+                    # preparation centre the user already passed.
+                    blocking = any(row.get("status") == "blocking" for row in job.checks)
+                    job.status = "draft" if blocking else "ready"
+                    job.stage = (
+                        "字幕样式已更新，可重新渲染"
+                        if first == "render"
+                        else "发布设置已更新"
+                    )
+                else:
+                    job.checks = []
+                    job.status, job.stage = "draft", "设置已更新，请重新检查准备"
             elif changed_fields:
                 job.stage = "资源模式已更新" if changed_fields == {"resource_profile"} else "设置已更新"
             job.error = None
@@ -1214,6 +1682,48 @@ class WorkbenchJobs:
     def _checks_ready(self, job: DemoJob) -> bool:
         return bool(job.checks) and not any(row.get("status") == "blocking" for row in job.checks)
 
+    @staticmethod
+    def _quality_fingerprint(job: DemoJob, proposal: dict[str, Any]) -> str:
+        payload = {
+            "job_id": job.id,
+            "source": job.material.source_url or job.artifacts.source,
+            "quality": job.options.get("download_quality"),
+            "max_seconds": job.options.get("max_seconds"),
+            "cookies_from_browser": job.options.get("cookies_from_browser"),
+            "cookies_file": bool(job.options.get("cookies_file")),
+            "youtube_po_token_mode": job.options.get("youtube_po_token_mode"),
+            "youtube_proxy_configured": bool(job.options.get("youtube_proxy")),
+            "require_reuse_allowed": bool(job.options.get("require_reuse_allowed")),
+            "proposal": {key: proposal.get(key) for key in ("width", "height", "has_audio", "baseline_width", "baseline_height")},
+        }
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+    def _require_quality_consent(self, job: DemoJob, stages: list[str] | None = None) -> None:
+        if not job.material.source_url or (stages and "acquire" not in stages and job.stages.get("acquire", {}).get("status") == "completed"):
+            return
+        proposal = job.options.get("quality_proposal")
+        if not isinstance(proposal, dict) or not proposal.get("fingerprint"):
+            raise RuntimeError("请先准备素材并确认服务器提供的画质方案。")
+        if not proposal.get("width") or not proposal.get("height"):
+            raise RuntimeError("服务器无法确定可下载的视频流，请重新准备或检查链接。")
+        if proposal.get("fingerprint") != self._quality_fingerprint(job, proposal):
+            raise RuntimeError("画质方案已失效，请重新准备检查。")
+        if proposal.get("requires_consent") is not True:
+            return
+        if job.options.get("quality_consent") is not True:
+            raise RuntimeError("下载画质方案尚未确认，请先明确同意后再开始。")
+
+    def confirm_quality(self, job_id: str, fingerprint: str) -> DemoJob:
+        job = self.get(job_id)
+        if not job or not job.material.source_url:
+            raise RuntimeError("当前任务不需要 URL 画质确认。")
+        proposal = job.options.get("quality_proposal")
+        if not isinstance(proposal, dict) or fingerprint != proposal.get("fingerprint") or fingerprint != self._quality_fingerprint(job, proposal):
+            raise RuntimeError("画质方案已失效，请重新准备检查后再确认。")
+        job.options["quality_consent"] = True
+        self._persist(job)
+        return job
+
     def run_stage(self, job_id: str, stage: str) -> DemoJob:
         job = self.get(job_id)
         if not job:
@@ -1222,6 +1732,7 @@ class WorkbenchJobs:
             raise ValueError("Unknown workflow stage.")
         if not self._checks_ready(job):
             raise RuntimeError("请先完成“开始前准备”检查并解决阻断项。")
+        self._require_quality_consent(job, [stage])
         if not self._prerequisites_complete(job, stage):
             raise RuntimeError("上一个阶段尚未完成，不能跳过执行。")
         return self._start_stage_sequence(job, [stage], auto_run=False)
@@ -1232,9 +1743,22 @@ class WorkbenchJobs:
             raise RuntimeError("Task not found.")
         if not self._checks_ready(job):
             raise RuntimeError("请先完成“开始前准备”检查并解决阻断项。")
-        stages = [name for name in WORKFLOW_STAGES[:4] if job.stages[name].get("status") != "completed"]
+        with self._lock:
+            if self._running_id or job.status in {"running", "cancelling", "preparing"} or job.id in self._preparing_ids:
+                raise RuntimeError("已有耗资源阶段在运行，请等待或先取消。")
+        # Re-check artifacts at the point of execution.  A file can disappear
+        # or become corrupt after prepare (including while the app was closed).
+        self._verify_checkpoints(job)
+        self._persist(job)
+        first_pending = next(
+            (index for index, name in enumerate(WORKFLOW_STAGES[:4])
+             if job.stages[name].get("status") != "completed"),
+            None,
+        )
+        stages = WORKFLOW_STAGES[first_pending:4] if first_pending is not None else []
         if not stages:
             return job
+        self._require_quality_consent(job, stages)
         first = stages[0]
         if not self._prerequisites_complete(job, first):
             raise RuntimeError("检查点不连续，请先重新运行最早失效阶段。")
@@ -1245,23 +1769,57 @@ class WorkbenchJobs:
         if not job:
             raise RuntimeError("Task not found.")
         self._verify_checkpoints(job)
+        if job.next_stage == "publish":
+            raise RuntimeError("投稿辅助可能已上传视频；请先到 B 站创作中心核对草稿，再手动重试投稿辅助。")
         if not job.next_stage:
             self._persist(job)
             return job
         if not self._checks_ready(job):
             raise RuntimeError("恢复前需要重新执行准备检查，确认环境与配置仍然可用。")
+        self._require_quality_consent(job, [job.next_stage] if job.next_stage else None)
         return self.run_stage(job_id, job.next_stage)
 
     def _start_stage_sequence(self, job: DemoJob, stages: list[str], *, auto_run: bool) -> DemoJob:
+        self._require_quality_consent(job, stages)
+        previous_state: dict[str, Any] | None = None
         with self._lock:
-            if self._running_id:
-                raise RuntimeError("已有耗资源阶段在运行，请等待或先取消。")
+            if self._running_id or job.status in {"preparing", "cancelling"} or job.id in self._preparing_ids:
+                raise RuntimeError("准备检查或耗资源阶段正在运行，请等待或先取消。")
+            previous_state = {
+                "status": job.status, "stage": job.stage, "error": job.error,
+                "current_stage": job.current_stage, "started_at": job.started_at,
+                "finished_at": job.finished_at, "next_stage": job.next_stage,
+                "auto_run": job.auto_run, "progress": job.progress,
+                "stages": copy.deepcopy(job.stages),
+            }
+            # Re-running a stage must invalidate it and everything after, otherwise
+            # translate/render can remain "completed" and be skipped after extract.
+            if stages:
+                invalidate_downstream(job.stages, stages[0])
+                job.next_stage = stages[0]
             job.cancellation.reset()
             job.auto_run, job.current_stage = auto_run, stages[0]
             job.status, job.stage, job.error = "running", WORKFLOW_STAGE_LABELS[stages[0]], None
             job.started_at, job.finished_at = time.time(), None
             self._running_id = job.id
-        self._persist(job)
+        try:
+            self._persist(job)
+        except Exception:
+            with self._lock:
+                if previous_state is not None:
+                    job.status = previous_state["status"]
+                    job.stage = previous_state["stage"]
+                    job.error = previous_state["error"]
+                    job.current_stage = previous_state["current_stage"]
+                    job.started_at = previous_state["started_at"]
+                    job.finished_at = previous_state["finished_at"]
+                    job.next_stage = previous_state["next_stage"]
+                    job.auto_run = previous_state["auto_run"]
+                    job.progress = previous_state["progress"]
+                    job.stages = previous_state["stages"]
+                if self._running_id == job.id:
+                    self._running_id = None
+            raise
         worker = threading.Thread(target=self._run_stage_sequence, args=(job, stages), daemon=True, name=f"workflow-{job.id}")
         with self._lock:
             self._worker = worker
@@ -1269,9 +1827,6 @@ class WorkbenchJobs:
         return job
 
     def _run_stage_sequence(self, job: DemoJob, stages: list[str]) -> None:
-        load_dotenv(USER_DATA_ROOT / ".env", override=True)
-        options = self._pipeline_options(job)
-
         def log(message: str) -> None:
             with self._lock:
                 job.add_log(message)
@@ -1288,34 +1843,71 @@ class WorkbenchJobs:
                     job.stages[job.current_stage]["progress"] = int(max(0, min(1, fraction)) * 100)
 
         try:
+            load_dotenv(USER_DATA_ROOT / ".env", override=True)
+            options = self._pipeline_options(job)
             for stage in stages:
                 with self._lock:
                     job.current_stage, job.stage = stage, WORKFLOW_STAGE_LABELS[stage]
                     row = job.stages[stage]
-                    row.update({"status": "running", "progress": 0, "error": None, "started_at": time.time(), "finished_at": None})
+                    row.update({
+                        "status": "running", "progress": 0, "error": None,
+                        "error_code": None, "recovery": None,
+                        "started_at": time.time(), "finished_at": None,
+                    })
+                    job.error, job.error_code, job.suggested_action = None, None, None
                     job.add_log(f"Stage started: {WORKFLOW_STAGE_LABELS[stage]}")
                 self._persist(job)
-                job.artifacts = run_workflow_stage(
-                    stage, options, job.work_dir, job.artifacts,  # type: ignore[arg-type]
+                # Stage runners update artifacts incrementally. Keep that
+                # mutation isolated until the stage returns successfully so a
+                # cancellation/failure cannot replace a known-good pointer.
+                candidate_artifacts = copy.deepcopy(job.artifacts)
+                candidate_artifacts = run_workflow_stage(
+                    stage, options, job.work_dir, candidate_artifacts,  # type: ignore[arg-type]
                     PipelineContext(job.cancellation, on_event), log, stage_progress,
                 )
+                previous_artifacts = job.artifacts
+                previous_result = copy.deepcopy(job.result)
+                previous_next_stage = job.next_stage
+                previous_stage_row = copy.deepcopy(job.stages[stage])
+                with self._lock:
+                    job.artifacts = candidate_artifacts
                 with self._lock:
                     row = job.stages[stage]
-                    row.update({"status": "completed", "progress": 100, "error": None, "finished_at": time.time(), "config_fingerprint": self._config_fingerprint(job)})
+                    row.update({
+                        "status": "completed", "progress": 100, "error": None,
+                        "error_code": None, "recovery": None,
+                        "finished_at": time.time(), "config_fingerprint": self._config_fingerprint(job),
+                    })
                     job.raw_video, job.rendered_video = job.artifacts.path("raw_video"), job.artifacts.path("rendered_video")
                     next_index = WORKFLOW_STAGES.index(stage) + 1
                     job.next_stage = next((name for name in WORKFLOW_STAGES[next_index:4] if job.stages[name].get("status") != "completed"), None)
+                    if not job.next_stage and job.options.get("publish_to_bilibili") and job.stages["publish"].get("status") != "completed":
+                        job.next_stage = "publish"
                     job.result = {
                         "output_dir": public_path(job.work_dir) or "",
                         "source_srt": public_path(job.artifacts.path("source_srt")) or "" if job.artifacts.path("source_srt") else "",
                         "translated_srt": public_path(job.artifacts.path("translated_srt")) or "" if job.artifacts.path("translated_srt") else "",
                         "rendered_video": public_path(job.rendered_video) or "" if job.rendered_video else "",
                     }
-                self._persist(job)
+                try:
+                    self._persist(job)
+                except Exception:
+                    # SQLite is authoritative: do not leave an unpersisted
+                    # candidate pointer claiming a completed stage.
+                    with self._lock:
+                        job.artifacts = previous_artifacts
+                        job.raw_video = previous_artifacts.path("raw_video")
+                        job.rendered_video = previous_artifacts.path("rendered_video")
+                        job.result = previous_result
+                        job.next_stage = previous_next_stage
+                        job.stages[stage] = previous_stage_row
+                    raise
             with self._lock:
                 job.current_stage, job.auto_run = None, False
                 job.finished_at = time.time()
-                if job.stages["render"].get("status") == "completed":
+                if job.stages["render"].get("status") == "completed" and job.next_stage == "publish":
+                    job.status, job.stage, job.progress = "ready", "成片完成，待投稿辅助", 100
+                elif job.stages["render"].get("status") == "completed":
                     job.status, job.stage, job.progress = "completed", "处理完成", 100
                 else:
                     job.status, job.stage = "ready", "阶段完成，等待下一步"
@@ -1324,21 +1916,53 @@ class WorkbenchJobs:
             with self._lock:
                 stage = job.current_stage
                 if stage:
-                    job.stages[stage].update({"status": "cancelled", "error": None, "finished_at": time.time()})
+                    job.stages[stage].update({"status": "cancelled", "error": None, "error_code": None, "recovery": None, "finished_at": time.time()})
                     job.next_stage = stage
                 job.status, job.stage, job.finished_at, job.auto_run = "cancelled", "当前阶段已取消", time.time(), False
+                job.error, job.error_code, job.suggested_action = None, None, None
                 job.add_log("Current stage was cancelled; completed checkpoints were kept.")
         except Exception as exc:
             traceback.print_exc()
             with self._lock:
                 stage = job.current_stage
                 if stage:
-                    job.stages[stage].update({"status": "failed", "error": str(exc), "finished_at": time.time()})
+                    error_code, suggested_action = _classify_job_error(exc)
+                    row = job.stages[stage]
+                    row.update({
+                        "status": "failed", "error": str(exc), "error_code": error_code,
+                        "recovery": _recovery_for_error(exc, stage, job), "finished_at": time.time(),
+                    })
                     job.next_stage = stage
+                else:
+                    error_code, suggested_action = _classify_job_error(exc)
                 job.status, job.stage, job.error = "failed", f"{WORKFLOW_STAGE_LABELS.get(stage or '', '阶段')}失败", str(exc)
-                job.error_code, job.suggested_action = _classify_job_error(exc)
+                job.error_code, job.suggested_action = error_code, suggested_action
                 job.finished_at, job.auto_run = time.time(), False
                 job.add_log(f"Stage failed: {exc}")
+        except BaseException as exc:
+            traceback.print_exc()
+            stage = job.current_stage or (stages[0] if stages else None)
+            detail = str(exc).strip()
+            error = f"工作线程异常终止（{type(exc).__name__}）"
+            if detail:
+                error += f"：{detail}"
+            with self._lock:
+                if stage:
+                    job.stages[stage].update({
+                        "status": "failed", "error": error,
+                        "error_code": "worker_terminated",
+                        "recovery": "已完成的阶段成果保留；请重试当前阶段。",
+                        "finished_at": time.time(),
+                    })
+                    job.next_stage = stage
+                job.status = "failed"
+                job.stage = f"{WORKFLOW_STAGE_LABELS.get(stage or '', '工作流程')}失败"
+                job.error, job.error_code = error, "worker_terminated"
+                job.suggested_action = "已完成的阶段成果保留；查看错误详情后重试当前阶段。"
+                job.finished_at, job.auto_run = time.time(), False
+                job.add_log(f"工作线程异常终止：{type(exc).__name__}" + (f": {detail}" if detail else ""))
+            LOGGER.error("Workflow worker terminated unexpectedly for job %s", job.id, exc_info=(type(exc), exc, exc.__traceback__))
+            raise
         finally:
             with self._lock:
                 if self._running_id == job.id:
@@ -1346,12 +1970,21 @@ class WorkbenchJobs:
                 if self._worker is threading.current_thread():
                     self._worker = None
                 job.current_stage = None
-            self._persist(job)
+            try:
+                self._persist(job)
+            except Exception as exc:
+                with self._lock:
+                    job.status = "failed"
+                    job.stage = "结果保存失败"
+                    job.error = f"无法保存任务最终状态：{exc}"
+                    job.error_code = "persistence_failed"
+                    job.add_log(f"Final persistence failed: {exc}")
+                LOGGER.exception("Could not persist final state for job %s", job.id)
 
     def cancel(self, job_id: str) -> DemoJob | None:
         with self._lock:
             job = self._jobs.get(job_id)
-            if job and job.status in {"queued", "running"}:
+            if job and (job.status in {"queued", "running", "preparing"} or job.id in self._preparing_ids or self._running_id == job.id):
                 job.status, job.stage = "cancelling", "正在取消当前阶段"
                 job.add_log("Cancellation requested from workbench.")
                 job.cancellation.cancel()
@@ -1372,18 +2005,62 @@ class WorkbenchJobs:
     def publish_file_metadata(self, token: str) -> dict[str, Any]:
         with self._lock:
             video = self._native_publish_files.get(token)
+            associated_metadata = next(
+                (job.artifacts.path("publish_metadata") for job in self._jobs.values()
+                 if job.artifacts.path("rendered_video") and job.artifacts.path("rendered_video").resolve() == video.resolve()
+                 and job.artifacts.path("publish_metadata") and job.artifacts.path("publish_metadata").is_file()),
+                None,
+            ) if video else None
+            if video and associated_metadata is None:
+                # Native file selection can happen before its task is restored
+                # into memory after a restart. Consult persisted artifacts, but
+                # require an exact rendered-video pointer match.
+                for record in job_db.list_jobs(None):
+                    artifacts = record.get("artifacts") if isinstance(record.get("artifacts"), dict) else {}
+                    rendered = artifacts.get("rendered_video")
+                    metadata = artifacts.get("publish_metadata")
+                    if not isinstance(rendered, str) or not isinstance(metadata, str):
+                        continue
+                    try:
+                        if Path(rendered).expanduser().resolve() == video.resolve() and Path(metadata).is_file():
+                            associated_metadata = Path(metadata)
+                            break
+                    except OSError:
+                        continue
         if video is None or not video.exists():
             raise ValueError("The selected video is no longer available. Choose it again.")
-        title, tags = video.stem, []
-        metadata_path = video.parent / "publish_metadata.json"
-        if metadata_path.exists():
-            try:
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                title = str(metadata.get("title") or title).strip() or title
-                tags = [str(tag).strip() for tag in metadata.get("tags") or [] if str(tag).strip()]
-            except (OSError, ValueError, json.JSONDecodeError):
-                pass
-        return {"token": token, "name": video.name, "title": title, "tags": tags, "has_metadata": metadata_path.exists()}
+        copy = _read_publish_metadata(associated_metadata or video.parent / "publish_metadata.json")
+        return {
+            "token": token,
+            "name": video.name,
+            "title": copy["title"] or video.stem,
+            "tags": copy["tags"],
+            "has_metadata": copy["has_metadata"],
+        }
+
+    def refresh_publish_metadata(self, job: DemoJob) -> dict[str, Any]:
+        work_dir = job.work_dir
+        if work_dir is None:
+            raise ValueError("当前任务还没有输出目录。")
+        source_path = job.artifacts.path("source_segments") or work_dir / "segments.source.json"
+        translated_path = job.artifacts.path("translated_segments") or work_dir / "segments.translated.json"
+        source_items = load_segments(source_path) if source_path.is_file() else []
+        translated_items = load_segments(translated_path) if translated_path.is_file() else []
+        if not source_items and not translated_items:
+            raise ValueError("还没有字幕，无法生成投稿标题和标签。")
+        metadata = generate_publish_metadata(
+            source_title=str(job.options.get("title") or job.artifacts.title or job.material.name),
+            source_description=job.artifacts.description,
+            source_segments=source_items,
+            translated_segments=translated_items or source_items,
+            provider=str(job.options.get("translator") or "none"),
+            target_lang=str(job.options.get("target_lang") or "zh-Hans"),
+            model=job.options.get("translate_model"),
+        )
+        metadata_path = save_publish_metadata(work_dir / "publish_metadata.json", metadata)
+        job.artifacts.publish_metadata = str(metadata_path)
+        self._persist(job)
+        return {"title": metadata.title, "tags": metadata.tags, "has_metadata": True, "generated": True}
 
     def publish_file_from_token(self, token: str) -> Path | None:
         with self._lock:
@@ -1392,25 +2069,46 @@ class WorkbenchJobs:
 
     def cues(self, job_id: str) -> dict[str, Any]:
         job = self.get(job_id)
-        if job is None or job.work_dir is None:
+        if job is None:
             raise RuntimeError("Subtitle data is not ready yet.")
-        translated_file = job.edited_segments or job.artifacts.path("translated_segments") or job.work_dir / "segments.translated.json"
-        translated_ready = translated_file.exists()
-        if translated_ready:
-            translated = load_segments(translated_file)
-        else:
-            source_file = job.work_dir / "segments.source.json"
-            if not source_file.exists():
-                # 转写/OCR 尚未完成
-                raise RuntimeError("Subtitle data is not ready yet.")
-            translated = load_segments(source_file)  # 翻译中：原文预览
+        translated_pointer = job.edited_segments or job.artifacts.path("translated_segments")
+        source_pointer = job.artifacts.path("source_segments")
+        if translated_pointer and not translated_pointer.exists():
+            raise RuntimeError("Subtitle data is invalid; a committed subtitle file is missing.")
+        if source_pointer and not source_pointer.exists() and not translated_pointer:
+            raise RuntimeError("Subtitle data is invalid; a committed subtitle file is missing.")
+        if job.work_dir is None and not (translated_pointer or source_pointer):
+            return {"cues": [], "ready": False, "translation_ready": False}
+        translated_file = translated_pointer or (job.work_dir / "segments.translated.json" if job.work_dir else None)
+        translated_ready = bool(translated_file and translated_file.exists())
+        try:
+            if translated_ready:
+                translated = load_segments(translated_file)  # type: ignore[arg-type]
+            else:
+                source_file = source_pointer or (job.work_dir / "segments.source.json" if job.work_dir else None)
+                if source_file is None or not source_file.exists():
+                    # A valid draft simply has no subtitle data yet.
+                    return {"cues": [], "ready": False, "translation_ready": False}
+                translated = load_segments(source_file)  # 翻译中：原文预览
+        except (OSError, TypeError, ValueError) as exc:
+            raise RuntimeError("Subtitle data is invalid; please rerun subtitle extraction.") from exc
         # 以当前数据为准：时间轴随编辑/裁剪/保留/重排变化，text 始终是原文
         audio_texts: set[str] = set()
         ocr_texts: set[str] = set()
+        attempt_parent = job.artifacts.path("source_segments")
+        attempt_parent = attempt_parent.parent if attempt_parent else (
+            translated_pointer.parent if translated_pointer else job.work_dir
+        )
         for name in ("segments.audio.json", "segments.ocr.json"):
-            path = job.work_dir / name
+            path = attempt_parent / name
+            if not path.exists() and job.work_dir is not None:
+                path = job.work_dir / name
             if path.exists():
-                for segment in load_segments(path):
+                try:
+                    auxiliary_segments = load_segments(path)
+                except (OSError, TypeError, ValueError) as exc:
+                    raise RuntimeError("Subtitle data is invalid; please rerun subtitle extraction.") from exc
+                for segment in auxiliary_segments:
                     (ocr_texts if name.startswith("segments.ocr") else audio_texts).add(segment.text.strip())
         output: list[dict[str, Any]] = []
         platform_mode = job.artifacts.subtitle_extraction_mode.startswith("platform")
@@ -1429,7 +2127,7 @@ class WorkbenchJobs:
                 "translated": item.translated_text or item.text,
                 "kind": kind,
             })
-        return {"cues": output, "translation_ready": translated_ready}
+        return {"cues": output, "ready": True, "translation_ready": translated_ready}
 
     def save_cues(self, job_id: str, cues: list[dict[str, Any]]) -> DemoJob:
         """Save subtitle edits: text, timing and deletions.
@@ -1443,7 +2141,7 @@ class WorkbenchJobs:
                 raise RuntimeError("翻译阶段完成后才能编辑中文字幕。")
             if job.status in {"running", "cancelling"}:
                 raise RuntimeError("请等待或取消当前阶段后再编辑字幕。")
-            source_path = job.edited_segments or job.work_dir / "segments.translated.json"
+            source_path = job.edited_segments or job.artifacts.path("translated_segments") or job.work_dir / "segments.translated.json"
             segments = load_segments(source_path)
             if len(cues) != len(segments):
                 raise RuntimeError("Subtitle changed while editing; reload the latest cues.")
@@ -1537,8 +2235,12 @@ class WorkbenchJobs:
             if self._running_id:
                 raise RuntimeError("已有任务在运行。")
         work_dir = job.work_dir
-        audio_path = work_dir / "segments.audio.json"
-        ocr_path = work_dir / "segments.ocr.json"
+        source_parent = job.artifacts.path("source_segments")
+        source_parent = source_parent.parent if source_parent else work_dir
+        audio_path = source_parent / "segments.audio.json"
+        ocr_path = source_parent / "segments.ocr.json"
+        if not audio_path.exists() or not ocr_path.exists():
+            audio_path, ocr_path = work_dir / "segments.audio.json", work_dir / "segments.ocr.json"
         if not audio_path.exists() or not ocr_path.exists():
             raise RuntimeError("该任务没有同时包含音频与画面字幕，无法自动对齐。")
         with self._lock:
@@ -2029,10 +2731,11 @@ class WorkbenchJobs:
         if kind == "source":
             return job.raw_video or job.material.path
         if kind == "rendered":
-            return job.rendered_video
+            return job.rendered_video or job.artifacts.path("rendered_video")
         return None
 
     def _run_rerender(self, job: DemoJob, subtitle: Path) -> None:
+        candidate: Path | None = None
         try:
             candidate = job.work_dir / f"rendered.next-{uuid.uuid4().hex[:8]}.mp4"  # type: ignore[operator]
             rendered_candidate = burn_subtitles(
@@ -2048,8 +2751,7 @@ class WorkbenchJobs:
             job.cancellation.check()
             if not validate_media(rendered_candidate, "video"):
                 raise RuntimeError("新成片验证失败，已保留上一版成片。")
-            rendered = job.work_dir / "rendered.mp4"  # type: ignore[operator]
-            rendered_candidate.replace(rendered)
+            rendered = commit_rendered_candidate(rendered_candidate, job.work_dir)  # type: ignore[arg-type]
         except CancellationRequested:
             with self._lock:
                 job.status, job.stage, job.error = "cancelled", "重新渲染已取消", None
@@ -2071,6 +2773,8 @@ class WorkbenchJobs:
                 job.status, job.stage, job.progress = "completed", "重新渲染完成", 100
                 job.finished_at = time.time()
         finally:
+            if candidate is not None:
+                candidate.unlink(missing_ok=True)
             with self._lock:
                 if self._running_id == job.id:
                     self._running_id = None
@@ -2091,7 +2795,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.NO_CONTENT); self._cors_headers(); self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path
+        # Browser fetch percent-encodes Unicode task IDs. Decode once before
+        # route matching, otherwise paths for titles containing accented or
+        # CJK characters fall through to the frontend HTML handler.
+        path = unquote(urlparse(self.path).path)
         if path == "/api/health":
             self._json({"ok": True, "version": __version__}); return
         if path == "/api/bootstrap":
@@ -2135,6 +2842,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if path == "/api/diagnostics":
             self._json(self._diagnostics()); return
         if path == "/api/dependencies":
+            if parse_qs(urlparse(self.path).query).get("refresh") == ["1"]:
+                clear_dependency_cache()
             self._json(self.dependencies.snapshot()); return
         match = re.fullmatch(r"/api/dependencies/jobs/([a-f0-9]+)", path)
         if match:
@@ -2168,28 +2877,59 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             scope = str(query.get("scope", ["current"])[0]).lower()
             output_dir = str(query.get("output_dir", [str(OUTPUT_ROOT)])[0])
             try:
+                offset = max(0, int(query.get("offset", ["0"])[0]))
+            except ValueError:
+                self._json({"error": "历史记录偏移量必须是数字。"}, HTTPStatus.BAD_REQUEST); return
+            search = str(query.get("q", [""])[0]).strip().casefold()
+            category = str(query.get("category", [""])[0]).strip().lower()
+            if category not in {"", "active", "attention", "completed"}:
+                self._json({"error": "历史记录分类无效。"}, HTTPStatus.BAD_REQUEST); return
+            try:
                 records = self._history_records(scope, output_dir)
             except ValueError as exc:
                 self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST); return
-            self._json({"jobs": records[:max(1, min(200, limit))], "total": len(records), "scope": scope}); return
+            if search:
+                records = [record for record in records if search in " ".join(
+                    str(record.get(key) or "") for key in ("title", "stage", "status", "error")
+                ).casefold()]
+            counts = {
+                "active": sum(record.get("status") in {"queued", "running", "preparing", "cancelling"} for record in records),
+                "attention": sum(record.get("status") not in {"queued", "running", "preparing", "cancelling", "completed"} for record in records),
+                "completed": sum(record.get("status") == "completed" for record in records),
+            }
+            if category == "active":
+                records = [record for record in records if record.get("status") in {"queued", "running", "preparing", "cancelling"}]
+            elif category == "attention":
+                records = [record for record in records if record.get("status") not in {"queued", "running", "preparing", "cancelling", "completed"}]
+            elif category == "completed":
+                records = [record for record in records if record.get("status") == "completed"]
+            page_size = max(1, min(200, limit))
+            page = records[offset:offset + page_size]
+            self._json({
+                "jobs": page, "total": len(records), "offset": offset,
+                "has_more": offset + len(page) < len(records), "scope": scope, "counts": counts,
+            }); return
         match = re.fullmatch(r"/api/materials/([\w-]+)/media", path)
         if match:
             media = self.jobs.material_path(match.group(1))
             if media is None or not media.exists(): self._json({"error": "Material is not available."}, HTTPStatus.NOT_FOUND)
             else: self._serve_media(media)
             return
-        match = re.fullmatch(r"/api/jobs/([\w-]+)/media/(source|rendered)", path)
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/media/(source|rendered)", path)
         if match:
             media = self.jobs.media(*match.groups())
             if media is None or not media.exists(): self._json({"error": "Requested media is not ready."}, HTTPStatus.NOT_FOUND)
             else: self._serve_media(media)
             return
-        match = re.fullmatch(r"/api/jobs/([\w-]+)/cues", path)
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/cues", path)
         if match:
+            if self.jobs.get(match.group(1)) is None:
+                self._json({"error": "Task not found."}, HTTPStatus.NOT_FOUND)
+                return
             try: self._json(self.jobs.cues(match.group(1)))
             except RuntimeError as exc: self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
             return
-        match = re.fullmatch(r"/api/jobs/([\w-]+)/logs", path)
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/logs", path)
         if match:
             try:
                 limit = int(parse_qs(urlparse(self.path).query).get("limit", ["5000"])[0])
@@ -2199,7 +2939,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             except RuntimeError as exc:
                 self._json({"error": str(exc)}, HTTPStatus.NOT_FOUND)
             return
-        match = re.fullmatch(r"/api/jobs/([\w-]+)", path)
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})", path)
         if match:
             job = self.jobs.get(match.group(1))
             query = parse_qs(urlparse(self.path).query)
@@ -2213,7 +2953,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         self._serve_frontend(path)
 
     def do_POST(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path
+        path = unquote(urlparse(self.path).path)
         if not self._authorize_mutation(path):
             return
         if path == "/api/materials":
@@ -2250,11 +2990,42 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             try:
                 scope = str(payload.get("scope", "current")).lower()
                 records = self._history_records(scope, str(payload.get("output_dir") or OUTPUT_ROOT), include_private=True)
-                deleted = job_db.delete_jobs([str(record["id"]) for record in records])
+                result = self.jobs.delete_history([str(record["id"]) for record in records], "record_only", allow_many=True) if records else {"deleted": 0}
+                deleted = int(result.get("deleted", 0))
             except ValueError as exc:
                 self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST); return
-            self._json({"deleted": deleted, "message": f"已清除 {deleted} 条任务记录；输出视频和字幕文件未删除。"})
+            except RuntimeError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
+            self._json({
+                "deleted": deleted,
+                "deleted_ids": [str(record["id"]) for record in records],
+                "message": f"已清除 {deleted} 条任务记录；输出视频和字幕文件未删除。",
+            })
             return
+        if path in {"/api/history/jobs/delete-preview", "/api/history/delete-preview"}:
+            try:
+                ids = payload.get("ids")
+                if not isinstance(ids, list):
+                    raise ValueError("ids must be a list of task IDs.")
+                plan = self.jobs.history_delete_plan(ids, str(payload.get("mode", "record_only")))
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST); return
+            except RuntimeError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
+            self._json(plan); return
+        if path in {"/api/history/jobs/delete", "/api/history/delete"}:
+            if payload.get("confirmed") is not True:
+                self._json({"error": "Deletion requires explicit confirmation."}, HTTPStatus.BAD_REQUEST); return
+            try:
+                ids = payload.get("ids")
+                if not isinstance(ids, list):
+                    raise ValueError("ids must be a list of task IDs.")
+                result = self.jobs.delete_history(ids, str(payload.get("mode", "record_only")), str(payload.get("fingerprint") or ""))
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST); return
+            except RuntimeError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
+            self._json(result); return
         if path == "/api/history/test-records/scan":
             candidates = self._test_history_candidates()
             self._json({"candidates": candidates, "count": len(candidates)}); return
@@ -2266,8 +3037,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             rejected = requested - eligible
             if rejected:
                 self._json({"error": "部分记录已不符合严格测试记录规则，操作已拒绝。"}, HTTPStatus.CONFLICT); return
-            deleted = job_db.delete_jobs(sorted(requested))
-            self.jobs.forget_history(requested)
+            try:
+                result = self.jobs.delete_history(sorted(requested), "record_only", allow_many=True)
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST); return
+            except RuntimeError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
+            deleted = int(result.get("deleted", 0))
             self._json({"deleted": deleted, "message": f"已删除 {deleted} 条测试历史；没有删除任何视频或输出目录。"}); return
         if path == "/api/history/open":
             target = Path(str(payload.get("path", ""))).expanduser()
@@ -2295,7 +3071,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                     po_token_mode=str(payload.get("youtube_po_token_mode", "auto")),
                     download_quality=str(payload.get("download_quality", "1080p")),
                 )
-                self._json({"title": metadata.title, "duration": metadata.duration, "license": metadata.license, "view_count": metadata.view_count, "webpage_url": metadata.webpage_url, "thumbnail_url": metadata.thumbnail_url, "max_width": metadata.max_width, "max_height": metadata.max_height})
+                self._json({"title": metadata.title, "duration": metadata.duration, "license": metadata.license, "view_count": metadata.view_count, "webpage_url": metadata.webpage_url, "thumbnail_url": metadata.thumbnail_url, "max_width": metadata.max_width, "max_height": metadata.max_height, "quality_proposal": metadata.quality_proposal})
             except InputValidationError as exc: self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
             except Exception as exc: self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
@@ -2360,6 +3136,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             else:
                 self._json({"description": body})
             return
+        if path == "/api/publish/copy":
+            self._publish_copy(payload); return
         if path == "/api/publish/check":
             self._start_publish_check(payload); return
         if path == "/api/publish/assist":
@@ -2374,11 +3152,21 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._open_output_root(payload); return
         if path == "/api/outputs/open-path":
             self._open_output_path(payload); return
+        if path == "/api/outputs/delete-preview":
+            try:
+                self._json(self._output_delete_plan(payload))
+            except ActiveTaskDeletionError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
+            except (ValueError, RuntimeError, OSError) as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
         if path == "/api/outputs/delete":
             self._delete_output_paths(payload); return
         if path == "/api/jobs":
             source_url = payload.get("source_url")
             try:
+                if source_url is not None and "material_id" in payload:
+                    raise InputValidationError("视频链接与本地素材只能选择一种来源。", code="ambiguous_source", field="source_url")
                 device, compute_type = _validate_device_precision(
                     payload.get("device", "cuda"), payload.get("compute_type", "float16"),
                 )
@@ -2396,7 +3184,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             except RuntimeError as exc: self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
             else: self._json(job.snapshot(), HTTPStatus.CREATED)
             return
-        match = re.fullmatch(r"/api/jobs/([\w-]+)/(prepare|run-all|resume)", path)
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/(prepare|run-all|resume)", path)
         if match:
             job_id, action = match.groups()
             try:
@@ -2407,12 +3195,20 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
             self._json(job.snapshot(), HTTPStatus.ACCEPTED if action != "prepare" else HTTPStatus.OK)
             return
-        match = re.fullmatch(r"/api/jobs/([\w-]+)/load", path)
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/quality/confirm", path)
+        if match:
+            try:
+                fingerprint = require_text(payload.get("fingerprint", ""), "fingerprint", 128, allow_empty=False)
+                job = self.jobs.confirm_quality(match.group(1), fingerprint)
+            except (ValueError, RuntimeError) as exc:
+                self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
+            self._json(job.snapshot()); return
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/load", path)
         if match:
             try: job = self.jobs.load(match.group(1))
             except RuntimeError as exc: self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
             self._json(job.snapshot()); return
-        match = re.fullmatch(r"/api/jobs/([\w-]+)/stages/(acquire|extract|translate|render|publish)/run", path)
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/stages/(acquire|extract|translate|render|publish)/run", path)
         if match:
             try:
                 job = self.jobs.run_stage(match.group(1), match.group(2))
@@ -2422,11 +3218,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
             self._json(job.snapshot(), HTTPStatus.ACCEPTED)
             return
-        match = re.fullmatch(r"/api/jobs/([\w-]+)/(cancel|open-output|rerender)", path)
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/(cancel|open-output|rerender)", path)
         if match:
             job_id, action = match.groups()
             if action == "cancel": job = self.jobs.cancel(job_id)
             elif action == "rerender":
+                if payload.get("dirty") is True:
+                    self._json({"error": "字幕存在未保存修改，请先保存后再重新渲染。"}, HTTPStatus.CONFLICT); return
                 try: job = self.jobs.rerender(job_id)
                 except RuntimeError as exc: self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
             else:
@@ -2437,19 +3235,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                         os.startfile(job.work_dir)  # type: ignore[attr-defined]
                     except OSError as exc: self._json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR); return
             self._json(job.snapshot() if job else {"error": "Task not found."}, HTTPStatus.OK if job else HTTPStatus.NOT_FOUND); return
-        match = re.fullmatch(r"/api/jobs/([\w-]+)/trim", path)
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/trim", path)
         if match:
             try: job = self.jobs.trim(match.group(1), payload.get("cut_ranges", []))
             except RuntimeError as exc: self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
             self._json(job.snapshot())
             return
-        match = re.fullmatch(r"/api/jobs/([\w-]+)/modify", path)
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/modify", path)
         if match:
             try: result = self.jobs.modify(match.group(1), str(payload.get("op", "")), payload)
             except RuntimeError as exc: self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
             self._json(result)
             return
-        match = re.fullmatch(r"/api/jobs/([\w-]+)/align", path)
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/align", path)
         if match:
             try: job = self.jobs.align(match.group(1))
             except RuntimeError as exc: self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
@@ -2458,10 +3256,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         self._json({"error": "Route not found."}, HTTPStatus.NOT_FOUND)
 
     def do_PUT(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path
+        path = unquote(urlparse(self.path).path)
         if not self._authorize_mutation(path):
             return
-        match = re.fullmatch(r"/api/jobs/([\w-]+)/cues", path)
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/cues", path)
         if not match: self._json({"error": "Route not found."}, HTTPStatus.NOT_FOUND); return
         try:
             payload = self._payload()
@@ -2475,10 +3273,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         else: self._json(job.snapshot())
 
     def do_PATCH(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path
+        path = unquote(urlparse(self.path).path)
         if not self._authorize_mutation(path):
             return
-        match = re.fullmatch(r"/api/jobs/([\w-]+)/options", path)
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/options", path)
         if not match:
             self._json({"error": "Route not found."}, HTTPStatus.NOT_FOUND); return
         try:
@@ -2497,7 +3295,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._json({**job.snapshot(), "stale_stages": stale})
 
     def do_DELETE(self) -> None:  # noqa: N802
-        path = urlparse(self.path).path
+        path = unquote(urlparse(self.path).path)
         if not self._authorize_mutation(path):
             return
         match = re.fullmatch(r"/api/templates/(.+)", path)
@@ -2512,6 +3310,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     def _save_settings(self, payload: dict[str, Any]) -> None:
         translator = require_text(payload.get("translator", "deepseek"), "translator", 32, allow_empty=False).lower()
         key = require_text(payload.get("api_key", ""), "api_key", 1024)
+        if translator not in {"deepseek", "openai", "ollama"}:
+            raise InputValidationError("设置中的翻译器无效。", code="invalid_choice", field="translator")
         cookies_from_browser = require_text(payload.get("cookies_from_browser", ""), "cookies_from_browser", 32).lower()
         cookies_file = require_text(payload.get("cookies_file", ""), "cookies_file", 1024)
         proxy_supplied = "youtube_proxy" in payload
@@ -2540,8 +3340,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             _upsert_env(USER_DATA_ROOT / ".env", {"YBLOCALIZER_YOUTUBE_PROXY": youtube_proxy})
             os.environ["YBLOCALIZER_YOUTUBE_PROXY"] = youtube_proxy
         if key:
-            if translator not in {"deepseek", "openai"}:
-                raise ValueError("Choose DeepSeek or OpenAI before saving an API key.")
+            if translator == "ollama":
+                raise ValueError("Ollama 本地翻译不使用 API Key。")
             env_key = "DEEPSEEK_API_KEY" if translator == "deepseek" else "OPENAI_API_KEY"
             _upsert_env(USER_DATA_ROOT / ".env", {env_key: key})
             os.environ[env_key] = key
@@ -2560,9 +3360,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             "total_size": format_bytes(sum(task.size for task in tasks)),
             "category_totals": {kind: {"bytes": size, "label": format_bytes(size)} for kind, size in category_totals.items()},
             "tasks": [{
-                "id": str(task.path.relative_to(root)).replace("\\", "/"), "name": task.name,
-                "size": task.size, "size_label": format_bytes(task.size), "modified_at": task.modified_at,
-                "files": [{"id": str(file.path.relative_to(root)).replace("\\", "/"), "name": file.path.name, "kind": file.kind, "size": file.size, "size_label": format_bytes(file.size)} for file in task.files],
+                "id": str(task.path.relative_to(root)).replace("\\", "/"),
+                "name": task.name,
+                "title": resolve_task_title(task.path),
+                "size": task.size,
+                "size_label": format_bytes(task.size),
+                "modified_at": task.modified_at,
+                "files": [{
+                    "id": str(file.path.relative_to(root)).replace("\\", "/"),
+                    "name": file.path.name,
+                    "kind": file.kind,
+                    "size": file.size,
+                    "size_label": format_bytes(file.size),
+                } for file in task.files],
             } for task in tasks],
         }
 
@@ -2685,17 +3495,80 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         else:
             self._json({"opened": relative})
 
+    def _output_delete_plan(self, payload: dict[str, Any]) -> dict[str, Any]:
+        root = _resolve_output_root(str(payload.get("output_dir") or OUTPUT_ROOT))
+        values = payload.get("paths")
+        if not isinstance(values, list) or not values or len(values) > 200 or any(not isinstance(value, str) or not value for value in values):
+            raise ValueError("每次请选择 1～200 个任务或文件。")
+        if len(set(values)) != len(values):
+            raise ValueError("删除目标不能重复。")
+        snapshot = self._outputs_snapshot(root)
+        tasks = {task["id"]: task for task in snapshot["tasks"]}
+        files = {file["id"]: file for task in snapshot["tasks"] for file in task["files"]}
+        if any(value not in tasks and value not in files for value in values):
+            raise ValueError("只能删除当前输出扫描中列出的任务或文件。请刷新后重试。")
+        if any(file_id.startswith(f"{task_id}/") for task_id in values if task_id in tasks for file_id in values if file_id in files):
+            raise ValueError("已选整个任务时不能同时选择其内部文件。")
+        paths = [(root / value).resolve() for value in values]
+        if self.jobs.output_paths_active(paths):
+            raise ActiveTaskDeletionError("运行中的任务输出不可删除，请先取消并等待当前阶段结束。")
+        records = {str(row["id"]): row for row in job_db.list_jobs(None)}
+        targets: list[dict[str, Any]] = []
+        for value, target in zip(values, paths):
+            if _path_contains_reparse(root / value):
+                raise RuntimeError("输出目录包含符号链接或 reparse point，已拒绝删除。")
+            is_task = value in tasks
+            registered = is_task and value in records
+            if registered:
+                history_preview = self.jobs.history_delete_plan([value], "record_and_outputs")
+                if history_preview["tasks"][0].get("disposition") != "verified_files":
+                    raise RuntimeError(
+                        "该任务输出无法通过安全校验；请到任务库使用仅删除记录或混合删除预览。"
+                    )
+            target_files = sorted(target.rglob("*")) if is_task else [target]
+            signatures = [{"path": file.relative_to(target if is_task else root).as_posix(), "size": file.stat().st_size, "mtime_ns": file.stat().st_mtime_ns} for file in target_files if file.is_file()]
+            targets.append({
+                "id": value, "name": tasks[value]["name"] if is_task else files[value]["name"],
+                "kind": "task" if is_task else "file", "record_will_remove": bool(registered),
+                "file_count": len(signatures), "bytes": sum(item["size"] for item in signatures),
+                "files": signatures,
+            })
+        plan = {"root": str(root), "paths": values, "targets": targets, "target_count": len(targets),
+                "file_count": sum(item["file_count"] for item in targets), "bytes": sum(item["bytes"] for item in targets)}
+        plan["fingerprint"] = WorkbenchJobs._history_fingerprint(plan)
+        return plan
+
     def _delete_output_paths(self, payload: dict[str, Any]) -> None:
         if payload.get("confirmed") is not True:
             self._json({"error": "Deletion requires explicit confirmation."}, HTTPStatus.BAD_REQUEST); return
         try:
-            root = _resolve_output_root(str(payload.get("output_dir") or OUTPUT_ROOT))
-            values = payload.get("paths")
-            if not isinstance(values, list) or not values: raise ValueError("Choose at least one task or file to delete.")
-            paths = [(root / str(value)).resolve() for value in values]
-            deleted = delete_paths(paths, root)
+            plan = self._output_delete_plan(payload)
+            fingerprint = payload.get("fingerprint")
+            if not fingerprint or not hmac.compare_digest(str(fingerprint), plan["fingerprint"]):
+                raise RuntimeError("删除预览已过期，请刷新后重新确认。")
+            root = Path(plan["root"])
+            results: list[dict[str, Any]] = []
+            for item in plan["targets"]:
+                value = item["id"]
+                if item["record_will_remove"]:
+                    history_plan = self.jobs.history_delete_plan([value], "record_and_outputs")
+                    history_result = self.jobs.delete_history([value], "record_and_outputs", history_plan["fingerprint"])
+                    detail = history_result["results"][0]
+                    results.append({"id": value, "name": item["name"], "status": detail["status"],
+                                    "record_removed": detail["record_removed"], "bytes": detail["bytes"], "error": detail["error"]})
+                    continue
+                try:
+                    delete_paths([root / value], root)
+                except Exception as exc:
+                    LOGGER.exception("Failed to delete output item %s", value)
+                    results.append({"id": value, "name": item["name"], "status": "partial", "record_removed": False, "bytes": 0, "error": str(exc)})
+                else:
+                    results.append({"id": value, "name": item["name"], "status": "deleted", "record_removed": False, "bytes": item["bytes"], "error": None})
+            deleted = sum(item["bytes"] for item in results if item["status"] == "deleted")
+            removed_history = sum(1 for item in results if item["record_removed"])
+        except ActiveTaskDeletionError as exc: self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
         except (ValueError, RuntimeError, OSError) as exc: self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
-        else: self._json({"deleted_bytes": deleted, "deleted_size": format_bytes(deleted)})
+        else: self._json({"deleted_bytes": deleted, "deleted_size": format_bytes(deleted), "removed_history": removed_history, "results": results})
 
     def _publish_profile_dir(self, browser: str) -> Path:
         return USER_DATA_ROOT / "data" / ("bilibili-edge-profile" if browser == "msedge" else "bilibili-profile")
@@ -2731,28 +3604,97 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         threading.Thread(target=runner, daemon=True, name="bilibili-check").start()
         self._json({"started": True, "message": "B 站登录检查页已打开；不会上传或投稿。"}, HTTPStatus.ACCEPTED)
 
+    def _resolve_publish_video(self, payload: dict[str, Any]) -> tuple[Path, DemoJob | None]:
+        job_id = str(payload.get("job_id", "") or "").strip()
+        job = self.jobs.get(job_id) if job_id else None
+        video = self.jobs.media(job.id, "rendered") if job else None
+        if video is None:
+            native_token = str(payload.get("native_video_token", "") or "").strip()
+            video = self.jobs.publish_file_from_token(native_token) if native_token else None
+        video_id = str(payload.get("video_id", "") or "").strip()
+        if video is None and video_id and video_id != "__native__":
+            root = _resolve_output_root(str(payload.get("output_dir") or OUTPUT_ROOT))
+            candidate = (root / video_id).resolve()
+            candidate.relative_to(root)
+            video = candidate
+            if job is None:
+                job = self.jobs.get(candidate.parent.name)
+        if video is None or not video.is_file() or video.suffix.lower() not in MEDIA_EXTENSIONS:
+            raise ValueError("请先选择一份已渲染的成片。")
+        if job is None:
+            job = self.jobs.get(video.parent.name)
+        return video, job
+
+    def _compose_publish_fields(self, payload: dict[str, Any], video: Path, job: DemoJob | None) -> tuple[str, str, list[str]]:
+        metadata_path = job.artifacts.path("publish_metadata") if job else None
+        copy = _read_publish_metadata(metadata_path if metadata_path and metadata_path.is_file() else video.parent / "publish_metadata.json")
+        title = require_text(payload.get("title", ""), "title", MAX_TITLE_LENGTH) or copy["title"]
+        if job and not title:
+            title = str(job.options.get("title") or job.artifacts.title or job.material.name)
+        title = title or video.stem
+        description = require_text(payload.get("description", ""), "description", MAX_DESCRIPTION_LENGTH)
+        if not description:
+            source_url = ""
+            if job:
+                source_url = job.material.source_url or job.artifacts.webpage_url or ""
+            include_link = True
+            if "include_source_link" in payload:
+                include_link = require_boolean(payload.get("include_source_link"), "include_source_link")
+            template_name = require_text(payload.get("template", "授权本地化"), "template", 50) or "授权本地化"
+            template_body = require_text(payload.get("template_body", ""), "template_body", MAX_DESCRIPTION_LENGTH) or None
+            extra_value = payload.get("extra_lines", [])
+            extra_lines = []
+            if isinstance(extra_value, list):
+                extra_lines = [require_text(line, f"extra_lines[{index}]", 500) for index, line in enumerate(extra_value) if str(line).strip()]
+            description = build_bilibili_description(
+                template_name, source_url, include_link, "", extra_lines, template_body=template_body,
+            )
+        tags = _validate_tags(payload.get("tags", [])) or list(copy["tags"])
+        if job and not tags:
+            tags = [str(tag).strip() for tag in (job.options.get("tags") or []) if str(tag).strip()]
+        return title, description, tags
+
+    def _publish_copy(self, payload: dict[str, Any]) -> None:
+        try:
+            generate = require_boolean(payload.get("generate", False), "generate")
+            video, job = self._resolve_publish_video(payload)
+            if generate:
+                if job is None:
+                    raise ValueError("找不到对应任务，无法根据字幕重新生成标题和标签。")
+                copy = self.jobs.refresh_publish_metadata(job)
+            else:
+                metadata_path = job.artifacts.path("publish_metadata") if job else None
+                copy = _read_publish_metadata(metadata_path if metadata_path and metadata_path.is_file() else video.parent / "publish_metadata.json")
+                if not copy["title"]:
+                    copy["title"] = (str(job.options.get("title") or job.artifacts.title or job.material.name) if job else video.stem)
+                copy["generated"] = False
+            source_url = ""
+            if job:
+                source_url = job.material.source_url or job.artifacts.webpage_url or ""
+        except InputValidationError as exc:
+            self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
+        except (ValueError, OSError) as exc:
+            self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        else:
+            self._json({
+                "title": copy["title"],
+                "tags": copy["tags"],
+                "has_metadata": copy["has_metadata"],
+                "generated": bool(copy.get("generated")),
+                "source_url": source_url,
+                "video_name": video.name,
+            })
+
     def _start_publish_assist(self, payload: dict[str, Any]) -> None:
         if payload.get("confirmed") is not True:
-            self._json({"error": "Confirm you have rights and will manually review before submitting."}, HTTPStatus.BAD_REQUEST); return
+            self._json({"error": "请先确认拥有授权，并在投稿前人工检查。"}, HTTPStatus.BAD_REQUEST); return
         try:
             browser = "msedge" if str(payload.get("browser", "chromium")).lower() in {"edge", "msedge"} else "chromium"
             close_after_fill = require_boolean(payload.get("close_after_fill", False), "close_after_fill")
             if self._publish_profile_process_ids(browser):
                 raise ValueError("B 站自动化浏览器正在使用中。请先关闭后台浏览器，再开始投稿辅助。")
-            job_id = str(payload.get("job_id", ""))
-            job = self.jobs.get(job_id) if job_id else None
-            video = self.jobs.media(job_id, "rendered") if job else None
-            if video is None:
-                native_token = str(payload.get("native_video_token", ""))
-                video = self.jobs.publish_file_from_token(native_token) if native_token else None
-            if video is None:
-                root = _resolve_output_root(str(payload.get("output_dir") or OUTPUT_ROOT))
-                video = (root / str(payload.get("video_id", ""))).resolve()
-                video.relative_to(root)
-            if not video.exists() or video.suffix.lower() not in MEDIA_EXTENSIONS: raise ValueError("Choose a rendered video from the output list.")
-            title = require_text(payload.get("title", ""), "title", MAX_TITLE_LENGTH) or video.stem
-            description = require_text(payload.get("description", ""), "description", MAX_DESCRIPTION_LENGTH)
-            tags = _validate_tags(payload.get("tags", []))
+            video, job = self._resolve_publish_video(payload)
+            title, description, tags = self._compose_publish_fields(payload, video, job)
             cover = next((video.parent / name for name in ("cover.jpg", "cover.png", "thumbnail.jpg", "thumbnail.png") if (video.parent / name).exists()), None)
             session = self.jobs.begin_publish_session()
 
@@ -2981,7 +3923,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
 
     def _json(self, value: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(value, ensure_ascii=False).encode("utf-8")
-        self.send_response(status); self._cors_headers(); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+        self.send_response(status); self._cors_headers(); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.send_header("Cache-Control", "no-store, no-cache, must-revalidate"); self.send_header("Pragma", "no-cache"); self.send_header("Expires", "0"); self.end_headers(); self.wfile.write(body)
 
     def _cors_headers(self) -> None:
         origin = self.headers.get("Origin", "")
@@ -2999,6 +3941,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if start > end or start >= size: self.send_error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE); return
         length = end - start + 1
         self.send_response(status); self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "video/mp4"); self.send_header("Accept-Ranges", "bytes"); self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
         if status == HTTPStatus.PARTIAL_CONTENT: self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
         with path.open("rb") as file:

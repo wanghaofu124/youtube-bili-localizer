@@ -1,15 +1,19 @@
 from pathlib import Path
 from http.client import HTTPConnection
+from http import HTTPStatus
 from io import BytesIO
 import json
 import socket
 import threading
+from types import SimpleNamespace
+from urllib.parse import quote
 
 import pytest
 
 from yblocalizer import db as job_db
 from yblocalizer.runtime import PipelineEvent, PipelineStage
-from yblocalizer.workbench_api import DEMO_VIDEO, DemoJob, Material, WorkbenchHandler, WorkbenchJobs, _ffconcat_path, _upsert_env, _resolve_output_root, _safe_options, build_server, public_path, stage_from_log
+from yblocalizer.transcribe import WhisperCudaOutOfMemory
+from yblocalizer.workbench_api import DEMO_VIDEO, DemoJob, Material, WorkbenchHandler, WorkbenchJobs, _ffconcat_path, _upsert_env, _resolve_output_root, _recovery_for_error, _safe_options, _probe_translation_service, build_server, public_path, stage_from_log
 from yblocalizer.workbench_config import InputValidationError, default_options, normalize_options, options_for_public, options_for_storage, options_from_storage, preflight
 
 
@@ -27,6 +31,76 @@ def test_workbench_job_never_moves_progress_backwards() -> None:
     job.apply_event(PipelineEvent(PipelineStage.TRANSCRIBING, 48, "transcribing"))
     assert job.progress == 90
     assert job.stage == "语音转写"
+
+
+def test_cuda_failure_exposes_user_confirmed_recovery_in_snapshot() -> None:
+    stage, error, expected_id = "extract", WhisperCudaOutOfMemory("CUDA out of memory"), "retry_extract_with_lower_resource"
+    job = DemoJob(
+        id="recovery-test", material=Material("demo", DEMO_VIDEO, "demo.mp4", 10, 1280, 720, True),
+        device="cuda", compute_type="float16",
+    )
+    job.status = "failed"
+    job.stages[stage].update({"status": "failed", "error_code": getattr(error, "code", "")})
+    job.stages[stage]["recovery"] = _recovery_for_error(error, stage, job)
+
+    recovery = job.snapshot()["recovery"]
+
+    assert recovery["id"] == expected_id
+    assert recovery["requires_confirmation"] is True
+    assert recovery["stage"] == stage
+
+
+def test_dependency_refresh_query_clears_cached_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    handler = object.__new__(WorkbenchHandler)
+    handler.path = "/api/dependencies?refresh=1"
+    handler.dependencies = SimpleNamespace(snapshot=lambda: {"dependencies": []})
+    result: dict[str, object] = {}
+    handler._json = lambda payload, status=HTTPStatus.OK: result.update(payload=payload, status=status)  # type: ignore[method-assign]
+    cleared: list[bool] = []
+    monkeypatch.setattr("yblocalizer.workbench_api.clear_dependency_cache", lambda: cleared.append(True))
+
+    handler.do_GET()
+
+    assert cleared == [True]
+    assert result["payload"] == {"dependencies": []}
+
+
+def test_material_media_route_accepts_normal_material_id(tmp_path: Path) -> None:
+    media = tmp_path / "source.mp4"
+    media.write_bytes(b"video")
+    handler = object.__new__(WorkbenchHandler)
+    handler.path = "/api/materials/abc-123/media"
+    handler.jobs = SimpleNamespace(material_path=lambda material_id: media if material_id == "abc-123" else None)
+    served: list[Path] = []
+    handler._serve_media = lambda path: served.append(path)  # type: ignore[method-assign]
+
+    handler.do_GET()
+
+    assert served == [media]
+
+
+def test_options_route_decodes_unicode_job_ids_before_matching() -> None:
+    job_id = "20260928-KO-UPECA-VEĆU-RIBU"
+    handler = object.__new__(WorkbenchHandler)
+    handler.path = f"/api/jobs/{quote(job_id, safe='')}/options"
+    handler._authorize_mutation = lambda _path: True  # type: ignore[method-assign]
+    handler._payload = lambda: {"options": {}}  # type: ignore[method-assign]
+    updated_job = SimpleNamespace(snapshot=lambda: {"id": job_id})
+    received: list[str] = []
+
+    def update_options(received_id: str, _payload: dict[str, object]) -> tuple[object, list[str]]:
+        received.append(received_id)
+        return updated_job, []
+
+    handler.jobs = SimpleNamespace(update_options=update_options)
+    result: dict[str, object] = {}
+    handler._json = lambda payload, status=HTTPStatus.OK: result.update(payload=payload, status=status)  # type: ignore[method-assign]
+
+    handler.do_PATCH()
+
+    assert received == [job_id]
+    assert result["status"] == HTTPStatus.OK
+    assert result["payload"] == {"id": job_id, "stale_stages": []}
 
 
 def test_workbench_default_subtitle_source_is_audio() -> None:
@@ -49,6 +123,9 @@ def test_workbench_creates_authorized_url_job(monkeypatch: pytest.MonkeyPatch) -
     assert job.options["subtitle_source"] == "ocr"
     assert job.options["font_size"] == 30
     assert job.output_root == _resolve_output_root("outputs/custom")
+    pipeline_options = jobs._pipeline_options(job)
+    assert pipeline_options.ocr_fallback_to_audio is False
+    assert pipeline_options.prefer_platform_subtitles is False
 
 
 def test_workbench_cancel_marks_running_job_as_cancelling(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -61,6 +138,36 @@ def test_workbench_cancel_marks_running_job_as_cancelling(monkeypatch: pytest.Mo
     assert cancelled.status == "cancelling"
     assert cancelled.cancellation.cancelled is True
     assert any("Cancellation requested" in line for line in cancelled.logs)
+
+
+def test_prepare_cannot_overwrite_running_or_revive_cancelled_job(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import threading
+
+    jobs = WorkbenchJobs()
+    job = jobs.create("demo", "cpu", "int8", {"output_dir": str(tmp_path)})
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_preflight(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(5)
+        return {"blocking": [], "warnings": []}
+
+    monkeypatch.setattr("yblocalizer.workbench_api.preflight", slow_preflight)
+    monkeypatch.setattr(jobs, "_prepare_required_stages", lambda _job: set())
+    worker = threading.Thread(target=jobs.prepare, args=(job.id,))
+    worker.start()
+    assert entered.wait(5)
+    try:
+        assert job.status == "preparing"
+        with pytest.raises(RuntimeError, match="准备检查"):
+            jobs._start_stage_sequence(job, ["acquire"], auto_run=False)
+        assert jobs.cancel(job.id).status == "cancelling"
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    assert job.status == "cancelled"
+    assert job.checks == []
 
 
 @pytest.mark.parametrize("url", ["example.com/video", "ftp://example.com/video", "https://"])
@@ -212,6 +319,230 @@ def test_native_publish_video_metadata_is_tokenized(tmp_path: Path) -> None:
     assert detail["title"] == "智能标题"
     assert detail["tags"] == ["AI", "字幕"]
     assert jobs.publish_file_from_token(token) == video.resolve()
+
+
+def test_native_publish_metadata_uses_persisted_attempt_pointer_after_restart(tmp_path: Path) -> None:
+    attempt = tmp_path / "job" / ".attempt-translate-restarted"
+    attempt.mkdir(parents=True)
+    video = attempt / "rendered.v2.mp4"
+    video.write_bytes(b"video")
+    metadata = attempt / "publish_metadata.json"
+    metadata.write_text(json.dumps({"title": "恢复标题", "tags": ["恢复"]}), encoding="utf-8")
+    job_db.record_job(
+        "restart-job", None, None, "restart-job", "completed", "完成", 100, None,
+        str(attempt.parent), str(video), "cpu", "int8", {}, 1, 1, 2,
+        artifacts={"rendered_video": str(video), "publish_metadata": str(metadata)},
+    )
+    jobs = WorkbenchJobs()
+    token = jobs.register_native_publish_file(video)
+    detail = jobs.publish_file_metadata(token)
+    assert detail["title"] == "恢复标题"
+    assert detail["tags"] == ["恢复"]
+
+
+def test_cues_reads_extract_attempt_pointer(tmp_path: Path) -> None:
+    from yblocalizer.models import Segment, save_segments
+
+    jobs = WorkbenchJobs()
+    material = Material("cue-material", DEMO_VIDEO, "demo.mp4", 10, 1280, 720, True)
+    job = DemoJob("cue-job", material, "cpu", "int8", work_dir=tmp_path)
+    attempt = tmp_path / ".attempt-extract-test"
+    attempt.mkdir()
+    source = attempt / "segments.source.json"
+    save_segments(source, [Segment(0, 1, "hello")])
+    job.artifacts.source_segments = str(source)
+    job.stages["extract"]["status"] = "completed"
+    jobs._jobs[job.id] = job
+    assert jobs.cues(job.id)["cues"][0]["source"] == "hello"
+
+
+def test_cues_empty_draft_is_ready_response_with_no_edit_owner(tmp_path: Path) -> None:
+    jobs = WorkbenchJobs()
+    job = DemoJob("empty-cues", Material("empty", DEMO_VIDEO, "demo.mp4", 10, 1280, 720, True), "cpu", "int8", work_dir=tmp_path)
+    jobs._jobs[job.id] = job
+
+    assert jobs.cues(job.id) == {"cues": [], "ready": False, "translation_ready": False}
+
+
+def test_cues_known_legacy_job_without_work_dir_is_empty_response() -> None:
+    jobs = WorkbenchJobs()
+    job = DemoJob("legacy-empty-cues", Material("legacy-empty", DEMO_VIDEO, "demo.mp4", 10, 1280, 720, True), "cpu", "int8")
+    jobs._jobs[job.id] = job
+
+    assert jobs.cues(job.id) == {"cues": [], "ready": False, "translation_ready": False}
+
+
+@pytest.mark.parametrize("artifact_name", ["source_segments", "translated_segments"])
+def test_cues_missing_committed_subtitle_pointer_is_controlled_error(
+    tmp_path: Path, artifact_name: str,
+) -> None:
+    jobs = WorkbenchJobs()
+    job = DemoJob("missing-pointer", Material("missing", DEMO_VIDEO, "demo.mp4", 10, 1280, 720, True), "cpu", "int8", work_dir=tmp_path)
+    setattr(job.artifacts, artifact_name, str(tmp_path / f"missing-{artifact_name}.json"))
+    jobs._jobs[job.id] = job
+
+    with pytest.raises(RuntimeError, match="committed subtitle file is missing"):
+        jobs.cues(job.id)
+
+
+def test_cues_translated_only_legacy_job_without_work_dir_reads_pointer(tmp_path: Path) -> None:
+    from yblocalizer.models import Segment, save_segments
+
+    jobs = WorkbenchJobs()
+    job = DemoJob("translated-only", Material("translated", DEMO_VIDEO, "demo.mp4", 10, 1280, 720, True), "cpu", "int8")
+    translated = tmp_path / "segments.translated.json"
+    save_segments(translated, [Segment(0, 1, "hello", "你好")])
+    job.artifacts.translated_segments = str(translated)
+    job.artifacts.source_segments = str(tmp_path / "missing-source.json")
+    jobs._jobs[job.id] = job
+
+    result = jobs.cues(job.id)
+    assert result["ready"] is True
+    assert result["translation_ready"] is True
+    assert result["cues"][0]["translated"] == "你好"
+
+
+def test_cues_rejects_corrupt_subtitle_file_as_controlled_error(tmp_path: Path) -> None:
+    jobs = WorkbenchJobs()
+    job = DemoJob("bad-cues", Material("bad", DEMO_VIDEO, "demo.mp4", 10, 1280, 720, True), "cpu", "int8", work_dir=tmp_path)
+    source = tmp_path / "segments.source.json"
+    source.write_text("not json", encoding="utf-8")
+    job.artifacts.source_segments = str(source)
+    jobs._jobs[job.id] = job
+
+    with pytest.raises(RuntimeError, match="Subtitle data is invalid"):
+        jobs.cues(job.id)
+
+
+def test_cues_rejects_corrupt_auxiliary_subtitle_file_as_controlled_error(tmp_path: Path) -> None:
+    from yblocalizer.models import Segment, save_segments
+
+    jobs = WorkbenchJobs()
+    job = DemoJob("bad-aux-cues", Material("bad-aux", DEMO_VIDEO, "demo.mp4", 10, 1280, 720, True), "cpu", "int8", work_dir=tmp_path)
+    source = tmp_path / "segments.source.json"
+    save_segments(source, [Segment(0, 1, "hello")])
+    (tmp_path / "segments.audio.json").write_text("not json", encoding="utf-8")
+    job.artifacts.source_segments = str(source)
+    jobs._jobs[job.id] = job
+
+    with pytest.raises(RuntimeError, match="Subtitle data is invalid"):
+        jobs.cues(job.id)
+
+
+def test_publish_fields_reads_translate_attempt_metadata(tmp_path: Path) -> None:
+    output = tmp_path / "job"
+    attempt = output / ".attempt-translate-test"
+    attempt.mkdir(parents=True)
+    video = attempt / "rendered.mp4"
+    video.write_bytes(b"video")
+    metadata = attempt / "publish_metadata.json"
+    metadata.write_text(json.dumps({"title": "Attempt title", "tags": ["attempt"]}), encoding="utf-8")
+    jobs = WorkbenchJobs()
+    material = Material("publish-material", DEMO_VIDEO, "demo.mp4", 10, 1280, 720, True)
+    job = DemoJob("publish-job", material, "cpu", "int8", work_dir=output)
+    job.artifacts.rendered_video = str(video)
+    job.artifacts.publish_metadata = str(metadata)
+    handler = object.__new__(WorkbenchHandler)
+    handler.jobs = jobs
+    title, _description, tags = handler._compose_publish_fields({}, video, job)
+    assert title == "Attempt title"
+    assert tags == ["attempt"]
+
+
+def test_publish_assist_falls_back_to_metadata_and_template(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output = tmp_path / "out" / "job-pub"
+    output.mkdir(parents=True)
+    video = output / "rendered.mp4"
+    video.write_bytes(b"video")
+    (output / "publish_metadata.json").write_text(
+        json.dumps({"title": "海狮与金枪鱼", "tags": ["中文字幕", "科普"]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    jobs = WorkbenchJobs()
+    monkeypatch.setattr("yblocalizer.workbench_api._validate_imported_media", lambda *_args: (5.0, 1280, 720))
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"source")
+    material = jobs.add_local_file(source, authorized=True)
+    job = jobs.create(material.id, "cpu", "int8", {
+        "translator": "none", "target_lang": "zh-Hans", "output_dir": str(tmp_path / "out"),
+        "title": "Sea Lion vs Tuna",
+    })
+    job.work_dir = output
+    job.rendered_video = video
+    job.artifacts.rendered_video = str(video)
+    job.artifacts.publish_metadata = str(output / "publish_metadata.json")
+    job.material.source_url = "https://www.youtube.com/watch?v=demo"
+    job.result = {"rendered_video": "job-pub/rendered.mp4", "output_dir": "job-pub"}
+    jobs._jobs[job.id] = job
+
+    captured: dict[str, object] = {}
+
+    def fake_assist(**kwargs):
+        captured.update(kwargs)
+        session = jobs.publish_session()
+        session.status = "finished"
+
+    monkeypatch.setattr("yblocalizer.workbench_api.assist_publish", fake_assist)
+    monkeypatch.setattr("yblocalizer.workbench_api.threading.Thread.start", lambda self: self.run())
+
+    handler = object.__new__(WorkbenchHandler)
+    handler.jobs = jobs
+    responses: list[tuple[int, dict]] = []
+
+    def fake_json(payload, status=HTTPStatus.OK):
+        responses.append((int(status), payload))
+
+    handler._json = fake_json  # type: ignore[method-assign]
+    handler._publish_profile_process_ids = lambda browser: []  # type: ignore[method-assign]
+    handler._publish_profile_dir = lambda browser: tmp_path / "profile"  # type: ignore[method-assign]
+    handler._start_publish_assist({
+        "confirmed": True,
+        "job_id": job.id,
+        "browser": "chromium",
+        "close_after_fill": False,
+        "title": "",
+        "description": "",
+        "tags": [],
+        "include_source_link": True,
+        "template": "授权本地化",
+    })
+    assert responses[-1][0] == int(HTTPStatus.ACCEPTED)
+    assert captured["title"] == "海狮与金枪鱼"
+    assert "中文字幕" in captured["tags"]
+    assert "https://www.youtube.com/watch?v=demo" in str(captured["description"])
+
+
+def test_publish_copy_endpoint_reads_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    output = tmp_path / "job-copy"
+    output.mkdir()
+    video = output / "rendered.mp4"
+    video.write_bytes(b"video")
+    (output / "publish_metadata.json").write_text(
+        json.dumps({"title": "本地化标题", "tags": ["标签A"]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    jobs = WorkbenchJobs()
+    monkeypatch.setattr("yblocalizer.workbench_api._validate_imported_media", lambda *_args: (5.0, 1280, 720))
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"source")
+    material = jobs.add_local_file(source, authorized=True)
+    job = jobs.create(material.id, "cpu", "int8", {
+        "translator": "none", "target_lang": "zh-Hans", "output_dir": str(tmp_path),
+    })
+    job.work_dir = output
+    job.rendered_video = video
+    job.artifacts.rendered_video = str(video)
+    job.artifacts.publish_metadata = str(output / "publish_metadata.json")
+    jobs._jobs[job.id] = job
+
+    handler = object.__new__(WorkbenchHandler)
+    handler.jobs = jobs
+    responses: list[dict] = []
+    handler._json = lambda payload, status=HTTPStatus.OK: responses.append(payload)  # type: ignore[method-assign]
+    handler._publish_copy({"job_id": job.id, "generate": False})
+    assert responses[-1]["title"] == "本地化标题"
+    assert responses[-1]["tags"] == ["标签A"]
+    assert responses[-1]["has_metadata"] is True
 
 
 def test_subtitle_saves_keep_the_previous_valid_edit(tmp_path: Path) -> None:
@@ -481,6 +812,310 @@ def test_history_current_scope_is_used_for_server_side_cleanup(
     assert [item["id"] for item in handler._history_records("current", str(root), include_private=True)] == ["visible"]
 
 
+def _record_history_row(job_id: str, output: Path, status: str = "completed") -> None:
+    job_db.record_job(
+        job_id, None, None, job_id, status, "完成", 100, None,
+        str(output), str(output / "rendered.mp4"), "cpu", "int8", {"output_dir": str(output.parent)}, 1, 1, 2,
+    )
+
+
+def test_history_delete_preview_and_confirmed_output_delete_are_fingerprinted(tmp_path: Path) -> None:
+    output = tmp_path / "outputs" / "task-1"
+    output.mkdir(parents=True)
+    (output / "rendered.mp4").write_bytes(b"video")
+    (output / "job_manifest.json").write_text(json.dumps({"job_id": "task-1"}), encoding="utf-8")
+    _record_history_row("task-1", output)
+    jobs = WorkbenchJobs()
+
+    plan = jobs.history_delete_plan(["task-1"], "record_and_outputs")
+    assert plan["task_count"] == 1 and plan["file_count"] == 2
+    result = jobs.delete_history(["task-1"], "record_and_outputs", plan["fingerprint"])
+    assert result["deleted"] == 1
+    assert not output.exists()
+    assert job_db.list_jobs() == []
+    assert jobs.get("task-1") is None
+
+
+def test_history_batch_delete_reports_partial_failure_per_task(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    first = tmp_path / "outputs" / "task-first"
+    second = tmp_path / "outputs" / "task-second"
+    for output in (first, second):
+        output.mkdir(parents=True)
+        (output / "rendered.mp4").write_bytes(b"video")
+        _record_history_row(output.name, output)
+    jobs = WorkbenchJobs()
+    plan = jobs.history_delete_plan([first.name, second.name], "record_and_outputs")
+    from yblocalizer.storage import delete_paths as real_delete_paths
+
+    def delete_one_then_fail(paths: list[Path], root: Path) -> int:
+        if paths[0] == second:
+            raise OSError("file in use")
+        return real_delete_paths(paths, root)
+
+    monkeypatch.setattr("yblocalizer.workbench_api.delete_paths", delete_one_then_fail)
+    result = jobs.delete_history([first.name, second.name], "record_and_outputs", plan["fingerprint"])
+    assert result["deleted_ids"] == [first.name]
+    assert [item["status"] for item in result["results"]] == ["deleted", "partial"]
+    assert not first.exists() and second.exists()
+    assert [row["id"] for row in job_db.list_jobs(None)] == [second.name]
+
+
+def test_restorable_hides_jobs_whose_local_outputs_were_wiped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "yblocalizer.workbench_api._validate_imported_media",
+        lambda *_args: (5.0, 1280, 720),
+    )
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"video")
+    jobs = WorkbenchJobs()
+    material = jobs.add_local_file(source, authorized=True)
+    job = jobs.create(material.id, "cpu", "int8", {
+        "translator": "none", "target_lang": "en", "output_dir": str(tmp_path / "out"),
+    })
+    assert any(row["id"] == job.id for row in jobs.restorable())
+    import shutil
+    shutil.rmtree(job.work_dir)
+    job.raw_video = None
+    job.artifacts.raw_video = None
+    job.artifacts.original_video = None
+    assert all(row["id"] != job.id for row in jobs.restorable())
+
+
+def test_history_delete_rejects_active_batch_without_changes(tmp_path: Path) -> None:
+    output = tmp_path / "outputs" / "task-active"
+    output.mkdir(parents=True)
+    _record_history_row("task-active", output, "running")
+    jobs = WorkbenchJobs()
+    with pytest.raises(RuntimeError, match="运行中的任务"):
+        jobs.history_delete_plan(["task-active"], "record_only")
+    assert [row["id"] for row in job_db.list_jobs()] == ["task-active"]
+
+
+def test_history_delete_rejects_stale_output_preview(tmp_path: Path) -> None:
+    output = tmp_path / "outputs" / "task-stale"
+    output.mkdir(parents=True)
+    (output / "rendered.mp4").write_bytes(b"video")
+    (output / "job_manifest.json").write_text(json.dumps({"job_id": "task-stale"}), encoding="utf-8")
+    _record_history_row("task-stale", output)
+    jobs = WorkbenchJobs()
+    plan = jobs.history_delete_plan(["task-stale"], "record_and_outputs")
+    (output / "rendered.mp4").write_bytes(b"changed")
+    with pytest.raises(RuntimeError, match="过期"):
+        jobs.delete_history(["task-stale"], "record_and_outputs", plan["fingerprint"])
+    assert output.exists()
+    assert job_db.list_jobs()[0]["id"] == "task-stale"
+
+
+def test_history_delete_missing_output_is_record_only_effectively(tmp_path: Path) -> None:
+    output = tmp_path / "outputs" / "task-missing"
+    _record_history_row("task-missing", output)
+    jobs = WorkbenchJobs()
+    plan = jobs.history_delete_plan(["task-missing"], "record_and_outputs")
+    assert plan["file_count"] == plan["bytes"] == 0
+    result = jobs.delete_history(["task-missing"], "record_and_outputs", plan["fingerprint"])
+    assert result["deleted"] == 1
+    assert job_db.list_jobs() == []
+
+
+def test_history_delete_requires_valid_ids_and_output_fingerprint(tmp_path: Path) -> None:
+    output = tmp_path / "outputs" / "task-id"
+    output.mkdir(parents=True)
+    _record_history_row("task-id", output)
+    jobs = WorkbenchJobs()
+    with pytest.raises(ValueError, match="duplicates"):
+        jobs.history_delete_plan(["task-id", "task-id"], "record_only")
+    for invalid_id in ("../task-id", "task/child", r"task\child", ".", "..", "task-id."):
+        with pytest.raises(ValueError, match="invalid"):
+            jobs.history_delete_plan([invalid_id], "record_only")
+    with pytest.raises(ValueError, match="fingerprint"):
+        jobs.delete_history(["task-id"], "record_and_outputs", "")
+
+
+def test_history_delete_accepts_legacy_mp4_id_without_deleting_outputs(tmp_path: Path) -> None:
+    job_id = "20260923-185105_authorized-demo-10s.mp4"
+    output = tmp_path / "outputs" / job_id
+    output.mkdir(parents=True)
+    (output / "rendered.mp4").write_bytes(b"video")
+    _record_history_row(job_id, output)
+    jobs = WorkbenchJobs()
+
+    record_plan = jobs.history_delete_plan([job_id], "record_only")
+    assert record_plan["job_ids"] == [job_id]
+    assert record_plan["file_count"] == 0
+    output_plan = jobs.history_delete_plan([job_id], "record_and_outputs")
+    assert output_plan["file_count"] == 1
+    assert output.exists()
+
+
+def test_internal_history_clear_allows_over_200_but_keeps_active_guard() -> None:
+    ids = [f"bulk-{index:03d}" for index in range(201)]
+    for job_id in ids:
+        job_db.record_job(job_id, None, None, job_id, "completed", "完成", 100, None, None, None, "cpu", "int8", {}, 1, 1, 2)
+    jobs = WorkbenchJobs()
+    plan = jobs.history_delete_plan(ids, "record_only", allow_many=True)
+    assert plan["task_count"] == 201
+    result = jobs.delete_history(ids, "record_only", allow_many=True)
+    assert result["deleted"] == 201
+    assert job_db.list_jobs() == []
+
+    active_ids = [f"active-{index:03d}" for index in range(201)]
+    for index, job_id in enumerate(active_ids):
+        job_db.record_job(job_id, None, None, job_id, "running" if index == 200 else "completed", "处理中", 50, None, None, None, "cpu", "int8", {}, 1, 1, None)
+    with pytest.raises(RuntimeError, match="运行中的任务"):
+        jobs.delete_history(active_ids, "record_only", allow_many=True)
+    assert len(job_db.list_jobs(None)) == 201
+
+
+def test_history_delete_requires_configured_output_root(tmp_path: Path) -> None:
+    output = tmp_path / "outputs" / "task-root"
+    output.mkdir(parents=True)
+    job_db.record_job(
+        "task-root", None, None, "task-root", "completed", "完成", 100, None,
+        str(output), None, "cpu", "int8", {}, 1, 1, 2,
+    )
+    plan = WorkbenchJobs().history_delete_plan(["task-root"], "record_and_outputs")
+    assert plan["record_only_required_count"] == 1
+    assert plan["tasks"][0]["disposition"] == "record_only_required"
+
+
+def test_history_delete_allows_derived_raw_video_but_protects_external_source(tmp_path: Path) -> None:
+    output = tmp_path / "outputs" / "task-material"
+    output.mkdir(parents=True)
+    source = tmp_path / "original.mp4"
+    source.write_bytes(b"source")
+    derived = output / "raw.mp4"
+    derived.write_bytes(b"derived")
+    job_db.record_job(
+        "task-material", "material-1", None, "task-material", "completed", "完成", 100, None,
+        str(output), None, "cpu", "int8", {"output_dir": str(output.parent)}, 1, 1, 2,
+        artifacts={"original_video": str(source), "raw_video": str(derived), "source": str(source)},
+    )
+    jobs = WorkbenchJobs()
+    plan = jobs.history_delete_plan(["task-material"], "record_and_outputs")
+    assert plan["bytes"] == len(b"derived")
+
+    protected = tmp_path / "outputs" / "task-protected"
+    protected.mkdir()
+    inside = protected / "imported.mp4"
+    inside.write_bytes(b"source")
+    job_db.record_job(
+        "task-protected", "material-2", None, "task-protected", "completed", "完成", 100, None,
+        str(protected), None, "cpu", "int8", {"output_dir": str(protected.parent)}, 1, 1, 2,
+        artifacts={"original_video": str(inside), "raw_video": str(inside), "source": str(inside)},
+    )
+    protected_plan = jobs.history_delete_plan(["task-protected"], "record_and_outputs")
+    assert protected_plan["tasks"][0]["disposition"] == "record_only_required"
+    assert "受保护" in protected_plan["tasks"][0]["reason"]
+
+
+def test_output_delete_rejects_unscanned_path(tmp_path: Path) -> None:
+    root = tmp_path / "outputs"
+    root.mkdir()
+    handler = object.__new__(WorkbenchHandler)
+    captured: dict[str, object] = {}
+    handler._outputs_snapshot = lambda _root: {"tasks": []}  # type: ignore[method-assign]
+    handler._json = lambda payload, status=HTTPStatus.OK: captured.update(payload=payload, status=status)  # type: ignore[method-assign]
+    handler._delete_output_paths({"confirmed": True, "output_dir": str(root), "paths": ["."]})
+    assert captured["status"] == HTTPStatus.BAD_REQUEST
+    assert "扫描" in str(captured["payload"])
+
+
+def test_output_paths_active_checks_persisted_task(tmp_path: Path) -> None:
+    output = tmp_path / "outputs" / "task-live"
+    output.mkdir(parents=True)
+    (output / "rendered.mp4").write_bytes(b"video")
+    _record_history_row("task-live", output, "running")
+    jobs = WorkbenchJobs()
+    assert jobs.output_paths_active([output, output / "rendered.mp4"])
+
+
+def test_output_delete_rejects_active_task_with_conflict(tmp_path: Path) -> None:
+    root = tmp_path / "outputs"
+    output = root / "task-live-api"
+    output.mkdir(parents=True)
+    (output / "rendered.mp4").write_bytes(b"video")
+    _record_history_row("task-live-api", output, "running")
+    handler = object.__new__(WorkbenchHandler)
+    handler.jobs = WorkbenchJobs()
+    captured: dict[str, object] = {}
+    handler._json = lambda payload, status=HTTPStatus.OK: captured.update(payload=payload, status=status)  # type: ignore[method-assign]
+    handler._delete_output_paths({"confirmed": True, "output_dir": str(root), "paths": ["task-live-api"]})
+    assert captured["status"] == HTTPStatus.CONFLICT
+    assert output.exists()
+
+
+def test_output_delete_preview_rejects_stale_file_and_syncs_registered_task(tmp_path: Path) -> None:
+    root = tmp_path / "outputs"
+    output = root / "task-preview"
+    output.mkdir(parents=True)
+    (output / "rendered.mp4").write_bytes(b"video")
+    (output / "job_manifest.json").write_text(json.dumps({"job_id": output.name}), encoding="utf-8")
+    _record_history_row(output.name, output)
+    handler = object.__new__(WorkbenchHandler)
+    handler.jobs = WorkbenchJobs()
+    captured: dict[str, object] = {}
+    handler._json = lambda payload, status=HTTPStatus.OK: captured.update(payload=payload, status=status)  # type: ignore[method-assign]
+    payload = {"output_dir": str(root), "paths": [output.name]}
+    plan = handler._output_delete_plan(payload)
+    assert plan["file_count"] == 2 and plan["bytes"] >= 5
+    assert plan["targets"][0]["record_will_remove"] is True
+    (output / "rendered.mp4").write_bytes(b"changed")
+    handler._delete_output_paths({**payload, "confirmed": True, "fingerprint": plan["fingerprint"]})
+    assert captured["status"] == HTTPStatus.BAD_REQUEST
+    assert output.exists() and job_db.list_jobs(None)
+    fresh = handler._output_delete_plan(payload)
+    handler._delete_output_paths({**payload, "confirmed": True, "fingerprint": fresh["fingerprint"]})
+    assert captured["status"] == HTTPStatus.OK
+    assert captured["payload"]["results"][0]["record_removed"] is True  # type: ignore[index]
+    assert not output.exists() and not job_db.list_jobs(None)
+
+
+def test_output_delete_preview_rejects_registered_record_only_fallback(tmp_path: Path) -> None:
+    root = tmp_path / "outputs"
+    output = root / "task-untrusted"
+    output.mkdir(parents=True)
+    (output / "rendered.mp4").write_bytes(b"video")
+    job_db.record_job(
+        output.name, None, None, output.name, "completed", "完成", 100, None,
+        str(output), None, "cpu", "int8", {}, 1, 1, 2,
+    )
+    handler = object.__new__(WorkbenchHandler)
+    handler.jobs = WorkbenchJobs()
+    with pytest.raises(RuntimeError, match="仅删除记录或混合删除"):
+        handler._output_delete_plan({"output_dir": str(root), "paths": [output.name]})
+    assert output.exists()
+
+
+def test_output_file_batch_delete_reports_each_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "outputs"
+    task = root / "orphan"
+    task.mkdir(parents=True)
+    first = task / "rendered.mp4"
+    second = task / "source.srt"
+    first.write_bytes(b"video")
+    second.write_bytes(b"subtitle")
+    handler = object.__new__(WorkbenchHandler)
+    handler.jobs = WorkbenchJobs()
+    captured: dict[str, object] = {}
+    handler._json = lambda payload, status=HTTPStatus.OK: captured.update(payload=payload, status=status)  # type: ignore[method-assign]
+    payload = {"output_dir": str(root), "paths": ["orphan/rendered.mp4", "orphan/source.srt"]}
+    plan = handler._output_delete_plan(payload)
+    from yblocalizer.storage import delete_paths as real_delete_paths
+
+    def delete_one_then_fail(paths: list[Path], allowed_root: Path) -> int:
+        if paths[0] == second:
+            raise OSError("file in use")
+        return real_delete_paths(paths, allowed_root)
+
+    monkeypatch.setattr("yblocalizer.workbench_api.delete_paths", delete_one_then_fail)
+    handler._delete_output_paths({**payload, "confirmed": True, "fingerprint": plan["fingerprint"]})
+    results = captured["payload"]["results"]  # type: ignore[index]
+    assert [item["status"] for item in results] == ["deleted", "partial"]
+    assert not first.exists() and second.exists()
+
+
 def test_diagnostics_reports_missing_tools_without_paths(monkeypatch: pytest.MonkeyPatch) -> None:
     handler = object.__new__(WorkbenchHandler)
     monkeypatch.setattr("yblocalizer.workbench_api.shutil.which", lambda command: "C:/tools/ffmpeg.exe" if command == "ffmpeg" else None)
@@ -524,6 +1159,66 @@ def test_preflight_warns_before_original_4k_processing(monkeypatch: pytest.Monke
     )
     assert result["ready"]
     assert any(item["code"] == "original_quality_load" for item in result["warnings"])
+
+
+def test_ollama_preflight_blocks_until_selected_model_is_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {
+        "material_id": "demo", "authorized": True, "device": "cpu", "compute_type": "int8",
+        "options": {"translator": "ollama", "target_lang": "zh-Hans", "translate_model": "qwen3.5:4b"},
+    }
+    monkeypatch.setattr("yblocalizer.workbench_config.ollama_local_status", lambda: {
+        "runtime_state": "ready", "runtime_available": True, "runtime_message": "ready",
+        "models": {"ollama-qwen35-4b": False, "ollama-qwen35-9b": False},
+    })
+    result = preflight(payload, "outputs", required_stages={"translate"})
+    assert any(item["code"] == "ollama-qwen35-4b" for item in result["blocking"])
+    gemma_payload = {
+        **payload,
+        "options": {"translator": "ollama", "target_lang": "zh-Hans", "translate_model": "translategemma:12b"},
+    }
+    gemma_result = preflight(gemma_payload, "outputs", required_stages={"translate"})
+    assert any(item["code"] == "ollama-translategemma-12b" for item in gemma_result["blocking"])
+    monkeypatch.setattr("yblocalizer.workbench_api.ollama_local_status", lambda: {
+        "runtime_state": "ready", "runtime_available": True, "runtime_message": "ready",
+        "models": {"ollama-qwen35-4b": True, "ollama-qwen35-9b": False},
+    })
+    ready, message = _probe_translation_service("ollama", "qwen3.5:4b")
+    assert ready and "qwen3.5:4b" in message
+    monkeypatch.setattr("yblocalizer.workbench_api.ollama_local_status", lambda: {
+        "runtime_state": "ready", "runtime_available": True, "runtime_message": "ready",
+        "models": {"ollama-qwen35-4b": False, "ollama-qwen35-9b": False, "ollama-translategemma-12b": True},
+    })
+    ready, message = _probe_translation_service("ollama", "translategemma:12b")
+    assert ready and "translategemma:12b" in message
+
+
+def test_deepseek_preflight_accepts_legacy_flash_alias(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeResponse:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({"data": [{"id": "deepseek-flash"}, {"id": "deepseek-v4-pro"}]}).encode()
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.setattr("yblocalizer.workbench_api.urlopen", lambda *_args, **_kwargs: FakeResponse())
+    ready, message = _probe_translation_service("deepseek", "deepseek-v4-flash")
+    assert ready and "验证通过" in message
+
+
+def test_ollama_options_reject_unregistered_model() -> None:
+    with pytest.raises(InputValidationError, match="已登记"):
+        normalize_options({"translator": "ollama", "translate_model": "somewhere/unknown:latest"}, "outputs")
+
+
+def test_translategemma_is_an_allowed_local_translation_model() -> None:
+    options = normalize_options({"translator": "ollama", "translate_model": "translategemma:12b"}, "outputs")
+    assert options["translate_model"] == "translategemma:12b"
 
 
 def test_workbench_server_can_bind_an_ephemeral_loopback_port() -> None:
@@ -655,6 +1350,28 @@ def test_each_server_uses_a_distinct_csrf_token() -> None:
     finally:
         first.server_close()
         second.server_close()
+
+
+def test_job_api_rejects_ambiguous_video_source() -> None:
+    server = build_server(Path("frontend/dist"), "127.0.0.1", 0)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    connection = HTTPConnection(*server.server_address[:2], timeout=10)
+    try:
+        connection.request("GET", "/api/bootstrap")
+        token = json.loads(connection.getresponse().read().decode("utf-8"))["csrf_token"]
+        connection.request("POST", "/api/jobs", body=json.dumps({
+            "source_url": "https://www.youtube.com/watch?v=demo",
+            "material_id": "demo", "authorized": True,
+        }), headers={"Content-Type": "application/json", "X-YBL-CSRF": token})
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        assert response.status == 400
+        assert payload["code"] == "ambiguous_source"
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
 
 
 def test_staged_job_api_creates_draft_prepares_then_runs_one_stage(

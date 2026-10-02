@@ -33,15 +33,18 @@ def test_pipeline_happy_path_with_mocked_integrations(monkeypatch: pytest.Monkey
         return items
 
     def fake_translate(_: Path, *, output_json: Path, output_srt: Path, **kwargs):
-        output_json.write_text("[]", encoding="utf-8")
-        output_srt.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好世界\n", encoding="utf-8")
-        return [Segment(0, 1, "hello world", "你好世界")]
+        items = [Segment(0, 1, "hello world", "你好世界")]
+        from yblocalizer.models import save_segments
+        from yblocalizer.subtitle import write_srt
+        save_segments(output_json, items)
+        write_srt(output_srt, items, display_mode="translated")
+        return items
 
     def fake_render(_: Path, __: Path, output: Path, **kwargs) -> Path:
         output.write_bytes(b"rendered")
         return output
 
-    monkeypatch.setattr("yblocalizer.pipeline.timestamp_id", lambda: "job-test")
+    monkeypatch.setattr("yblocalizer.pipeline.allocate_job_folder_name", lambda *_args, **_kwargs: "job-test")
     monkeypatch.setattr("yblocalizer.workflow.import_local_video", fake_import)
     monkeypatch.setattr("yblocalizer.workflow.extract_audio", fake_audio)
     monkeypatch.setattr("yblocalizer.workflow.transcribe_audio", fake_transcribe)
@@ -57,14 +60,14 @@ def test_pipeline_happy_path_with_mocked_integrations(monkeypatch: pytest.Monkey
     assert (result.work_dir / "publish_metadata.json").is_file()
 
 
-def test_non_publish_pipeline_uses_local_metadata_fallback(
+def test_translator_still_generates_publish_metadata_when_pipeline_publish_is_off(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     raw_video = tmp_path / "input.mp4"
     raw_video.write_bytes(b"video")
     seen_providers: list[str] = []
 
-    monkeypatch.setattr("yblocalizer.pipeline.timestamp_id", lambda: "job-fast-translation")
+    monkeypatch.setattr("yblocalizer.pipeline.allocate_job_folder_name", lambda *_args, **_kwargs: "job-fast-translation")
     monkeypatch.setattr(
         "yblocalizer.workflow.import_local_video",
         lambda path, work_dir, title=None: VideoJob(
@@ -110,27 +113,27 @@ def test_non_publish_pipeline_uses_local_metadata_fallback(
         )
     )
 
-    assert seen_providers == ["none"]
+    assert seen_providers == ["deepseek"]
 
 
 def test_pipeline_errors_when_ocr_and_audio_have_no_text(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     raw_video = tmp_path / "input.mp4"
     raw_video.write_bytes(b"video")
-    monkeypatch.setattr("yblocalizer.pipeline.timestamp_id", lambda: "job-empty")
+    monkeypatch.setattr("yblocalizer.pipeline.allocate_job_folder_name", lambda *_args, **_kwargs: "job-empty")
     monkeypatch.setattr("yblocalizer.workflow.import_local_video", lambda path, work_dir, title=None: VideoJob("test", str(path), "file", work_dir, raw_video=raw_video))
     monkeypatch.setattr("yblocalizer.workflow.extract_audio", lambda _video, output: output)
     monkeypatch.setattr("yblocalizer.workflow.transcribe_audio", lambda *_args, **_kwargs: [])
     monkeypatch.setattr("yblocalizer.workflow.extract_ocr_subtitles", lambda *_args, **_kwargs: [])
     monkeypatch.setattr("yblocalizer.workflow.validate_media", lambda *_: True)
 
-    with pytest.raises(RuntimeError, match="没有找到可用字幕"):
-        run_pipeline(PipelineOptions(source=str(raw_video), source_kind="file", output_dir=tmp_path / "outputs", i_have_rights=True, translator="deepseek"))
+    with pytest.raises(RuntimeError, match="音频转写和画面字幕 OCR 都未产生可用字幕"):
+        run_pipeline(PipelineOptions(source=str(raw_video), source_kind="file", output_dir=tmp_path / "outputs", i_have_rights=True, subtitle_source="merged", translator="deepseek"))
 
 
 def test_ocr_mode_falls_back_to_audio_when_ocr_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     raw_video = tmp_path / "input.mp4"
     raw_video.write_bytes(b"video")
-    monkeypatch.setattr("yblocalizer.pipeline.timestamp_id", lambda: "job-ocr-fallback")
+    monkeypatch.setattr("yblocalizer.pipeline.allocate_job_folder_name", lambda *_args, **_kwargs: "job-ocr-fallback")
     monkeypatch.setattr("yblocalizer.workflow.import_local_video", lambda path, work_dir, title=None: VideoJob("test", str(path), "file", work_dir, raw_video=raw_video))
     monkeypatch.setattr("yblocalizer.workflow.extract_audio", lambda _video, output: output)
     monkeypatch.setattr("yblocalizer.workflow.extract_ocr_subtitles", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("OCR unavailable")))

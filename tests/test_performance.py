@@ -46,6 +46,7 @@ def test_resource_profiles_have_explicit_cpu_and_network_limits() -> None:
 
 def test_balanced_download_applies_rate_limit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured: dict = {}
+    monkeypatch.setattr("yblocalizer.download._probe_video_dimensions", lambda _path: (1280, 720))
 
     class FakeYoutubeDL:
         def __init__(self, options):
@@ -72,6 +73,7 @@ def test_balanced_download_applies_rate_limit(monkeypatch: pytest.MonkeyPatch, t
 
 def test_youtube_download_requests_platform_subtitles(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured: dict = {}
+    monkeypatch.setattr("yblocalizer.download._probe_video_dimensions", lambda _path: (1280, 720))
 
     class FakeYoutubeDL:
         def __init__(self, options):
@@ -112,6 +114,7 @@ def test_platform_subtitle_timeout_keeps_downloaded_video(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     instances = 0
+    monkeypatch.setattr("yblocalizer.download._probe_video_dimensions", lambda _path: (1280, 720))
 
     class FakeYoutubeDL:
         def __init__(self, _options):
@@ -148,6 +151,8 @@ def test_platform_subtitle_timeout_keeps_downloaded_video(
 
 def test_balanced_render_limits_ffmpeg_threads(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     commands: list[list[str]] = []
+    subtitle = tmp_path / "zh.srt"
+    subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
     monkeypatch.setattr("yblocalizer.render.require_command", lambda _name: None)
     monkeypatch.setattr("yblocalizer.render._probe_video_size", lambda _path: (1920, 1080))
     monkeypatch.setattr("yblocalizer.render.render_encoder_status", lambda: {"cpu": True, "nvidia": False})
@@ -155,7 +160,7 @@ def test_balanced_render_limits_ffmpeg_threads(monkeypatch: pytest.MonkeyPatch, 
 
     burn_subtitles(
         tmp_path / "in.mp4",
-        tmp_path / "zh.srt",
+        subtitle,
         tmp_path / "out.mp4",
         encoder="cpu",
         resource_profile="balanced",
@@ -178,7 +183,6 @@ def test_transcription_passes_profile_thread_limit_to_whisper(
 
     monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=FakeWhisperModel))
     monkeypatch.setattr("yblocalizer.transcribe.require_whisper_model", lambda _size: tmp_path / "model")
-    monkeypatch.setattr("yblocalizer.transcribe._align_segment_starts", lambda segments, _audio: segments)
 
     transcribe_audio(
         tmp_path / "audio.wav",

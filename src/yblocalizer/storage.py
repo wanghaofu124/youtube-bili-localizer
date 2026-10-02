@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import json
 import shutil
 
 
@@ -44,8 +45,10 @@ def scan_outputs(root: Path) -> list[TaskUsage]:
     if not root.exists():
         return []
     tasks: list[TaskUsage] = []
-    for directory in sorted([path for path in root.rglob("*") if path.is_dir()]):
-        files = [path for path in directory.iterdir() if path.is_file()]
+    # A job owns its direct children; immutable stage-attempt directories are
+    # implementation details and must not appear as fake library tasks.
+    for directory in sorted([path for path in root.iterdir() if path.is_dir()]):
+        files = [path for path in directory.rglob("*") if path.is_file()]
         if not files:
             continue
         if not _looks_like_task_dir(directory, files):
@@ -72,13 +75,44 @@ def classify_file(path: Path) -> str:
     return "其他"
 
 
+def resolve_task_title(directory: Path) -> str:
+    """Best-effort human title for a task output folder (never the bare hash alone)."""
+    publish = _read_json_object(directory / "publish_metadata.json")
+    title = str(publish.get("title") or "").strip()
+    if title:
+        return title
+    manifest = _read_json_object(directory / "job_manifest.json")
+    options = manifest.get("options") if isinstance(manifest.get("options"), dict) else {}
+    title = str(options.get("title") or "").strip()
+    if title:
+        return title
+    for info in sorted(directory.glob("*.info.json")):
+        payload = _read_json_object(info)
+        title = str(payload.get("title") or "").strip()
+        if title:
+            return title
+    return directory.name
+
+
+def _read_json_object(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def delete_paths(paths: list[Path], allowed_root: Path) -> int:
     allowed_root = allowed_root.resolve()
     deleted_bytes = 0
     for path in paths:
         resolved = path.resolve()
-        if not _is_inside(resolved, allowed_root):
+        if resolved == allowed_root or not _is_inside(resolved, allowed_root):
             raise RuntimeError(f"Refusing to delete outside output directory: {resolved}")
+        if _contains_reparse_point(path, allowed_root):
+            raise RuntimeError(f"Refusing to delete symlink or reparse path: {path}")
         if not resolved.exists():
             continue
         if resolved.is_dir():
@@ -112,3 +146,37 @@ def _is_inside(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _contains_reparse_point(path: Path, root: Path) -> bool:
+    """Reject links/junctions before a recursive delete can follow them."""
+    try:
+        current = path
+        root = root.resolve()
+        while True:
+            if current.is_symlink():
+                return True
+            try:
+                attributes = int(current.stat(follow_symlinks=False).st_file_attributes)
+            except (AttributeError, OSError):
+                attributes = 0
+            if attributes & 0x400:  # FILE_ATTRIBUTE_REPARSE_POINT
+                return True
+            if current.resolve() == root:
+                break
+            if current.parent == current:
+                break
+            current = current.parent
+        if path.is_dir():
+            for child in path.rglob("*"):
+                if child.is_symlink():
+                    return True
+                try:
+                    attributes = int(child.stat(follow_symlinks=False).st_file_attributes)
+                except (AttributeError, OSError):
+                    attributes = 0
+                if attributes & 0x400:
+                    return True
+    except OSError:
+        return True
+    return False

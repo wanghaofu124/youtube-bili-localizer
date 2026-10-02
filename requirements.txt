@@ -8,6 +8,7 @@ playwright>=1.40.0
 python-dotenv>=1.0.0
 pytesseract>=0.3.13
 Pillow>=10.0.0
+pysubs2>=1.9.0,<2
 pywebview>=6.2.1
 
 # Optional CUDA runtime for faster-whisper/CTranslate2 on Windows.

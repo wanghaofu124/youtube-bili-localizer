@@ -6,7 +6,7 @@ from pathlib import Path
 import shutil
 from typing import Any, Callable
 
-from .dependencies import dependency_capabilities
+from .dependencies import OLLAMA_MODEL_TAGS, dependency_capabilities, ollama_local_status
 from .download import po_token_provider_status
 from .ocr_subtitle import _normalize_ocr_language, available_ocr_languages
 from .render import render_encoder_status
@@ -235,8 +235,23 @@ def normalize_options(value: Any, output_dir: str, *, strict: bool = True) -> di
         _validate_strict_source(source)
     raw = {**default_options(output_dir), **source}
     translator = str(raw["translator"]).lower()
-    if translator not in {"deepseek", "openai", "none"}:
-        raise InputValidationError("翻译器必须是 deepseek、openai 或 none。", code="invalid_choice", field="translator")
+    if translator not in {"deepseek", "openai", "ollama", "none"}:
+        raise InputValidationError("翻译器必须是 deepseek、openai、ollama 或 none。", code="invalid_choice", field="translator")
+    translate_model = _text(raw["translate_model"]) or None
+    # Keep saved user preferences and older job manifests usable after the
+    # TranslateGemma 4B choice was replaced by the tested 12B model.
+    if translator == "ollama" and translate_model == "translategemma:4b":
+        translate_model = "translategemma:12b"
+    # Return saved preferences from the 27B trial to the supported 9B model.
+    if translator == "ollama" and translate_model == "qwen3.5:27b":
+        translate_model = "qwen3.5:9b"
+    if translator == "ollama" and translate_model and translate_model not in OLLAMA_MODEL_TAGS.values():
+        if strict:
+            raise InputValidationError(
+                "Ollama 仅支持依赖中心中已登记的本地模型。",
+                code="invalid_choice", field="translate_model",
+            )
+        translate_model = None
     subtitle_source = str(raw["subtitle_source"])
     if subtitle_source not in {"auto", "audio", "ocr", "merged"}:
         raise InputValidationError("字幕来源选项无效。", code="invalid_choice", field="subtitle_source")
@@ -299,7 +314,7 @@ def normalize_options(value: Any, output_dir: str, *, strict: bool = True) -> di
         "subtitle_margin_ratio": float(raw["subtitle_margin_ratio"]) if strict else max(0.01, min(0.4, float(raw["subtitle_margin_ratio"]))),
         "render_crf": int(raw["render_crf"]) if strict else max(14, min(32, int(raw["render_crf"]))),
         "translator": translator, "target_lang": str(raw["target_lang"]).strip() or "zh-Hans",
-        "translate_model": _text(raw["translate_model"]) or None,
+        "translate_model": translate_model,
         "smart_translation": raw["smart_translation"] if strict else bool(raw["smart_translation"]),
         "smart_subtitle_layout": raw["smart_subtitle_layout"] if strict else bool(raw["smart_subtitle_layout"]),
         "font_name": str(raw["font_name"]).strip() or "Microsoft YaHei", "font_size": font_size,
@@ -358,42 +373,62 @@ def capabilities() -> dict[str, Any]:
 def preflight(
     payload: dict[str, Any], output_dir: str,
     profile_in_use: Callable[[str], bool] | None = None,
+    required_stages: set[str] | None = None,
 ) -> dict[str, Any]:
+    """Validate settings needed by the requested workflow stages.
+
+    ``None`` deliberately preserves the public, full preflight contract.  A
+    prepare operation can pass the remaining stages so a resumed local task
+    does not re-check network/model dependencies belonging to completed work.
+    """
     options = normalize_options(payload.get("options"), output_dir)
+    stages = None if required_stages is None else set(required_stages)
+    needs = lambda stage: stages is None or stage in stages
     blocking: list[dict[str, str]] = []
     warnings: list[dict[str, str]] = []
     add_block = lambda code, message: blocking.append({"code": code, "message": message})
     add_warn = lambda code, message: warnings.append({"code": code, "message": message})
     source_url = str(payload.get("source_url", "")).strip()
-    if not source_url and not payload.get("material_id"): add_block("source_missing", "还没有选择素材。")
-    if not bool(payload.get("authorized", False)): add_block("authorization_required", "还没有确认处理授权。")
-    if options["target_lang"].lower().startswith("zh") and options["translator"] == "none": add_block("translator_required", "中文字幕不能使用 none 翻译器。")
-    if options["translator"] == "deepseek" and not os.getenv("DEEPSEEK_API_KEY"): add_block("deepseek_key_missing", "DeepSeek API Key 尚未配置。")
-    if options["translator"] == "openai" and not os.getenv("OPENAI_API_KEY"): add_block("openai_key_missing", "OpenAI API Key 尚未配置。")
-    if options["cookies_file"] and not Path(options["cookies_file"]).expanduser().is_file(): add_block("cookies_missing", "Cookies 文件不存在，请重新选择。")
-    if source_url and options["youtube_po_token_mode"] == "auto":
+    if needs("acquire"):
+        if not source_url and not payload.get("material_id"): add_block("source_missing", "还没有选择素材。")
+        if not bool(payload.get("authorized", False)): add_block("authorization_required", "还没有确认处理授权。")
+        if options["cookies_file"] and not Path(options["cookies_file"]).expanduser().is_file(): add_block("cookies_missing", "Cookies 文件不存在，请重新选择。")
+    if needs("translate"):
+        if options["target_lang"].lower().startswith("zh") and options["translator"] == "none": add_block("translator_required", "中文字幕不能使用 none 翻译器。")
+        if options["translator"] == "deepseek" and not os.getenv("DEEPSEEK_API_KEY"): add_block("deepseek_key_missing", "DeepSeek API Key 尚未配置。")
+        if options["translator"] == "openai" and not os.getenv("OPENAI_API_KEY"): add_block("openai_key_missing", "OpenAI API Key 尚未配置。")
+        if options["translator"] == "ollama":
+            local = ollama_local_status()
+            if not local["runtime_available"]:
+                add_block("ollama-runtime", str(local["runtime_message"]))
+            else:
+                model = options["translate_model"] or "qwen3.5:4b"
+                model_id = next((key for key, tag in OLLAMA_MODEL_TAGS.items() if tag == model), None)
+                if model_id and not local["models"].get(model_id, False):
+                    add_block(model_id, f"本地模型 {model} 尚未下载。请在依赖中心点击“下载模型”；完成后无需重启。")
+    if needs("acquire") and source_url and options["youtube_po_token_mode"] == "auto":
         po_status = po_token_provider_status()
         if not po_status["available"]:
             add_warn("youtube_po_provider_missing", "安装包缺少 YouTube 自动浏览器验证组件；将使用 yt-dlp 常规模式，受限视频可能失败。")
         elif not po_status["browser_path"]:
             add_warn("youtube_po_browser_unknown", "未预先检测到 Chrome/Edge；开始任务时验证组件会再次自动查找浏览器。")
-    if source_url and options["download_quality"] == "original":
+    if needs("acquire") and source_url and options["download_quality"] == "original":
         source_height = int(payload.get("source_height") or 0)
         detail = f"（检测到最高 {source_height}p）" if source_height >= 2160 else ""
         add_warn("original_quality_load", f"原始画质可能显著增加下载、OCR 和字幕渲染负载{detail}；普通电脑推荐 1080p。")
-    if options["render_encoder"] == "nvidia" and not render_encoder_status()["nvidia"]:
+    if needs("render") and options["render_encoder"] == "nvidia" and not render_encoder_status()["nvidia"]:
         add_block("nvenc_unavailable", "未检测到可用的 NVIDIA NVENC；请改用自动或 CPU 渲染。")
     device = str(payload.get("device", "cpu")).lower()
     compute_type = str(payload.get("compute_type", "int8")).lower()
-    if device == "cpu" and compute_type in {"float16", "int8_float16"}: add_block("precision_incompatible", "CPU 不支持当前 float16 精度，请使用 int8 或 float32。")
-    caps = capabilities()
-    if not caps["ffmpeg"]["available"]: add_block("ffmpeg_missing", "未检测到 FFmpeg，无法提取音频或渲染视频。")
-    if options["subtitle_source"] == "ocr" and not caps["tesseract"]["available"]: add_block("tesseract_required", "纯 OCR 模式需要 Tesseract，请安装后重试。")
-    elif options["subtitle_source"] in {"merged", "auto"} and not caps["tesseract"]["available"]: add_warn("ocr_unavailable", "未安装 Tesseract；如需 OCR 将自动退回音频转写。")
-    if options["subtitle_source"] in {"ocr", "merged"} and caps["tesseract"]["available"]:
+    if needs("extract") and device == "cpu" and compute_type in {"float16", "int8_float16"}: add_block("precision_incompatible", "CPU 不支持当前 float16 精度，请使用 int8 或 float32。")
+    caps = capabilities() if needs("extract") or needs("render") else None
+    if caps is not None and not caps["ffmpeg"]["available"]: add_block("ffmpeg_missing", "未检测到 FFmpeg，无法提取音频或渲染视频。")
+    if needs("extract") and options["subtitle_source"] == "ocr" and caps is not None and not caps["tesseract"]["available"]: add_block("tesseract_required", "纯 OCR 模式需要 Tesseract，请安装后重试。")
+    elif needs("extract") and options["subtitle_source"] in {"merged", "auto"} and caps is not None and not caps["tesseract"]["available"]: add_warn("ocr_unavailable", "未安装 Tesseract；如需 OCR 将自动退回音频转写。")
+    if needs("extract") and options["subtitle_source"] in {"ocr", "merged"} and caps is not None and caps["tesseract"]["available"]:
         installed = available_ocr_languages()
         missing = [item for item in options["ocr_language"].split("+") if item not in installed]
         if missing:
             add_block("ocr_language_missing", f"Tesseract 缺少语言包：{', '.join(missing)}。请安装语言数据或更改 OCR 语言。")
-    if options["publish_to_bilibili"] and profile_in_use and profile_in_use(options["bilibili_browser"]): add_block("bilibili_profile_busy", "B 站自动化浏览器正在使用中，请关闭后再开始全流程。")
+    if needs("publish") and options["publish_to_bilibili"] and profile_in_use and profile_in_use(options["bilibili_browser"]): add_block("bilibili_profile_busy", "B 站自动化浏览器正在使用中，请关闭后再开始全流程。")
     return {"ready": not blocking, "blocking": blocking, "warnings": warnings, "normalized_options": options}

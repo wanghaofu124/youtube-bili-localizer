@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from yblocalizer.models import Segment, save_segments
-from yblocalizer.subtitle import format_segment_text, format_srt_timestamp, read_srt_segments, segments_to_srt, write_srt
+from yblocalizer.subtitle import format_segment_text, format_srt_timestamp, read_srt_segments, segments_to_srt, translated_layout_issues, write_srt
 
 
 def test_format_srt_timestamp_clamps_and_rounds() -> None:
@@ -17,6 +17,97 @@ def test_bilingual_translation_first_and_cjk_layout() -> None:
     assert text.splitlines()[-1] == "A short English source"
     assert "\n" in text
 
+
+def test_bilingual_prefers_one_chinese_line_and_one_english_line() -> None:
+    segment = Segment(
+        0,
+        6,
+        "You see, my idea was for Pandora to be an ecosystem vivarium, and with all its plants",
+        "你知道，我的设想是让潘多拉成为生态缸，而如今所有植物",
+    )
+    text = format_segment_text(
+        segment,
+        display_mode="bilingual-translation-first",
+        max_chars_per_line=18,
+    )
+    lines = text.splitlines()
+    chinese = [line for line in lines if any("\u4e00" <= char <= "\u9fff" for char in line)]
+    english = [line for line in lines if line not in chinese]
+    assert chinese == ["你知道，我的设想是让潘多拉成为生态缸，而如今所有植物"]
+    assert english == [
+        "You see, my idea was for Pandora to be an ecosystem vivarium, and with all its plants"
+    ]
+
+
+def test_bilingual_allows_two_rows_only_when_chinese_is_too_long() -> None:
+    segment = Segment(
+        0,
+        8,
+        "This is a much longer English sentence that should also wrap once Chinese overflows the single-line bilingual budget.",
+        "这是一句明显超过双语单行上限的中文翻译内容，用来确认只有在中文本身过长时才允许两边都折成两行显示。",
+    )
+    text = format_segment_text(
+        segment,
+        display_mode="bilingual-translation-first",
+        max_chars_per_line=18,
+    )
+    lines = text.splitlines()
+    chinese = [line for line in lines if any("\u4e00" <= char <= "\u9fff" for char in line)]
+    english = [line for line in lines if line not in chinese]
+    assert len(chinese) == 2
+    assert len(english) == 2
+
+
+def test_dense_chinese_layout_never_emits_more_than_two_rows_per_cue() -> None:
+    translated = "从模拟子弹对战致命猎物，到让一千只蚂蚁对抗杀手大黄蜂大军，再到意外在我家引发全面战争——这些就是我2026年最精彩的视频。"
+    result = format_segment_text(
+        Segment(0, 4, "A long voice-over sentence", translated),
+        display_mode="translated",
+        max_chars_per_line=18,
+        max_lines=2,
+    )
+
+    assert len(result.splitlines()) <= 2
+    assert "".join(result.splitlines()) == translated
+
+
+def test_dense_chinese_layout_is_rejected_before_render() -> None:
+    dense = Segment(0, 4, "source", "一段明显超出两行画面容量的字幕，一段明显超出两行画面容量的字幕，一段明显超出两行画面容量的字幕。")
+    concise = Segment(4, 6, "source", "简短字幕。")
+    assert [item[0] for item in translated_layout_issues([dense, concise])] == [1]
+
+
+def test_balanced_chinese_rows_do_not_strand_a_measure_word() -> None:
+    segment = Segment(0, 4, "source", "兄弟们，目的就是先在一面快速煎一下，然后翻面")
+    rows = format_segment_text(segment).splitlines()
+    assert len(rows) == 2
+    assert "".join(rows) == segment.translated_text
+    assert not any(left.endswith("一") and right.startswith("面") for left, right in zip(rows, rows[1:]))
+    assert not any(left.endswith("快") and right.startswith("速") for left, right in zip(rows, rows[1:]))
+
+
+@pytest.mark.parametrize(
+    "text,broken",
+    [
+        ("去猎杀这颗星球上最疯狂的动物，横跨一大堆", "疯\n狂"),
+        ("是我带来帮自己度过接下来几天的。这里有一把鱼枪", "接下\n来"),
+        ("伙计们，这会是一条漂亮的鱼，但你们能看到", "漂\n亮"),
+        ("在评论区告诉我该给他取什么名字，他是个真正的幸存者", "什\n么"),
+    ],
+)
+def test_chinese_layout_never_uses_character_balance_to_break_a_word(
+    text: str, broken: str,
+) -> None:
+    result = format_segment_text(Segment(0, 4, "source", text))
+    assert broken not in result
+    assert result.replace("\n", "") == text
+    assert len(result.splitlines()) <= 2
+
+
+def test_unpunctuated_chinese_stays_intact_when_no_safe_break_exists() -> None:
+    text = "这段字幕没有明确的语义边界千万不要按字数硬拆开"
+    result = format_segment_text(Segment(0, 4, "source", text))
+    assert result == text
 
 def test_srt_keeps_sequence_and_time_alignment() -> None:
     output = segments_to_srt([Segment(0, 1.2, "hello", "你好")], smart_layout=False)

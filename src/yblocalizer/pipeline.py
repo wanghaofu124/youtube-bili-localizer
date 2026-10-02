@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 from .models import VideoJob
-from .util import ensure_rights_confirmed, timestamp_id
+from .util import allocate_job_folder_name, ensure_rights_confirmed
 from .runtime import CancellationRequested, PipelineContext, PipelineStage
 from .cancellation import _cancellation_requested as _deprecated_global_cancellation
 
@@ -59,6 +59,7 @@ class PipelineOptions:
     youtube_po_token_mode: str = "auto"
     youtube_proxy: str | None = None
     download_quality: str = "1080p"
+    quality_proposal: dict | None = None
     resource_profile: str = "balanced"
     max_seconds: int | None = None
     subtitle_source: str = "audio"
@@ -172,9 +173,29 @@ def run_pipeline(
     ctx = context or _legacy_context
     logger = log or (lambda message: print(message, flush=True))
     ensure_rights_confirmed(options.i_have_rights)
-    work_dir = options.output_dir / timestamp_id()
+    work_dir = options.output_dir / allocate_job_folder_name(
+        options.output_dir,
+        title=getattr(options, "title", None),
+        source_url=options.source if getattr(options, "source_kind", "") == "url" else None,
+        source_name=Path(options.source).name if options.source and getattr(options, "source_kind", "") != "url" else None,
+    )
     work_dir.mkdir(parents=True, exist_ok=True)
     artifacts = WorkflowArtifacts()
+    if options.source_kind == "url" and not options.quality_proposal:
+        # Legacy/Tk callers share this scheduler; never let them bypass the
+        # server-side proposal gate by calling the downloader directly.
+        from .download import get_video_metadata
+        metadata = get_video_metadata(
+            options.source, options.cookies_from_browser, options.cookies_file,
+            proxy=options.youtube_proxy, po_token_mode=options.youtube_po_token_mode,
+            download_quality=options.download_quality,
+        )
+        proposal = metadata.quality_proposal or {}
+        if not proposal.get("width") or not proposal.get("height"):
+            raise RuntimeError("无法确定服务器拟下载的视频流，请重新准备素材。")
+        if proposal.get("requires_consent"):
+            raise RuntimeError("当前下载画质低于档位上限，需要先明确确认画质方案。")
+        options.quality_proposal = proposal
     stages = ["acquire", "extract", "translate", "render"]
     if options.publish_to_bilibili:
         stages.append("publish")

@@ -1,10 +1,13 @@
 param(
     [switch]$Clean,
-    [string]$Version = "0.2.6",
+    [string]$Version = "0.2.41",
     [string]$AppName = "YouTubeBiliLocalizer",
     [string]$PythonExe = "",
     [string]$SigningThumbprint = "",
-    [switch]$RequireSignature
+    [switch]$RequireSignature,
+    [switch]$SkipNativeSmokeTest,
+    # When set, overwrite this onedir install and refresh the desktop shortcut.
+    [string]$InstallDir = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -89,6 +92,7 @@ foreach ($module in $Excluded) { $Arguments += @("--exclude-module", $module) }
 $Arguments += @(
     "--collect-submodules", "faster_whisper",
     "--collect-data", "faster_whisper",
+    "--collect-all", "pysubs2",
     "--collect-binaries", "ctranslate2",
     "--collect-all", "playwright",
     "--collect-all", "nodriver",
@@ -136,9 +140,11 @@ $OnnxRuntimeDll = Join-Path $AppRoot "_internal\onnxruntime\capi\onnxruntime_pro
 if (-not (Test-Path -LiteralPath $OnnxRuntimeDll)) {
     throw "ONNX Runtime is missing from the release; Whisper VAD cannot run."
 }
-$NativeSmoke = Start-Process -FilePath $AppExe -ArgumentList @("--whisper-worker", "--native-smoke-test") -WindowStyle Hidden -Wait -PassThru
-if ($NativeSmoke.ExitCode -ne 0) {
-    throw "Frozen Whisper native dependency smoke test failed with exit code $($NativeSmoke.ExitCode)."
+if (-not $SkipNativeSmokeTest) {
+    $NativeSmoke = Start-Process -FilePath $AppExe -ArgumentList @("--whisper-worker", "--native-smoke-test") -WindowStyle Hidden -Wait -PassThru
+    if ($NativeSmoke.ExitCode -ne 0) {
+        throw "Frozen Whisper native dependency smoke test failed with exit code $($NativeSmoke.ExitCode)."
+    }
 }
 if ($SigningThumbprint) {
     $SignTool = Get-Command signtool.exe -ErrorAction SilentlyContinue
@@ -173,3 +179,26 @@ $hash = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash.ToLowerInvar
 Set-Content -LiteralPath "$ZipPath.sha256" -Value "$hash  $(Split-Path $ZipPath -Leaf)" -Encoding ascii
 Write-Host "Release: $ZipPath"
 Write-Host "Unpacked size: $([math]::Round($size / 1MB, 1)) MB"
+
+if ($InstallDir) {
+    $InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
+    Write-Host "Installing to: $InstallDir"
+    Get-Process -Name $AppName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+    New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+    & robocopy.exe $AppRoot $InstallDir /MIR /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "Install robocopy failed with exit code $LASTEXITCODE" }
+    $InstalledExe = Join-Path $InstallDir "$AppName.exe"
+    if (-not (Test-Path -LiteralPath $InstalledExe)) { throw "Installed exe missing: $InstalledExe" }
+
+    $Desktop = [Environment]::GetFolderPath("Desktop")
+    $ShortcutPath = Join-Path $Desktop "YouTube Bili Localizer.lnk"
+    $Shell = New-Object -ComObject WScript.Shell
+    $Shortcut = $Shell.CreateShortcut($ShortcutPath)
+    $Shortcut.TargetPath = $InstalledExe
+    $Shortcut.WorkingDirectory = $InstallDir
+    $Shortcut.IconLocation = "$InstalledExe,0"
+    $Shortcut.Description = "YouTube Bili Localizer"
+    $Shortcut.Save()
+    Write-Host "Desktop shortcut: $ShortcutPath -> $InstalledExe"
+}

@@ -35,14 +35,35 @@ def _discover_windows_command(name: str) -> Path | None:
     return matches[0] if matches else None
 
 
+def _safe_console_print(message: str) -> None:
+    """Write diagnostics without letting the local console encoding stop work."""
+    stream = sys.stdout
+    if stream is None:
+        return
+    try:
+        print(message, file=stream, flush=True)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        escaped = message.encode(encoding, errors="backslashreplace").decode(encoding)
+        try:
+            print(escaped, file=stream, flush=True)
+        except (OSError, UnicodeError, ValueError):
+            pass
+    except (OSError, ValueError):
+        # GUI/frozen launchers may have no attached console at all.
+        pass
+
+
 def run(
     command: list[str],
     cwd: Path | None = None,
     cancel_check: Callable[[], bool] | None = None,
     resource_profile: str = "balanced",
+    progress_callback: Callable[[float], None] | None = None,
+    progress_duration: float | None = None,
 ) -> None:
     printable = " ".join(command)
-    print(f"$ {printable}")
+    _safe_console_print(f"$ {printable}")
     creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
     process = subprocess.Popen(
         command, cwd=cwd, text=True, errors="replace",
@@ -52,6 +73,24 @@ def run(
     lower_process_priority(process, normalize_resource_profile(resource_profile))
     output: list[str] = []
     cancelled = False
+    last_progress = 0.0
+
+    def _report_progress(line: str) -> None:
+        nonlocal last_progress
+        if not progress_callback:
+            return
+        if line.startswith(("out_time_us=", "out_time_ms=")) and progress_duration and progress_duration > 0:
+            try:
+                elapsed = int(line.partition("=")[2]) / 1_000_000
+            except ValueError:
+                return
+            fraction = max(0.0, min(0.99, elapsed / progress_duration))
+            if fraction > last_progress:
+                last_progress = fraction
+                progress_callback(fraction)
+        elif line.strip() == "progress=end" and last_progress < 1.0:
+            last_progress = 1.0
+            progress_callback(1.0)
 
     def _watch_cancel() -> None:
         nonlocal cancelled
@@ -74,7 +113,9 @@ def run(
             if not line and process.poll() is not None:
                 break
             if line:
-                output.append(line.rstrip())
+                value = line.rstrip()
+                output.append(value)
+                _report_progress(value)
         if cancelled:
             raise CancellationRequested("任务已被用户中断")
         if process.returncode != 0:
@@ -107,10 +148,103 @@ def _terminate_process_tree(process: subprocess.Popen[str]) -> None:
 
 def slugify(value: str, fallback: str = "video") -> str:
     value = re.sub(r"[^\w\-.]+", "-", value, flags=re.UNICODE).strip("-._")
+    value = re.sub(r"-{2,}", "-", value)
     return value[:80] or fallback
 
 
-def timestamp_id(prefix: str = "job") -> str:
+_YOUTUBE_ID_RE = re.compile(
+    r"(?:youtube\.com/(?:watch\?(?:[^#]*&)?v=|shorts/|embed/|live/)|youtu\.be/)"
+    r"([A-Za-z0-9_-]{6,})",
+    re.IGNORECASE,
+)
+_MEDIA_SUFFIXES = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".mp3", ".wav", ".m4a")
+
+
+def extract_youtube_video_id(url: str | None) -> str | None:
+    text = (url or "").strip()
+    if not text:
+        return None
+    match = _YOUTUBE_ID_RE.search(text)
+    return match.group(1) if match else None
+
+
+def _folder_safe_slug(value: str, *, max_len: int = 48, fallback: str = "") -> str:
+    """Slug for job folder / job id segments (no dots — keep URL routes working)."""
+    text = (value or "").strip()
+    lowered = text.lower()
+    for suffix in _MEDIA_SUFFIXES:
+        if lowered.endswith(suffix):
+            text = text[: -len(suffix)]
+            break
+    # Prefer pathlib stem when the value looks like a file path.
+    if "/" in text or "\\" in text:
+        text = Path(text).stem
+    slug = slugify(text, fallback=fallback or "task")
+    slug = slug.replace(".", "-").strip("-._")
+    return (slug[:max_len] or (fallback or "task"))
+
+
+def job_folder_label(
+    *,
+    title: str | None = None,
+    source_url: str | None = None,
+    source_name: str | None = None,
+    max_len: int = 48,
+) -> str:
+    """Human-readable folder label from title / YouTube id / local file name."""
+    video_id = extract_youtube_video_id(source_url)
+    title_slug = _folder_safe_slug(title or "", max_len=max_len, fallback="")
+    if title_slug and title_slug != "task" and video_id:
+        # Keep both: easy to spot the video and still unique across re-runs.
+        id_part = video_id[:12]
+        remain = max(8, max_len - len(id_part) - 1)
+        return f"{id_part}_{title_slug[:remain]}"
+    if title_slug and title_slug != "task":
+        return title_slug
+    if video_id:
+        return video_id
+    file_slug = _folder_safe_slug(source_name or "", max_len=max_len, fallback="")
+    if file_slug and file_slug != "task":
+        return file_slug
+    return "task"
+
+
+def allocate_job_folder_name(
+    output_root: Path,
+    *,
+    title: str | None = None,
+    source_url: str | None = None,
+    source_name: str | None = None,
+    now: datetime | None = None,
+) -> str:
+    """Allocate a unique work-dir name: YYYYMMDD-HHMMSS_label[-n]."""
+    stamp = (now or datetime.now()).strftime("%Y%m%d-%H%M%S")
+    label = job_folder_label(title=title, source_url=source_url, source_name=source_name)
+    base = f"{stamp}_{label}"
+    # Windows path safety: no trailing dots/spaces.
+    base = base.rstrip(". ")
+    candidate = base
+    suffix = 2
+    root = output_root
+    while (root / candidate).exists():
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+        if suffix > 99:
+            from uuid import uuid4
+
+            candidate = f"{base}-{uuid4().hex[:6]}"
+            break
+    return candidate
+
+
+def timestamp_id(prefix: str = "job", *, title: str | None = None) -> str:
+    """Legacy CLI helper; prefers readable stamp_label when a title is given."""
+    if title and title.strip():
+        # Ignore output_root collision here; callers that need uniqueness should
+        # use allocate_job_folder_name with a real output root.
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        label = job_folder_label(title=title)
+        return f"{stamp}_{label}"
     return f"{prefix}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
 

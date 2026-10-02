@@ -8,19 +8,31 @@ processes, which keeps the HTTP handlers and the media pipeline declarative.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
+from urllib.error import HTTPError, URLError
+from urllib.request import ProxyHandler, Request, build_opener
 import uuid
 from typing import Any, Callable
 
 
 WEBVIEW2_DOWNLOAD_URL = "https://developer.microsoft.com/microsoft-edge/webview2/"
 WINGET_HELP_URL = "https://learn.microsoft.com/windows/package-manager/winget/"
+OLLAMA_DOWNLOAD_URL = "https://ollama.com/download/windows"
+OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+OLLAMA_MODEL_TAGS: dict[str, str] = {
+    "ollama-qwen35-4b": "qwen3.5:4b",
+    "ollama-qwen35-9b": "qwen3.5:9b",
+    "ollama-translategemma-12b": "translategemma:12b",
+}
+OLLAMA_SPECIALIZED_TRANSLATION_MODELS = frozenset({"translategemma:12b"})
 _SCAN_CACHE_TTL_SECONDS = 10.0
 _scan_cache: dict[tuple[str, str], tuple[float, list[Path]]] = {}
 _scan_cache_lock = threading.Lock()
@@ -39,6 +51,7 @@ class DependencySpec:
     install_kind: str | None
     size_hint: str
     action_url: str | None = None
+    model_tag: str | None = None
 
 
 SPECS: tuple[DependencySpec, ...] = (
@@ -53,6 +66,10 @@ SPECS: tuple[DependencySpec, ...] = (
     DependencySpec("tesseract", "Tesseract OCR", "OCR 与音频+OCR 字幕模式", False, "winget", "约 100 MB", WINGET_HELP_URL),
     DependencySpec("playwright-chromium", "投稿辅助浏览器", "B 站登录检查、上传与填表", False, "playwright", "约 300 MB"),
     DependencySpec("webview2", "Microsoft WebView2", "显示桌面应用窗口", True, None, "通常随 Windows/Edge 安装", WEBVIEW2_DOWNLOAD_URL),
+    DependencySpec("ollama-runtime", "Ollama 本地运行环境", "在本机运行免费翻译模型；不会随应用打包", False, None, "单独安装", OLLAMA_DOWNLOAD_URL),
+    DependencySpec("ollama-qwen35-4b", "Qwen 3.5 4B 本地翻译模型", "本地翻译，适合内存较有限的电脑；首次下载约 3.4 GB", False, "ollama-model", "约 3.4 GB", model_tag="qwen3.5:4b"),
+    DependencySpec("ollama-qwen35-9b", "Qwen 3.5 9B 本地翻译模型", "本地翻译；首次下载约 6.6 GB", False, "ollama-model", "约 6.6 GB", model_tag="qwen3.5:9b"),
+    DependencySpec("ollama-translategemma-12b", "TranslateGemma 12B 本地翻译模型", "专用多语言翻译模型；模型文件约 8.1 GB，字幕术语仍需人工复核", False, "ollama-model", "约 8.1 GB", model_tag="translategemma:12b"),
 )
 
 _COMMAND_CANDIDATES: dict[str, tuple[Path, ...]] = {
@@ -64,6 +81,10 @@ _COMMAND_CANDIDATES: dict[str, tuple[Path, ...]] = {
     "tesseract": (
         Path(os.environ.get("ProgramFiles", "")) / "Tesseract-OCR" / "tesseract.exe",
         Path(os.environ.get("ProgramFiles(x86)", "")) / "Tesseract-OCR" / "tesseract.exe",
+    ),
+    "ollama": (
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe",
+        Path(os.environ.get("ProgramFiles", "")) / "Ollama" / "ollama.exe",
     ),
 }
 
@@ -205,6 +226,53 @@ def _playwright_available() -> bool:
     return root.is_dir() and bool(list(root.glob("chromium-*")) or list(root.glob("chromium_headless_shell-*")))
 
 
+def _ollama_json(path: str, *, timeout: float = 2.0) -> dict[str, Any]:
+    """Read only Ollama's fixed loopback API; bypass system proxies explicitly."""
+    request = Request(f"{OLLAMA_BASE_URL}{path}", headers={"Accept": "application/json"})
+    with build_opener(ProxyHandler({})).open(request, timeout=timeout) as response:
+        value = json.loads(response.read().decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("Ollama returned an invalid response.")
+    return value
+
+
+def ollama_local_status() -> dict[str, Any]:
+    """Return runtime and allowlisted-model status without loading a model."""
+    executable = resolve_command("ollama")
+    try:
+        _ollama_json("/api/version")
+        try:
+            raw_tags = _ollama_json("/api/tags").get("models", [])
+            installed = {
+                str(item.get("name") or item.get("model") or "").strip()
+                for item in raw_tags if isinstance(item, dict)
+            } if isinstance(raw_tags, list) else set()
+        except (HTTPError, URLError, OSError, TimeoutError, ValueError, json.JSONDecodeError):
+            return {
+                "runtime_state": "unavailable", "runtime_available": False,
+                "runtime_message": "Ollama 已响应，但无法读取已安装模型。请检查 Ollama 后重试。",
+                "cli_available": bool(executable),
+                "models": {dependency_id: False for dependency_id in OLLAMA_MODEL_TAGS},
+            }
+        return {
+            "runtime_state": "ready", "runtime_available": True,
+            "runtime_message": "Ollama 正在运行。",
+            "cli_available": bool(executable),
+            "models": {dependency_id: tag in installed for dependency_id, tag in OLLAMA_MODEL_TAGS.items()},
+        }
+    except (HTTPError, URLError, OSError, TimeoutError, ValueError, json.JSONDecodeError):
+        if executable:
+            state, message = "stopped", "Ollama 已安装但当前未运行。请从 Windows 开始菜单启动 Ollama，再点“重新检测”；无需重启本应用。"
+        else:
+            state, message = "missing", "尚未安装 Ollama。请先从官方页面下载安装并启动；运行环境不会打进本应用。"
+        return {
+            "runtime_state": state, "runtime_available": False,
+            "runtime_message": message,
+            "cli_available": bool(executable),
+            "models": {dependency_id: False for dependency_id in OLLAMA_MODEL_TAGS},
+        }
+
+
 def dependency_statuses(user_data_root: Path | None = None) -> list[dict[str, Any]]:
     root = user_data_root or default_user_data_root()
     winget_available = resolve_command("winget", root / "tools") is not None
@@ -218,11 +286,14 @@ def dependency_statuses(user_data_root: Path | None = None) -> list[dict[str, An
         f"whisper-{size}": resolve_whisper_model(size, root) != size
         for size in ("tiny", "base", "small", "medium", "large-v3")
     }
+    ollama = ollama_local_status()
     available = {
         **command_available,
         **model_available,
         "playwright-chromium": _playwright_available(),
         "webview2": webview2_available(),
+        "ollama-runtime": bool(ollama["runtime_available"]),
+        **ollama["models"],
     }
     rows = []
     for spec in SPECS:
@@ -233,7 +304,32 @@ def dependency_statuses(user_data_root: Path | None = None) -> list[dict[str, An
             can_install = _module_available("faster_whisper")
         if spec.install_kind == "playwright":
             can_install = _module_available("playwright")
+        if spec.install_kind == "ollama-model":
+            can_install = bool(ollama["runtime_available"] and ollama.get("cli_available"))
         present = bool(available[spec.id])
+        state = "ready" if present else "missing"
+        if spec.id == "ollama-runtime":
+            state = str(ollama["runtime_state"])
+        elif spec.install_kind == "ollama-model" and not ollama["runtime_available"]:
+            state = "blocked"
+        elif spec.install_kind == "ollama-model" and not present and not ollama.get("cli_available"):
+            state = "blocked"
+        if spec.id == "ollama-runtime":
+            message = str(ollama["runtime_message"])
+        elif spec.install_kind == "ollama-model" and not ollama["runtime_available"]:
+            message = str(ollama["runtime_message"])
+        elif spec.install_kind == "ollama-model" and not present and not ollama.get("cli_available"):
+            message = "Ollama 正在运行，但没有找到 ollama 命令。请重新安装官方运行环境，或使用 Ollama 自行下载模型后重新检测。"
+        elif present:
+            message = "已安装，可以使用。"
+        elif spec.install_kind == "ollama-model":
+            message = "尚未下载。点击下载后模型会保存在 Ollama 管理的本机模型目录；下载完成可立即使用。"
+        else:
+            message = "点击安装，完成后无需重启应用。" if can_install else (
+                "当前环境缺少 WinGet；点击说明安装 App Installer 后重试。" if spec.install_kind == "winget" else
+                "当前环境无法自动安装，请使用说明链接。" if spec.action_url else
+                "当前环境无法自动安装。"
+            )
         rows.append({
             "id": spec.id,
             "label": spec.label,
@@ -242,13 +338,11 @@ def dependency_statuses(user_data_root: Path | None = None) -> list[dict[str, An
             "available": present,
             "installable": can_install and not present,
             "size_hint": spec.size_hint,
-            "action_url": spec.action_url,
-            "message": "已安装，可以使用。" if present else (
-                "点击安装，完成后无需重启应用。" if can_install else
-                "当前环境缺少 WinGet；点击说明安装 App Installer 后重试。" if spec.install_kind == "winget" else
-                "当前环境无法自动安装，请使用说明链接。" if spec.action_url else
-                "当前环境无法自动安装。"
-            ),
+            "action_url": spec.action_url if spec.id != "ollama-runtime" or state == "missing" else None,
+            "message": message,
+            "state": state,
+            "action_label": "下载模型" if spec.install_kind == "ollama-model" else ("下载 Ollama" if spec.id == "ollama-runtime" and state == "missing" else None),
+            "depends_on": "ollama-runtime" if spec.install_kind == "ollama-model" else None,
         })
     return rows
 
@@ -394,6 +488,10 @@ class DependencyManager:
                 self._install_whisper(job, spec.id.removeprefix("whisper-"))
             elif spec.install_kind == "playwright":
                 self._install_playwright(job)
+            elif spec.install_kind == "ollama-model":
+                if not spec.model_tag or OLLAMA_MODEL_TAGS.get(spec.id) != spec.model_tag:
+                    raise RuntimeError("未知的本地翻译模型。")
+                self._install_ollama_model(job, spec.model_tag)
             else:
                 raise RuntimeError("该组件不能从应用内安装。")
             self._check_cancelled(job)
@@ -459,6 +557,21 @@ class DependencyManager:
         self._stream_command(job, [node, cli, "install", "chromium"], env=env)
         job.progress, job.message = 92, "浏览器下载完成，正在校验…"
 
+    def _install_ollama_model(self, job: InstallJob, model_tag: str) -> None:
+        if model_tag not in OLLAMA_MODEL_TAGS.values():
+            raise RuntimeError("不允许下载未登记的 Ollama 模型。")
+        if not ollama_local_status()["runtime_available"]:
+            raise RuntimeError("Ollama 尚未运行。请先启动 Ollama，再重新下载模型。")
+        ollama = resolve_command("ollama", self.tools_root)
+        if ollama is None:
+            raise RuntimeError("未找到 Ollama 命令。请重新安装 Ollama 并启动后重试。")
+        job.progress = 5
+        job.progress_kind = "indeterminate"
+        job.message = f"正在从 Ollama 官方模型库下载 {model_tag}；下载可安全取消，已下载的数据由 Ollama 保留。"
+        self._stream_command(job, [str(ollama), "pull", model_tag])
+        job.progress, job.progress_kind = 92, "determinate"
+        job.message = "模型下载完成，正在验证可用状态…"
+
     def _stream_command(self, job: InstallJob, command: list[str], env: dict[str, str] | None = None) -> None:
         self._check_cancelled(job)
         creationflags = 0
@@ -484,6 +597,13 @@ class DependencyManager:
                 if text:
                     job.logs.append(text)
                     job.logs[:] = job.logs[-100:]
+                    if job.dependency_id in OLLAMA_MODEL_TAGS:
+                        percent_match = re.search(r"\b(\d{1,3}(?:\.\d+)?)%", text)
+                        if percent_match:
+                            percent = max(0.0, min(100.0, float(percent_match.group(1))))
+                            job.progress = min(90, 5 + int(percent * 0.85))
+                            job.progress_kind = "determinate"
+                            job.message = f"正在下载本地翻译模型… {int(percent)}%"
             return_code = process.wait()
         finally:
             if process.stdout:

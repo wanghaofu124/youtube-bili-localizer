@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { videoLibraryCategory, videoLibraryMatches } from "./videoLibrary";
+import { retainVisibleVideoLibrarySelection, selectableVideoLibraryIds, videoLibraryCategory, videoLibraryMatches } from "./videoLibrary";
 
 const item = {
   id: "job-1",
@@ -21,5 +21,11 @@ describe("video library", () => {
     expect(videoLibraryMatches(item, "翻译")).toBe(true);
     expect(videoLibraryMatches(item, "API 暂时")).toBe(true);
     expect(videoLibraryMatches(item, "不存在的内容")).toBe(false);
+  });
+
+  it("keeps only visible, non-active selections", () => {
+    const visible = [item, { ...item, id: "running", status: "running" }];
+    expect(selectableVideoLibraryIds(visible)).toEqual(["job-1"]);
+    expect(retainVisibleVideoLibrarySelection(["job-1", "hidden", "running"], visible)).toEqual(["job-1"]);
   });
 });

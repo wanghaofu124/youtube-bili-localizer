@@ -1,9 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { stageAvailability, workflowPrimaryLabel } from "./workflowState";
-import { videoLibraryCategory, videoLibraryMatches, type VideoLibraryCategory } from "./videoLibrary";
+import { publishStageButton, sameTaskOption, stageAvailability, workflowPrimaryLabel } from "./workflowState";
+import { retainVisibleVideoLibrarySelection, selectableVideoLibraryIds, videoLibraryCategory, videoLibraryMatches, type VideoLibraryCategory } from "./videoLibrary";
 
 type View = "material" | "library" | "process" | "subtitle" | "publish" | "files";
 type WorkflowStageName = "acquire" | "extract" | "translate" | "render" | "publish";
+type RecoveryAction = {
+  id: "retry_extract_with_lower_resource";
+  stage: WorkflowStageName;
+  requires_confirmation: boolean;
+  impact: string;
+};
 type WorkflowStage = {
   status: "pending" | "ready" | "running" | "completed" | "failed" | "cancelled" | "stale" | "interrupted";
   progress: number;
@@ -11,6 +17,8 @@ type WorkflowStage = {
   started_at: number | null;
   finished_at: number | null;
   config_fingerprint: string | null;
+  error_code?: string | null;
+  recovery?: RecoveryAction | null;
 };
 type PreparationCheck = {
   id: string;
@@ -51,6 +59,7 @@ type Job = {
   error: string | null;
   error_code?: string | null;
   suggested_action?: string | null;
+  recovery?: RecoveryAction | null;
   result: {
     output_dir: string;
     source_srt: string;
@@ -75,12 +84,15 @@ type Job = {
   artifact_revision?: number;
   edit_state?: string;
   checkpoint_validation?: "pending" | "verified" | "invalid";
+  publish_copy?: { title: string; tags: string[]; has_metadata?: boolean };
   subtitle_extraction?: {
     mode: string;
     ocr_status: "not-requested" | "completed" | "fallback" | "failed";
     message: string | null;
   };
   content_warnings?: string[];
+  quality_proposal?: { width: number | null; height: number | null; baseline_width?: number | null; baseline_height?: number | null; quality: string; requires_consent?: boolean; fingerprint?: string } | null;
+  quality_consent?: boolean;
 };
 type Options = {
   title: string;
@@ -133,6 +145,7 @@ function mergeRestoredOptions(current: Options, restored: Partial<Options> | nul
   }
   return merged as Options;
 }
+
 type Template = { name: string; body: string };
 type OutputFile = {
   id: string;
@@ -144,6 +157,7 @@ type OutputFile = {
 type OutputTask = {
   id: string;
   name: string;
+  title?: string;
   size: number;
   size_label: string;
   modified_at: number;
@@ -186,6 +200,30 @@ type TestHistoryCandidate = {
   reason: string;
   created_at: number | null;
 };
+type HistoryDeletePlan = {
+  mode: "record_only" | "record_and_outputs";
+  job_ids: string[];
+  tasks: Array<{ id: string; title: string; status: string; output_dir: string; files: Array<{ path: string; name: string; size: number }>; bytes: number; disposition?: "verified_files" | "record_only_required"; reason?: string }>;
+  task_count: number;
+  file_count: number;
+  bytes: number;
+  verified_files_count?: number;
+  record_only_required_count?: number;
+  fingerprint: string;
+};
+type OutputDeletePlan = {
+  root: string;
+  paths: string[];
+  targets: Array<{ id: string; name: string; kind: "task" | "file"; record_will_remove: boolean; file_count: number; bytes: number }>;
+  target_count: number;
+  file_count: number;
+  bytes: number;
+  fingerprint: string;
+};
+type DeleteItemResult = { id: string; status: "deleted" | "failed" | "partial"; record_removed: boolean; bytes: number; error: string | null };
+type PendingDelete =
+  | { source: "history"; plan: HistoryDeletePlan; mode: "record_only" | "record_and_outputs" }
+  | { source: "outputs"; plan: OutputDeletePlan };
 type Diagnostic = {
   id: string;
   label: string;
@@ -198,6 +236,9 @@ type Dependency = Diagnostic & {
   installable: boolean;
   size_hint: string;
   action_url: string | null;
+  state?: "ready" | "missing" | "stopped" | "blocked" | "unavailable";
+  action_label?: string | null;
+  depends_on?: string | null;
 };
 type DependencyInstallJob = {
   id: string;
@@ -254,8 +295,16 @@ const nav: Array<[View, string, string]> = [
   ["publish", "发布", "B 站投稿辅助"],
   ["files", "文件", "输出与空间管理"],
 ];
-const timecode = (seconds: number) =>
-  `00:${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
+const timecode = (seconds: number, precise = false) => {
+  const safe = precise ? Math.round(Math.max(0, seconds) * 10) / 10 : Math.floor(Math.max(0, seconds));
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  const wholeSeconds = Math.floor(safe % 60);
+  const base = hours
+    ? `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`
+    : String(minutes).padStart(2, "0");
+  return `${base}:${precise ? (safe % 60).toFixed(1).padStart(4, "0") : String(wholeSeconds).padStart(2, "0")}`;
+};
 
 const parseTime = (value: string): number | null => {
   const parts = value.trim().split(":").map((item) => Number(item));
@@ -271,6 +320,43 @@ const formatTime = (seconds: number) => {
   const minutes = Math.floor(value / 60);
   const rest = value % 60;
   return `${String(minutes).padStart(2, "0")}:${rest.toFixed(1).padStart(4, "0")}`;
+};
+
+const truncateLabel = (text: string, max = 42) => {
+  const value = (text || "").trim();
+  if (value.length <= max) return value;
+  return `${value.slice(0, Math.max(1, max - 1))}…`;
+};
+
+const formatOutputTaskStamp = (modifiedAt: number) => {
+  if (!modifiedAt) return "";
+  try {
+    return new Date(modifiedAt * 1000).toLocaleString(undefined, {
+      month: "numeric",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return "";
+  }
+};
+
+const outputTaskDisplayTitle = (task: OutputTask, fallbackTitles?: Map<string, string>) => {
+  const fromApi = (task.title || "").trim();
+  if (fromApi && fromApi !== task.name) return fromApi;
+  const fromHistory = fallbackTitles?.get(task.name)?.trim();
+  if (fromHistory) return fromHistory;
+  return fromApi || task.name;
+};
+
+const formatPublishSourceLabel = (task: OutputTask, file: OutputFile, fallbackTitles?: Map<string, string>) => {
+  const title = truncateLabel(outputTaskDisplayTitle(task, fallbackTitles), 36);
+  const stamp = formatOutputTaskStamp(task.modified_at);
+  const bits = [title];
+  if (stamp) bits.push(stamp);
+  if (file.name && file.name.toLowerCase() !== "rendered.mp4") bits.push(file.name);
+  return bits.join(" · ");
 };
 
 const copyToClipboard = async (text: string): Promise<boolean> => {
@@ -359,6 +445,7 @@ const workflowStageMeta: Array<[WorkflowStageName, string, string]> = [
   ["render", "渲染", "使用 FFmpeg 生成 SRT 与硬字幕成片。"],
   ["publish", "发布辅助", "可选；上传并填表，始终停在人工提交前。"],
 ];
+const whisperModelOrder = ["tiny", "base", "small", "medium", "large-v3"] as const;
 const stageStatusLabel: Record<string, string> = {
   pending: "待执行", ready: "可执行", running: "运行中", completed: "已完成",
   failed: "失败", cancelled: "已取消", stale: "需重做", interrupted: "意外中断",
@@ -366,6 +453,47 @@ const stageStatusLabel: Record<string, string> = {
 
 function FieldGuide({ summary, detail, badges = [] }: { summary: string; detail: string; badges?: string[] }) {
   return <span className="field-guide"><small>{summary}</small><span className="guide-badges">{badges.map((badge) => <i key={badge}>{badge}</i>)}</span><details><summary>？ 选择建议与影响</summary><p>{detail}</p></details></span>;
+}
+
+function ActivityBars() {
+  return <span className="activity-bars" aria-hidden="true"><i /><i /><i /><i /><i /></span>;
+}
+
+function describeTaskError(message: string, fallbackTitle = "任务处理未完成", fallbackHint = "查看技术详情，确认原因后从失败阶段继续。"): { title: string; hint: string } {
+  if (/WinError 32|另一个程序正在使用|being used by another process|Unable to rename file/i.test(message)) {
+    return { title: "文件写入失败", hint: "目标文件可能正在被其他程序占用。关闭占用文件的程序后，再从失败阶段继续。" };
+  }
+  if (/WinError 10060|连接尝试失败|youtube_network_timeout|媒体流时连接超时|timed out|Timeout/i.test(message)) {
+    return { title: "下载连接超时", hint: "YouTube 媒体 CDN 无响应。检查代理/VPN，或稍后重试「获取素材」。" };
+  }
+  if (/Sign in to confirm|not a bot|机器人验证|登录要求/i.test(message)) {
+    return { title: "视频访问被平台拦截", hint: "请检查 YouTube 访问设置或稍后重试。" };
+  }
+  if (/403 Forbidden|HTTP Error 403|HTTP 403/i.test(message)) {
+    return { title: "视频暂时无法访问", hint: "请检查链接、登录状态或网络连接。" };
+  }
+  if (/No such file|WinError 2|找不到指定的文件/i.test(message)) {
+    return { title: "找不到素材文件", hint: "原文件可能已移动或删除，请检查素材位置。" };
+  }
+  if (/out of memory|显存不足|CUDA OOM/i.test(message)) {
+    return { title: "处理资源不足", hint: "可尝试较小模型、低负载设置或 CPU 模式。" };
+  }
+  return { title: fallbackTitle, hint: fallbackHint };
+}
+
+function TaskErrorSummary({ message, fallbackTitle, fallbackHint }: { message: string; fallbackTitle?: string; fallbackHint?: string }) {
+  const { title, hint } = describeTaskError(message, fallbackTitle, fallbackHint);
+  return <div className="task-error-summary">
+    <div className="task-error-overview"><b>{title}</b><span>{hint}</span></div>
+    <details><summary>查看详情</summary><pre>{message}</pre></details>
+  </div>;
+}
+
+function mostlyCjk(text: string): boolean {
+  const chars = [...text].filter((character) => character.trim());
+  if (!chars.length) return false;
+  const cjk = chars.filter((character) => character >= "\u3400" && character <= "\u9fff").length;
+  return cjk / chars.length > 0.35;
 }
 declare global {
   interface Window { pywebview?: { api?: NativeBridge } }
@@ -404,11 +532,20 @@ function App() {
   const fileInput = useRef<HTMLInputElement>(null);
   const publishFileInput = useRef<HTMLInputElement>(null);
   const video = useRef<HTMLVideoElement>(null);
+  const timelinePlayhead = useRef<HTMLDivElement>(null);
+  const timelineCurrentTime = useRef<HTMLSpanElement>(null);
   const jobLogCursor = useRef(0);
+  const historyRequestSeq = useRef(0);
+  const publishHydrateKey = useRef("");
+  const installTargetJobId = useRef<string | null>(null);
+  const prepareSpecificJobRef = useRef<(jobId: string) => Promise<void>>(async () => undefined);
+  const schemeDirtyRef = useRef(false);
   const [view, setView] = useState<View>("material");
   const [materials, setMaterials] = useState<Material[]>([]);
   const [materialId, setMaterialId] = useState("");
   const [sourceUrl, setSourceUrl] = useState("");
+  const [materialSourceTab, setMaterialSourceTab] = useState<"url" | "local">("url");
+  const sourceRevision = useRef(0);
   const [authorized, setAuthorized] = useState(false);
   const [fullVideo, setFullVideo] = useState(false);
   const [durationValue, setDurationValue] = useState("10");
@@ -420,11 +557,20 @@ function App() {
   const [appVersion, setAppVersion] = useState("0.2.6");
   const [demoPreview, setDemoPreview] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
+  const jobRef = useRef<Job | null>(job);
+  jobRef.current = job;
+  const selectedJobIdRef = useRef<string | null>(job?.id ?? null);
   const [cues, setCues] = useState<Cue[]>([]);
+  const cueOwner = useRef<string | null>(null);
+  const cueGeneration = useRef(0);
+  const [cuesReady, setCuesReady] = useState(false);
   const [history, setHistory] = useState<Cue[][]>([]);
   const [future, setFuture] = useState<Cue[][]>([]);
   const [activeCue, setActiveCue] = useState<number | null>(null);
+  const [selectedCue, setSelectedCue] = useState<number | null>(null);
   const [preview, setPreview] = useState<"source" | "rendered">("source");
+  const [mediaNonce, setMediaNonce] = useState(0);
+  const [mediaDuration, setMediaDuration] = useState<number | null>(null);
   const [online, setOnline] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -438,6 +584,7 @@ function App() {
     view_count: number | null;
     max_width: number | null;
     max_height: number | null;
+    quality_proposal?: { width: number | null; height: number | null; quality: string; requires_consent?: boolean; fingerprint?: string } | null;
   } | null>(null);
   const [metadataNotice, setMetadataNotice] = useState("");
   const [metadataState, setMetadataState] = useState<
@@ -465,9 +612,17 @@ function App() {
   const [readiness, setReadiness] = useState<string[]>([]);
   const [preflightWarnings, setPreflightWarnings] = useState<string[]>([]);
   const [preparingJob, setPreparingJob] = useState(false);
+  const preparingJobRef = useRef(preparingJob);
+  preparingJobRef.current = preparingJob;
   const [outputs, setOutputs] = useState<Outputs | null>(null);
   const [selectedOutputPaths, setSelectedOutputPaths] = useState<string[]>([]);
   const [selectedOutputTaskIds, setSelectedOutputTaskIds] = useState<string[]>([]);
+  const [pendingDelete, setPendingDelete] = useState<PendingDelete | null>(null);
+  const [deleteResults, setDeleteResults] = useState<DeleteItemResult[] | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [historyDeleteError, setHistoryDeleteError] = useState("");
+  const [libraryBatchMode, setLibraryBatchMode] = useState(false);
+  const [materialDraftToken, setMaterialDraftToken] = useState(0);
   const [selectedPublishVideo, setSelectedPublishVideo] = useState("");
   const [mode, setMode] = useState<"basic" | "advanced">(
     () => (localStorage.getItem("ybl-mode") as "basic" | "advanced") || "basic",
@@ -490,10 +645,17 @@ function App() {
   const [testHistoryOpen, setTestHistoryOpen] = useState(false);
   const [historyScope, setHistoryScope] = useState<"current" | "all">("all");
   const [historyTotal, setHistoryTotal] = useState(0);
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
+  const [historyCategoryCounts, setHistoryCategoryCounts] = useState<Record<VideoLibraryCategory, number>>({ active: 0, attention: 0, completed: 0 });
   const [libraryFilter, setLibraryFilter] = useState<"all" | VideoLibraryCategory>("all");
   const [libraryQuery, setLibraryQuery] = useState("");
   const [diagnostics, setDiagnostics] = useState<Diagnostic[]>([]);
   const [dependencies, setDependencies] = useState<Dependency[]>([]);
+  const onlineTranslateModel = useRef("");
+  const dependencySignature = useRef("");
+  const dependencyAvailability = useRef<Record<string, boolean>>({});
+  const autoPrepareEnvironmentKey = useRef("");
   const [dependencyJob, setDependencyJob] = useState<DependencyInstallJob | null>(null);
   const [translationReady, setTranslationReady] = useState(true);
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
@@ -510,26 +672,38 @@ function App() {
   const [proxyDirty, setProxyDirty] = useState(false);
 
   const selected = materials.find((item) => item.id === materialId);
-  const running = ["queued", "running", "cancelling"].includes(
+  const ollamaRuntimeDependency = dependencies.find((item) => item.id === "ollama-runtime");
+  const localModelTag = options.translate_model || "translategemma:12b";
+  const localModelDependencyId = localModelTag === "qwen3.5:9b"
+    ? "ollama-qwen35-9b"
+    : localModelTag === "translategemma:12b"
+      ? "ollama-translategemma-12b"
+      : "ollama-qwen35-4b";
+  const selectedLocalModelDependency = dependencies.find((item) => item.id === localModelDependencyId);
+  const materialSourceReady = materialSourceTab === "url" ? Boolean(sourceUrl.trim()) : Boolean(selected);
+  const running = ["queued", "running", "preparing", "cancelling"].includes(
     job?.status ?? "",
   );
+  const runningRef = useRef(running);
+  runningRef.current = running;
   const dirty = history.length > 0;
   const publishVideoReady = Boolean(
-    nativePublishToken || selectedPublishVideo || job?.result?.rendered_video,
+    nativePublishToken || selectedPublishVideo || job?.result?.rendered_video || job?.artifacts?.rendered_video?.available,
   );
   const savedTemplateBody =
     templates.find((item) => item.name === templateName)?.body ?? "";
   const templateDraftDirty = templateBody !== savedTemplateBody;
   const duration =
+    mediaDuration ??
     (demoPreview ? 10 : null) ??
     job?.material.duration_seconds ??
     selected?.duration_seconds ??
     metadata?.duration ??
     10;
   const previewSrc = demoPreview
-    ? "/api/demo/rendered"
+    ? `/api/demo/rendered?v=${mediaNonce || "demo"}`
     : job
-    ? `/api/jobs/${job.id}/media/${preview === "rendered" && job.result ? "rendered" : "source"}`
+    ? `/api/jobs/${job.id}/media/${preview === "rendered" && job.result ? "rendered" : "source"}?v=${mediaNonce || job.stages?.render?.finished_at || "0"}`
     : selected
       ? `/api/materials/${selected.id}/media`
       : "";
@@ -538,18 +712,14 @@ function App() {
       cues.map((cue) => ({
         cue,
         left: `${(cue.start / duration) * 100}%`,
-        width: `${Math.max(3, ((cue.end - cue.start) / duration) * 100)}%`,
+        width: `${Math.max(0.25, ((cue.end - cue.start) / duration) * 100)}%`,
       })),
     [cues, duration],
   );
-  const selectedOutputBytes = useMemo(() => {
-    if (!outputs) return 0;
-    const taskIds = new Set(selectedOutputPaths.filter((path) => outputs.tasks.some((task) => task.id === path)));
-    return outputs.tasks.reduce((total, task) => total + (taskIds.has(task.id) ? task.size : task.files.filter((file) => selectedOutputPaths.includes(file.id)).reduce((sum, file) => sum + file.size, 0)), 0);
-  }, [outputs, selectedOutputPaths]);
   const librarySourceJobs = useMemo(() => {
     const rows = [...jobHistory];
     if (job) {
+      const backend = rows.find((item) => item.id === job.id);
       const current: HistoryJob = {
         id: job.id,
         title: job.options.title || job.material.name || "未命名任务",
@@ -557,19 +727,28 @@ function App() {
         stage: job.stage,
         progress: job.progress,
         error: job.error,
-        output_dir: job.result?.output_dir ?? null,
-        rendered_video: job.result?.rendered_video ?? null,
-        output_exists: Boolean(job.result?.output_dir),
-        rendered_exists: Boolean(job.result?.rendered_video),
-        created_at: job.started_at,
-        finished_at: job.finished_at,
+        output_dir: job.result?.output_dir ?? backend?.output_dir ?? null,
+        rendered_video: job.result?.rendered_video ?? backend?.rendered_video ?? null,
+        // Prefer backend filesystem probes; local path strings alone can outlive deleted folders.
+        output_exists: backend?.output_exists ?? Boolean(job.result?.output_dir),
+        rendered_exists: backend?.rendered_exists ?? Boolean(job.result?.rendered_video),
+        created_at: job.started_at ?? backend?.created_at ?? null,
+        finished_at: job.finished_at ?? backend?.finished_at ?? null,
       };
       const currentIndex = rows.findIndex((item) => item.id === job.id);
-      if (currentIndex >= 0) rows[currentIndex] = { ...rows[currentIndex], ...current };
+      if (currentIndex >= 0) rows[currentIndex] = { ...rows[currentIndex], ...current, output_exists: backend?.output_exists ?? current.output_exists, rendered_exists: backend?.rendered_exists ?? current.rendered_exists };
       else rows.unshift(current);
     }
     return rows;
   }, [jobHistory, job]);
+  const outputTaskTitles = useMemo(
+    () => new Map(
+      jobHistory
+        .filter((item) => item.output_dir)
+        .map((item) => [item.output_dir!.split(/[\\/]/).pop() ?? "", item.title]),
+    ),
+    [jobHistory],
+  );
   const libraryJobs = useMemo(() => {
     const resumableIds = new Set(restorableJobs.map((item) => item.id));
     return librarySourceJobs.filter((item) => {
@@ -578,14 +757,18 @@ function App() {
         && videoLibraryMatches(item, libraryQuery);
     });
   }, [librarySourceJobs, restorableJobs, libraryFilter, libraryQuery]);
-  const libraryCounts = useMemo(() => {
-    const resumableIds = new Set(restorableJobs.map((item) => item.id));
-    const counts: Record<VideoLibraryCategory, number> = { active: 0, attention: 0, completed: 0 };
-    for (const item of librarySourceJobs) {
-      counts[videoLibraryCategory(item, resumableIds.has(item.id))] += 1;
-    }
-    return counts;
-  }, [librarySourceJobs, restorableJobs]);
+  const libraryCounts = historyCategoryCounts;
+  const visibleLibraryTaskIds = useMemo(
+    () => selectableVideoLibraryIds(libraryJobs),
+    [libraryJobs],
+  );
+  const selectablePage = visibleLibraryTaskIds.slice(0, 200);
+  const allVisibleLibraryTasksSelected = selectablePage.length > 0
+    && selectablePage.every((id) => selectedOutputTaskIds.includes(id));
+  useEffect(() => {
+    // A filter/search change must not leave hidden task IDs armed for deletion.
+    setSelectedOutputTaskIds((current) => retainVisibleVideoLibrarySelection(current, libraryJobs));
+  }, [visibleLibraryTaskIds]);
 
   const updateOptions = <K extends keyof Options>(key: K, value: Options[K]) => {
     setFieldErrors((current) => {
@@ -595,6 +778,17 @@ function App() {
       return next;
     });
     setOptions((current) => ({ ...current, [key]: value }));
+  };
+  const changeTranslator = (value: string) => {
+    const localModels = ["qwen3.5:4b", "qwen3.5:9b", "translategemma:12b"];
+    if (value === "ollama" && options.translator !== "ollama") {
+      onlineTranslateModel.current = localModels.includes(options.translate_model) ? "" : options.translate_model;
+      updateOptions("translate_model", "translategemma:12b");
+      setApiKey("");
+    } else if (value !== "ollama" && options.translator === "ollama") {
+      updateOptions("translate_model", onlineTranslateModel.current);
+    }
+    updateOptions("translator", value);
   };
   const reportApiError = (error: unknown, fallback: string) => {
     if (error instanceof ApiError && error.field) {
@@ -648,8 +842,16 @@ function App() {
     setRestorableJobs(response.jobs);
   };
   const loadRestoredJob = async (id: string) => {
+    if (materialDraftToken > 0 && !window.confirm("素材页还有未保存的链接/本地选择。载入任务会覆盖这些内容，确定继续吗？")) {
+      return;
+    }
+    const generation = ++cueGeneration.current;
+    selectedJobIdRef.current = id;
+    cueOwner.current = null;
+    setCues([]); setHistory([]); setFuture([]); setCuesReady(false);
     try {
       const restored = await api<Job>(`/api/jobs/${id}/load`, { method: "POST", body: "{}" });
+      if (generation !== cueGeneration.current || selectedJobIdRef.current !== id) return;
       setJob(restored);
       setDemoPreview(false);
       setOptions((current) => ({
@@ -659,8 +861,15 @@ function App() {
       }));
       setDevice(restored.device);
       setComputeType(restored.compute_type);
+      sourceRevision.current += 1;
+      setMetadata(null);
+      setMetadataNotice("");
+      setMetadataState("idle");
       setSourceUrl(restored.material.source_url ?? "");
+      setMaterialId(restored.material.source_url ? "" : restored.material.id);
+      setMaterialSourceTab(restored.material.source_url ? "url" : "local");
       setAuthorized(restored.material.authorized);
+      setMaterialDraftToken(0);
       if (restored.material.source_url) {
         const restoredLimit = restored.options?.max_seconds;
         setFullVideo(restoredLimit === null);
@@ -676,11 +885,17 @@ function App() {
       setPublishBrowser(restored.options.bilibili_browser ?? "chromium");
       setCloseAfterFill(Boolean(restored.options.close_after_fill));
       setPreview(restored.artifacts?.rendered_video?.available ? "rendered" : "source");
-      await loadCues(restored.id);
+      setSelectedCue(null);
+      const cuesLoaded = await loadCues(restored.id, generation);
       setView("process");
       const completedStageCount = Object.values(restored.stages ?? {}).filter((stage) => stage.status === "completed").length;
+      if (!cuesLoaded) return;
       setMessage(restored.edit_state === "legacy-ambiguous"
         ? "已载入旧任务并保留现有成片；后期版本顺序无法确认，已禁用重新渲染。"
+        : !(restored.checks?.length)
+          ? restored.status === "completed" && !restored.next_stage
+            ? "已载入已完成任务，可查看字幕与成片；如需重新处理，请先检查当前环境与配置。"
+            : "任务已载入。由于应用已重启，请重新运行准备检查，确认当前环境与配置后再继续。"
         : restored.status === "draft" && completedStageCount === 0
           ? "任务草稿已载入。请运行准备检查；当前不会自动下载或占用大量电脑资源。"
         : restored.checkpoint_validation === "invalid"
@@ -688,21 +903,39 @@ function App() {
           : "任务已载入。不会自动继续耗资源处理，请确认后再执行下一阶段。");
       await loadRestorableJobs();
     } catch (error) {
+      if (selectedJobIdRef.current === id) {
+        selectedJobIdRef.current = null;
+        cueOwner.current = null;
+        setCuesReady(false);
+      }
       setMessage(error instanceof Error ? error.message : "载入任务失败");
     }
   };
-  const loadJobHistory = async () => {
+  const loadJobHistory = async (append = false) => {
+    const requestId = ++historyRequestSeq.current;
+    if (append) setHistoryLoadingMore(true);
+    else setHistoryLoadingMore(false);
     try {
       const query = new URLSearchParams({
         limit: "200",
+        offset: append ? String(jobHistory.length) : "0",
         scope: historyScope,
         output_dir: options.output_dir,
       });
-      const response = await api<{ jobs: HistoryJob[]; total: number }>(`/api/history/jobs?${query}`);
-      setJobHistory(response.jobs);
+      if (view === "library") {
+        if (libraryQuery.trim()) query.set("q", libraryQuery.trim());
+        if (libraryFilter !== "all") query.set("category", libraryFilter);
+      }
+      const response = await api<{ jobs: HistoryJob[]; total: number; has_more?: boolean; counts?: Record<VideoLibraryCategory, number> }>(`/api/history/jobs?${query}`);
+      if (requestId !== historyRequestSeq.current) return;
+      setJobHistory((current) => append ? [...current, ...response.jobs] : response.jobs);
       setHistoryTotal(response.total);
+      setHistoryHasMore(response.has_more ?? (append ? jobHistory.length + response.jobs.length < response.total : response.jobs.length < response.total));
+      if (response.counts) setHistoryCategoryCounts(response.counts);
     } catch {
       /* history is best-effort */
+    } finally {
+      if (append && requestId === historyRequestSeq.current) setHistoryLoadingMore(false);
     }
   };
   const loadDiagnostics = async () => {
@@ -713,17 +946,51 @@ function App() {
       /* A local service error is already reported by the connection state. */
     }
   };
-  const loadDependencies = async () => {
+  const loadDependencies = async (force = false) => {
+    const requestedJobId = jobRef.current?.id ?? null;
     const response = await api<{
       dependencies: Dependency[];
       active_job: DependencyInstallJob | null;
-    }>("/api/dependencies");
-    setDependencies(response.dependencies);
-    setDependencyJob((current) => response.active_job ?? (current && ["completed", "failed", "cancelled"].includes(current.status) ? current : null));
-    setDiagnostics(response.dependencies.map(({ installable: _installable, size_hint: _size, action_url: _url, ...item }) => item));
+    }>(`/api/dependencies${force ? "?refresh=1" : ""}`);
+    const previousAvailability = dependencyAvailability.current;
+    const newlyAvailable = response.dependencies
+      .filter((item) => previousAvailability[item.id] === false && item.available)
+      .map((item) => item.id);
+    dependencyAvailability.current = Object.fromEntries(response.dependencies.map((item) => [item.id, item.available]));
+    const nextSignature = JSON.stringify(response.dependencies.map((item) => [item.id, item.available, item.installable, item.state, item.message]));
+    if (nextSignature !== dependencySignature.current) {
+      dependencySignature.current = nextSignature;
+      setDependencies(response.dependencies);
+      setDiagnostics(response.dependencies.map(({ installable: _installable, size_hint: _size, action_url: _url, ...item }) => item));
+    }
+    const currentJob = jobRef.current;
+    const resolvedBlockers = newlyAvailable.filter((id) => currentJob?.checks?.some((check) => check.id === id && check.status === "blocking"));
+    if (currentJob && resolvedBlockers.length) {
+      const recoveryKey = `${currentJob.id}:${resolvedBlockers.sort().join(",")}`;
+      if (autoPrepareEnvironmentKey.current !== recoveryKey) {
+        autoPrepareEnvironmentKey.current = recoveryKey;
+        const installTarget = installTargetJobId.current;
+        if (requestedJobId !== currentJob.id || (installTarget && installTarget !== currentJob.id)) {
+          setMessage("本机环境已更新，但当前任务与开始安装时的任务选择不同。请在当前任务中点击“重新检查准备”后继续。");
+        } else if (!runningRef.current && !preparingJobRef.current && !schemeDirtyRef.current && jobRef.current?.id === currentJob.id) {
+          setMessage("检测到本机依赖或模型已安装，正在刷新当前任务的准备检查…");
+          void prepareSpecificJobRef.current(currentJob.id);
+        } else {
+          setMessage("检测到本机环境已更新。保存当前方案后点击“重新检查准备”即可使用，无需重启应用。 ");
+        }
+      }
+    }
+    setDependencyJob((current) => {
+      const active = response.active_job;
+      if (!active) return current && ["completed", "failed", "cancelled"].includes(current.status) ? current : null;
+      if (current?.id === active.id && current.status === active.status && current.progress === active.progress && current.message === active.message) return current;
+      return active;
+    });
   };
   const installDependency = async (dependency: Dependency) => {
-    if (!window.confirm(`安装“${dependency.label}”吗？\n\n用途：${dependency.purpose}\n预计占用：${dependency.size_hint}\n\n安装过程需要联网，Windows 可能显示权限提示。`)) return;
+    const action = dependency.action_label === "下载模型" ? "下载" : "安装";
+    if (!window.confirm(`${action}“${dependency.label}”吗？\n\n用途：${dependency.purpose}\n预计占用：${dependency.size_hint}\n\n过程需要联网；模型下载可取消，取消不会删除 Ollama 已保存的数据。`)) return;
+    installTargetJobId.current = job?.id ?? "__no-task-selected__";
     try {
       const response = await api<{ job: DependencyInstallJob }>(`/api/dependencies/${dependency.id}/install`, {
         method: "POST",
@@ -732,8 +999,12 @@ function App() {
       setDependencyJob(response.job);
       setDependenciesOpen(true);
       setMessage(response.job.message);
-      if (response.job.status === "completed") await loadDependencies();
+      if (response.job.status === "completed") {
+        await loadDependencies(true);
+        installTargetJobId.current = null;
+      }
     } catch (error) {
+      installTargetJobId.current = null;
       setMessage(error instanceof Error ? error.message : "无法开始安装");
     }
   };
@@ -784,12 +1055,14 @@ function App() {
     const scopeLabel = historyScope === "current" ? "当前输出目录" : "全部输出目录";
     if (!window.confirm(`清除“${scopeLabel}”中的 ${historyTotal} 条任务记录吗？\n\n只删除历史列表记录，不会删除任何视频、字幕或输出文件。`)) return;
     try {
-      const response = await api<{ message: string }>("/api/history/clear", {
+      const response = await api<{ message: string; deleted_ids?: string[] }>("/api/history/clear", {
         method: "POST",
         body: JSON.stringify({ confirmed: true, scope: historyScope, output_dir: options.output_dir }),
       });
+      for (const id of response.deleted_ids ?? []) clearLoadedTaskState(id);
+      setSelectedOutputTaskIds((current) => current.filter((id) => !(response.deleted_ids ?? []).includes(id)));
       setMessage(response.message);
-      await loadJobHistory();
+      await Promise.all([loadJobHistory(), loadRestorableJobs()]);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "清除任务历史失败");
     }
@@ -821,6 +1094,47 @@ function App() {
       setMessage(error instanceof Error ? error.message : "删除测试历史失败");
     }
   };
+  const clearLoadedTaskState = (id: string) => {
+    if (job?.id !== id) return;
+    cueGeneration.current += 1;
+    selectedJobIdRef.current = null;
+    cueOwner.current = null;
+    setCuesReady(false);
+    setJob(null);
+    setCues([]);
+    setHistory([]);
+    setFuture([]);
+    setActiveCue(null);
+    setSelectedCue(null);
+    setPreview("source");
+    setInspectorOpen(false);
+    setView("library");
+  };
+  const deleteSelectedHistoryTasks = async (mode: "record_only" | "record_and_outputs") => {
+    if (selectedOutputTaskIds.length > 200) {
+      setHistoryDeleteError("批量删除每次最多选择 200 个任务，请减少选择后重试。 ");
+      return;
+    }
+    const ids = selectedOutputTaskIds.filter((id) => libraryJobs.some((item) => item.id === id && !["queued", "running", "preparing", "cancelling"].includes(item.status)));
+    if (!ids.length) {
+      setHistoryDeleteError("请至少选择一条可删除的历史任务。");
+      return;
+    }
+    setDeleteBusy(true);
+    setHistoryDeleteError("正在生成删除预览…");
+    try {
+      const plan = await api<HistoryDeletePlan>("/api/history/jobs/delete-preview", {
+        method: "POST", body: JSON.stringify({ ids, mode }),
+      });
+      setDeleteResults(null);
+      setPendingDelete({ source: "history", plan, mode });
+      setHistoryDeleteError("");
+    } catch (error) {
+      setHistoryDeleteError(error instanceof Error ? error.message : "读取删除预览失败");
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
   const openHistoryPath = async (path: string) => {
     try {
       await api("/api/history/open", { method: "POST", body: JSON.stringify({ path }) });
@@ -834,18 +1148,31 @@ function App() {
       body: JSON.stringify({ output_dir: options.output_dir }),
     });
     setOutputs(snapshot);
+    const taskIds = new Set(snapshot.tasks.map((task) => task.id));
+    const fileIds = new Set(snapshot.tasks.find((task) => task.id === viewedTaskId)?.files.map((file) => file.id) ?? []);
+    setSelectedOutputPaths((current) => current.filter((id) => taskIds.has(id) || fileIds.has(id)));
+    setViewedTaskId((current) => snapshot.tasks.some((task) => task.id === current) ? current : null);
   };
-  const loadCues = async (id: string) => {
+  const loadCues = async (id: string, generation = cueGeneration.current): Promise<boolean> => {
     try {
-      const data = await api<{ cues: Cue[]; translation_ready?: boolean }>(
+      const data = await api<{ cues: Cue[]; ready?: boolean; translation_ready?: boolean }>(
         `/api/jobs/${id}/cues`,
       );
-      setCues(data.cues);
+      if (generation !== cueGeneration.current || selectedJobIdRef.current !== id) return false;
+      const ready = data.ready ?? true;
+      cueOwner.current = ready ? id : null;
+      setCues(data.cues ?? []);
+      setCuesReady(ready);
       setTranslationReady(data.translation_ready ?? true);
       setHistory([]);
       setFuture([]);
-    } catch {
-      /* Cues are not ready during download/transcription. */
+      return true;
+    } catch (error) {
+      if (generation !== cueGeneration.current || selectedJobIdRef.current !== id) return false;
+      cueOwner.current = null;
+      setCues([]); setHistory([]); setFuture([]); setCuesReady(false);
+      setMessage(error instanceof Error ? `字幕加载失败：${error.message}` : "字幕加载失败，请重试");
+      return false;
     }
   };
   const toggleFullLogs = async () => {
@@ -864,7 +1191,8 @@ function App() {
     }
   };
   const taskOptions = () => {
-    const maxSeconds = sourceUrl.trim() && !fullVideo
+    const urlSourceActive = job ? Boolean(job.material.source_url) : materialSourceTab === "url";
+    const maxSeconds = urlSourceActive && !fullVideo
       ? secondsFromDuration(durationValue, durationUnit)
       : null;
     return {
@@ -880,8 +1208,9 @@ function App() {
   };
   const validateTaskFields = () => {
     const errors: Record<string, string> = {};
-    if (sourceUrl.trim() && !fullVideo && secondsFromDuration(durationValue, durationUnit) === null) {
-      errors.max_seconds = "读取长度必须换算为 1～86400 秒之间的整数。";
+    const urlSourceActive = job ? Boolean(job.material.source_url) : materialSourceTab === "url";
+    if (urlSourceActive && !fullVideo && secondsFromDuration(durationValue, durationUnit) === null) {
+      errors.max_seconds = "处理范围须为 1～86400 秒之间的整数。";
     }
     if (sourceUrl.trim().length > 2048) errors.source_url = "视频链接不能超过 2048 个字符。";
     if (options.title.length > 200) errors.title = "标题不能超过 200 个字符。";
@@ -925,6 +1254,10 @@ function App() {
   const cookieHintMatches = (text: string | null | undefined) =>
     !!text && /Cookies|机器人|登录验证|拦截|PO Token|HTTP 403|浏览器验证/i.test(text);
   const checkReadiness = async () => {
+    if (job) {
+      await prepareJob();
+      return;
+    }
     if (!validateTaskFields()) return false;
     try {
       const response = await api<{
@@ -980,7 +1313,7 @@ function App() {
   const applyRecommended = () => {
     setDevice("cpu");
     setComputeType("int8");
-    setOptions((current) => ({ ...current, download_quality: "1080p", render_encoder: "auto", resource_profile: "balanced", subtitle_source: "audio", prefer_platform_subtitles: true, whisper_model_size: "small", source_language: "", translator: "deepseek", target_lang: "zh-Hans", smart_translation: true, smart_subtitle_layout: true, font_name: "Microsoft YaHei", font_size: 24, subtitle_display_mode: "translated", subtitle_color: "白色", subtitle_outline_color: "黑色", subtitle_effect: "描边" }));
+    setOptions((current) => ({ ...current, download_quality: "1080p", render_encoder: "auto", resource_profile: "balanced", subtitle_source: "audio", prefer_platform_subtitles: true, whisper_model_size: "small", source_language: "", translator: "deepseek", translate_model: "", target_lang: "zh-Hans", smart_translation: true, smart_subtitle_layout: true, font_name: "Microsoft YaHei", font_size: 24, subtitle_display_mode: "translated", subtitle_color: "白色", subtitle_outline_color: "黑色", subtitle_effect: "描边" }));
     setIncludeSourceLink(true);
     setMessage("已应用推荐设置：最高 1080p、自动优先 NVIDIA 渲染、CPU int8 转写与中文硬字幕。");
   };
@@ -1001,6 +1334,25 @@ function App() {
       .catch(() => setMessage("未连接本地服务，请启动工作台 EXE。"));
   }, []);
   useEffect(() => {
+    let inFlight = false;
+    const refresh = async (force = false) => {
+      if (inFlight || document.visibilityState !== "visible") return;
+      inFlight = true;
+      try { await loadDependencies(force); } catch { /* Keep the last known local environment status. */ }
+      finally { inFlight = false; }
+    };
+    const onFocus = () => void refresh(true);
+    const onVisibility = () => { if (document.visibilityState === "visible") void refresh(true); };
+    const timer = window.setInterval(() => void refresh(false), 5000);
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, []);
+  useEffect(() => {
     if (!dependencyJob || !["queued", "running", "cancelling"].includes(dependencyJob.status)) return;
     const timer = window.setInterval(async () => {
       try {
@@ -1009,8 +1361,8 @@ function App() {
         setMessage(latest.message);
         if (["completed", "failed", "cancelled"].includes(latest.status)) {
           window.clearInterval(timer);
-          await loadDependencies();
-          if (latest.status === "completed" && job) await prepareJob();
+          await loadDependencies(true);
+          installTargetJobId.current = null;
         }
       } catch (error) {
         window.clearInterval(timer);
@@ -1023,6 +1375,7 @@ function App() {
     if (running) setInspectorOpen(true);
     if (job?.status === "completed") {
       setInspectorOpen(false);
+      setMediaNonce(Date.now());
       setPreview("rendered");
       loadCues(job.id);
       loadOutputs().catch(() => undefined);
@@ -1064,9 +1417,34 @@ function App() {
       loadOutputs().catch((error) => setMessage(String(error)));
       void loadJobHistory();
     }
-    if (view === "library") void Promise.all([loadJobHistory(), loadRestorableJobs()]);
-    if (view === "publish") void loadPublishSession();
+    if (view === "library") void loadRestorableJobs();
+    if (view === "publish") {
+      void loadPublishSession();
+      void loadOutputs().catch(() => undefined);
+      void loadJobHistory();
+    }
   }, [view, historyScope, options.output_dir]);
+  useEffect(() => {
+    if (view !== "library") return;
+    const timer = window.setTimeout(() => void loadJobHistory(), 250);
+    return () => window.clearTimeout(timer);
+  }, [view, historyScope, options.output_dir, libraryQuery, libraryFilter]);
+  useEffect(() => {
+    if (view !== "publish" || !publishVideoReady) return;
+    const hydrateKey = [
+      job?.id ?? "",
+      selectedPublishVideo || "__current__",
+      nativePublishToken || "",
+      job?.artifacts?.publish_metadata?.available ? "meta" : "none",
+      job?.result?.rendered_video || "",
+    ].join("|");
+    if (publishHydrateKey.current === hydrateKey) return;
+    publishHydrateKey.current = hydrateKey;
+    if (job?.publish_copy?.has_metadata || (job?.publish_copy?.title && job.publish_copy.tags?.length)) {
+      applyPublishCopy(job.publish_copy);
+    }
+    void loadPublishCopy({ force: false });
+  }, [view, publishVideoReady, job?.id, job?.publish_copy?.title, selectedPublishVideo, nativePublishToken]);
   useEffect(() => {
     if (!publishSession.active) return;
     const timer = window.setInterval(loadPublishSession, 1500);
@@ -1098,12 +1476,39 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [running, sourceUrl, selected?.id, authorized, device, computeType, options, description, tags, publishInPipeline, includeSourceLink, fullVideo, durationValue, durationUnit]);
 
+  const confirmDiscardSubtitles = (action: string) =>
+    !dirty ||
+    window.confirm(
+      `当前字幕还有未保存的修改（已编辑 ${history.length} 次）。\n${action}，未保存的内容将被清空。\n\n确定继续吗？`,
+    );
+  const resetForSourceSwitch = () => {
+    sourceRevision.current += 1;
+    setJob(null);
+    // Do not carry a previous task's strict Creative Commons filter into a
+    // different URL/local source.  The filter is an explicit per-source
+    // choice; inheriting it silently makes ordinary authorized videos fail at
+    // acquire with no relation to the new material.  Users can re-enable it
+    // after entering the new URL when they specifically require CC metadata.
+    updateOptions("require_reuse_allowed", false);
+    setCues([]);
+    setHistory([]);
+    setFuture([]);
+    setActiveCue(null);
+    setSelectedCue(null);
+    setPreview("source");
+    setDemoPreview(false);
+    setMetadata(null);
+    setMetadataNotice("");
+    setMetadataState("idle");
+  };
   const readMetadata = async () => {
-    if (!sourceUrl.trim()) {
+    const url = sourceUrl.trim();
+    if (!url) {
       setMetadataState("error");
       setMetadataNotice("请先粘贴完整的视频链接，再读取标题与时长。");
       return;
     }
+    const revision = ++sourceRevision.current;
     try {
       setMetadataState("loading");
       setMetadataNotice("正在读取标题、时长与许可证信息…");
@@ -1118,7 +1523,7 @@ function App() {
       }>("/api/metadata", {
         method: "POST",
         body: JSON.stringify({
-          url: sourceUrl,
+          url,
           cookies_from_browser: options.cookies_from_browser,
           cookies_file: options.cookies_file,
           youtube_po_token_mode: options.youtube_po_token_mode,
@@ -1126,12 +1531,14 @@ function App() {
           download_quality: options.download_quality,
         }),
       });
+      if (revision !== sourceRevision.current) return;
       setMetadata(value);
       if (value.title) updateOptions("title", value.title);
       setMetadataState("success");
       setMetadataNotice("已读取视频信息，标题已自动填入下方字段。");
       setMessage("已读取视频信息。");
     } catch (error) {
+      if (revision !== sourceRevision.current) return;
       const detail = error instanceof Error ? error.message : "未知错误";
       setMetadataState("error");
       setMetadataNotice(`读取失败：${detail}`);
@@ -1139,11 +1546,13 @@ function App() {
     }
   };
   const importVideo = async (file: File) => {
+    if (running) return setMessage("当前阶段运行中，请先取消或等待完成后再切换素材。");
     if (!authorized) {
       setMessage("请先勾选上方「我确认拥有处理、转载或发布该视频的授权/许可证」复选框，再导入本地视频。");
       document.getElementById("rights-check")?.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
     }
+    if (!confirmDiscardSubtitles("切换到本地视频")) return;
     const body = new FormData();
     body.append("video", file);
     body.append("authorized", "true");
@@ -1153,8 +1562,11 @@ function App() {
         body,
       });
       await loadMaterials();
+      resetForSourceSwitch();
       setMaterialId(material.id);
       setSourceUrl("");
+      setMaterialSourceTab("local");
+      setMaterialDraftToken((value) => value + 1);
       updateOptions("title", material.name.replace(/\.[^.]+$/, ""));
       setMessage(
         `已导入 ${material.name}（开发模式：此版本会复制到工作区；桌面版直接使用原路径）。`,
@@ -1173,6 +1585,8 @@ function App() {
       const detail = await api<{ token: string; name: string; title: string; tags: string[] }>("/api/publish/upload", { method: "POST", body });
       setNativePublishToken(detail.token); setNativePublishName(detail.name); setSelectedPublishVideo("__native__");
       updateOptions("title", detail.title); if (detail.tags.length) setTags(detail.tags.join(", "));
+      publishHydrateKey.current = "";
+      void generateDescription({ silent: true });
       setMessage(`开发模式已导入成品视频：${detail.name}。`);
     } catch (error) { setMessage(error instanceof Error ? error.message : "导入成品视频失败"); }
   };
@@ -1199,14 +1613,9 @@ function App() {
     ];
     return lines.join("\n");
   };
-  const confirmDiscardSubtitles = (action: string) =>
-    !dirty ||
-    window.confirm(
-      `当前字幕还有未保存的修改（已编辑 ${history.length} 次）。\n${action}，未保存的内容将被清空。\n\n确定继续吗？`,
-    );
   const start = async () => {
-    const url = sourceUrl.trim();
-    if ((!selected && !url) || running) return;
+    const url = materialSourceTab === "url" ? sourceUrl.trim() : "";
+    if ((materialSourceTab === "url" ? !url : !selected) || running) return;
     if (dirty && !confirmDiscardSubtitles("开始新任务会清空当前未保存的字幕修改")) return;
     if (!authorized) return setMessage("开始前请确认拥有处理或转载授权。");
     if (!validateTaskFields()) return;
@@ -1222,45 +1631,77 @@ function App() {
       const created = await api<Job>("/api/jobs", {
         method: "POST",
         body: JSON.stringify({
-          material_id: selected?.id,
-          source_url: url || undefined,
+          ...(url ? { source_url: url } : { material_id: selected?.id }),
           authorized,
           device,
           compute_type: computeType,
           options: taskOptions(),
         }),
       });
+      cueGeneration.current += 1;
+      selectedJobIdRef.current = created.id;
+      cueOwner.current = null;
+      setCuesReady(false);
       setJob(created);
+      setOptions((current) => mergeRestoredOptions(current, created.options));
       setDemoPreview(false);
       setCues([]);
+      setHistory([]);
+      setFuture([]);
+      setSelectedCue(null);
       setPreview("source");
+      setMaterialDraftToken(0);
       setView("process");
       setMessage("任务草稿已保存。请确认处理方案，然后运行开始前准备检查；当前不会下载视频。 ");
     } catch (error) {
       setMessage(`无法启动：${reportApiError(error, "未知错误")}`);
     }
   };
-  const saveWorkflowOptions = async () => {
+  const checksReady = (current: Job | null | undefined) =>
+    Boolean(current?.checks?.length) && !(current?.checks ?? []).some((item) => item.status === "blocking");
+  const patchJobOptions = async (optionPatch: Partial<Options>, successMessage?: string) => {
     if (!job || running) return job;
     if (!validateTaskFields()) return null;
     try {
       const updated = await api<Job & { stale_stages?: string[] }>(`/api/jobs/${job.id}/options`, {
         method: "PATCH",
-        body: JSON.stringify({ device, compute_type: computeType, options: taskOptions() }),
+        body: JSON.stringify({
+          device,
+          compute_type: computeType,
+          options: { ...taskOptions(), ...optionPatch },
+        }),
       });
       setJob(updated);
-      const stale = updated.stale_stages ?? [];
-      setMessage(stale.length ? `方案已保存；${stale.map((name) => workflowStageMeta.find(([id]) => id === name)?.[1] ?? name).join("、")}需要重新执行。` : "方案已保存，请运行准备检查。 ");
+      setOptions((current) => mergeRestoredOptions(current, updated.options));
+      if (successMessage) {
+        setMessage(successMessage);
+      } else {
+        const stale = updated.stale_stages ?? [];
+        setMessage(stale.length ? `方案已保存；${stale.map((name) => workflowStageMeta.find(([id]) => id === name)?.[1] ?? name).join("、")}需要重新执行。` : "方案已保存，请运行准备检查。 ");
+      }
       return updated;
     } catch (error) {
       setMessage(reportApiError(error, "保存处理方案失败"));
       return null;
     }
   };
+  const saveWorkflowOptions = async () => patchJobOptions({});
+  const persistRequireReuseAllowed = async (checked: boolean) => {
+    updateOptions("require_reuse_allowed", checked);
+    const summary = checked
+      ? "已开启仅接受可复用 CC 视频。获取素材将使用新设置。"
+      : "已关闭 CC 限制。当前任务会立刻使用新设置，可重新获取素材。";
+    if (!job || running) {
+      setMessage(summary);
+      return;
+    }
+    await patchJobOptions({ require_reuse_allowed: checked }, summary);
+  };
   const prepareJob = async () => {
     if (!job || running || preparingJob) return;
     const saved = await saveWorkflowOptions();
     if (!saved) return;
+    preparingJobRef.current = true;
     setPreparingJob(true);
     try {
       const prepared = await api<Job>(`/api/jobs/${job.id}/prepare`, { method: "POST", body: "{}" });
@@ -1269,12 +1710,93 @@ function App() {
       setMessage(blockers.length ? `准备检查发现 ${blockers.length} 个阻断项，请按清单修正。` : "开始前准备已通过。你可以逐阶段运行，或一键运行到渲染。 ");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "准备检查失败");
-    } finally { setPreparingJob(false); }
+    } finally { preparingJobRef.current = false; setPreparingJob(false); }
+  };
+  const confirmQualityProposal = async () => {
+    if (!job?.quality_proposal?.fingerprint) return;
+    try {
+      const confirmed = await api<Job>(`/api/jobs/${job.id}/quality/confirm`, {
+        method: "POST",
+        body: JSON.stringify({ fingerprint: job.quality_proposal.fingerprint }),
+      });
+      setJob(confirmed);
+      setMessage("画质方案已确认，可以开始获取素材。 ");
+    } catch (error) {
+      setMessage(reportApiError(error, "确认画质方案失败"));
+    }
+  };
+  prepareSpecificJobRef.current = async (jobId: string) => {
+    if (jobRef.current?.id !== jobId || runningRef.current || preparingJobRef.current || schemeDirtyRef.current) return;
+    preparingJobRef.current = true;
+    setPreparingJob(true);
+    try {
+      const prepared = await api<Job>(`/api/jobs/${jobId}/prepare`, { method: "POST", body: "{}" });
+      if (jobRef.current?.id !== jobId) return;
+      setJob(prepared);
+      const blockers = (prepared.checks ?? []).filter((item) => item.status === "blocking");
+      setMessage(blockers.length ? `本机环境已更新；当前任务仍有 ${blockers.length} 个准备阻断项，请查看清单。` : "本机环境已更新，当前任务准备检查已刷新，可以继续，无需重启应用。");
+    } catch (error) {
+      if (jobRef.current?.id === jobId) setMessage(error instanceof Error ? error.message : "刷新当前任务准备检查失败。");
+    } finally {
+      preparingJobRef.current = false;
+      setPreparingJob(false);
+    }
+  };
+  const runRecoveryAction = async (
+    recovery: RecoveryAction,
+    change: { device?: string; compute_type?: string; options?: Partial<Options> },
+  ) => {
+    if (!job || running || preparingJob) return;
+    if (schemeDirtyRef.current) {
+      setMessage("当前处理方案有未保存修改。先保存并检查准备，再执行恢复操作。 ");
+      return;
+    }
+    const stageLabel = workflowStageMeta.find(([id]) => id === recovery.stage)?.[1] ?? recovery.stage;
+    if (recovery.requires_confirmation && !window.confirm(`${recovery.impact}\n\n确认后仅重新执行“${stageLabel}”；其他有效阶段结果会保留。继续吗？`)) return;
+    preparingJobRef.current = true;
+    setPreparingJob(true);
+    try {
+      const updated = await api<Job>(`/api/jobs/${job.id}/options`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          device: change.device ?? job.device,
+          compute_type: change.compute_type ?? job.compute_type,
+          options: change.options ?? {},
+        }),
+      });
+      setJob(updated);
+      setOptions((current) => mergeRestoredOptions(current, updated.options));
+      setDevice(updated.device);
+      setComputeType(updated.compute_type);
+      const prepared = await api<Job>(`/api/jobs/${updated.id}/prepare`, { method: "POST", body: "{}" });
+      setJob(prepared);
+      const blockers = (prepared.checks ?? []).filter((item) => item.status === "blocking");
+      if (blockers.length) {
+        setMessage(`恢复设置已保存，但准备检查仍有 ${blockers.length} 个阻断项。解决后可从“${stageLabel}”继续。`);
+        return;
+      }
+      const started = await api<Job>(`/api/jobs/${prepared.id}/stages/${recovery.stage}/run`, { method: "POST", body: "{}" });
+      setJob(started);
+      setInspectorOpen(true);
+      setView("process");
+      setMessage(`已按确认后的设置，仅重新执行“${stageLabel}”。`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "恢复操作未能启动；已有检查点仍保留。 ");
+    } finally {
+      preparingJobRef.current = false;
+      setPreparingJob(false);
+    }
   };
   const runStage = async (stage: WorkflowStageName) => {
     if (!job || running) return;
+    const saved = await saveWorkflowOptions();
+    if (!saved) return;
+    if (!checksReady(saved)) {
+      setMessage("方案已同步到当前任务。请先重新检查准备，再运行该阶段。");
+      return;
+    }
     try {
-      const latest = await api<Job>(`/api/jobs/${job.id}/stages/${stage}/run`, { method: "POST", body: "{}" });
+      const latest = await api<Job>(`/api/jobs/${saved.id}/stages/${stage}/run`, { method: "POST", body: "{}" });
       setJob(latest); setInspectorOpen(true);
       setMessage(`已开始：${workflowStageMeta.find(([id]) => id === stage)?.[1] ?? stage}`);
     } catch (error) { setMessage(error instanceof Error ? error.message : "无法启动该阶段"); }
@@ -1282,34 +1804,56 @@ function App() {
   const openStageResult = (stage: WorkflowStageName) => {
     if (!job) return;
     if (stage === "publish") { setView("publish"); return; }
-    if (stage === "render") setPreview("rendered");
-    else setPreview("source");
+    if (stage === "render") {
+      setMediaNonce(Date.now());
+      setPreview("rendered");
+    } else setPreview("source");
     if (["extract", "translate", "render"].includes(stage)) void loadCues(job.id);
     setView("subtitle");
   };
   const runAll = async () => {
     if (!job || running) return;
+    const saved = await saveWorkflowOptions();
+    if (!saved) {
+      return;
+    }
+    if (!checksReady(saved)) {
+      setMessage("方案已同步到当前任务。请先重新检查准备，再一键运行。");
+      return;
+    }
     try {
-      const latest = await api<Job>(`/api/jobs/${job.id}/run-all`, { method: "POST", body: "{}" });
+      const latest = await api<Job>(`/api/jobs/${saved.id}/run-all`, { method: "POST", body: "{}" });
       setJob(latest); setInspectorOpen(true); setMessage("已按同一套阶段顺序运行；任一步失败都会停在该检查点。 ");
-    } catch (error) { setMessage(error instanceof Error ? error.message : "无法运行全部阶段"); }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "无法运行全部阶段");
+    }
   };
   const resumeJob = async () => {
     if (!job || running) return;
+    const saved = await saveWorkflowOptions();
+    if (!saved) return;
+    if (!checksReady(saved)) {
+      setMessage("方案已同步到当前任务。请先重新检查准备，再从检查点继续。");
+      return;
+    }
     try {
-      const latest = await api<Job>(`/api/jobs/${job.id}/resume`, { method: "POST", body: "{}" });
+      const latest = await api<Job>(`/api/jobs/${saved.id}/resume`, { method: "POST", body: "{}" });
       setJob(latest); setInspectorOpen(true); setMessage("已从最后一个有效检查点继续。 ");
     } catch (error) { setMessage(error instanceof Error ? error.message : "无法恢复任务"); }
   };
   const topAction = () => {
     if (running) return void cancel();
     if (!job) return void start();
+    if (job.status === "completed" && !job.next_stage) return setView("subtitle");
     if (!job.checks?.length || (job.checks ?? []).some((item) => item.status === "blocking")) return void prepareJob();
     if (job.can_resume) return void resumeJob();
+    if (job.next_stage === "publish") return setView("publish");
     if (job.next_stage) return void runStage(job.next_stage);
     setView("subtitle");
   };
-  const topActionLabel = preparingJob ? "正在检查准备…" : workflowPrimaryLabel({
+  const topActionLabel = preparingJob ? "正在检查准备…" : job?.status === "completed" && !job.next_stage
+    ? "查看字幕成片" : job?.next_stage === "publish" && !running && job.checks?.length && !(job.checks ?? []).some((item) => item.status === "blocking")
+    ? "查看投稿辅助" : workflowPrimaryLabel({
     running, hasJob: Boolean(job), hasChecks: Boolean(job?.checks?.length),
     hasBlocking: (job?.checks ?? []).some((item) => item.status === "blocking"),
     canResume: Boolean(job?.can_resume), nextStage: job?.next_stage ?? null,
@@ -1330,7 +1874,10 @@ function App() {
     }
   };
   const save = async () => {
-    if (!job || !dirty) return;
+    if (!job || !dirty || cueOwner.current !== job.id || !cuesReady) {
+      if (job && cueOwner.current !== job.id) setMessage("当前任务字幕尚未加载完成，暂不能保存。");
+      return;
+    }
     for (const cue of cues) {
       if (!cue.deleted && cue.start >= cue.end) {
         setMessage(`第 ${cue.id + 1} 条字幕时间无效：开始时间必须小于结束时间。`);
@@ -1358,12 +1905,23 @@ function App() {
     }
   };
   const rerender = async () => {
-    if (!job || dirty) return;
+    if (!job) return;
+    if (dirty) { setMessage("字幕有未保存修改，请先保存后再重新渲染。 "); return; }
     try {
+      if (schemeDirty) {
+        const saved = await saveWorkflowOptions();
+        if (!saved) return;
+        const prepared = await api<Job>(`/api/jobs/${job.id}/prepare`, { method: "POST", body: "{}" });
+        setJob(prepared);
+        if ((prepared.checks ?? []).some((item) => item.status === "blocking")) {
+          setMessage("渲染前准备检查未通过，请先修正阻断项。 ");
+          return;
+        }
+      }
       setJob(
         await api<Job>(`/api/jobs/${job.id}/rerender`, {
           method: "POST",
-          body: "{}",
+          body: JSON.stringify({ dirty }),
         }),
       );
       setMessage("正在按当前字幕样式重新渲染。 ");
@@ -1545,6 +2103,7 @@ function App() {
   };
   const seek = (cue: Cue) => {
     setActiveCue(cue.id);
+    setSelectedCue(cue.id);
     if (video.current) {
       video.current.currentTime = cue.start;
       video.current.play();
@@ -1587,7 +2146,7 @@ function App() {
       setMessage(error instanceof Error ? error.message : "选择 Cookies 文件失败");
     }
   };
-  const generateDescription = async () => {
+  const generateDescription = async (opts?: { silent?: boolean; sourceUrlOverride?: string }) => {
     try {
       const response = await api<{ description: string }>(
         "/api/publish/description",
@@ -1595,7 +2154,7 @@ function App() {
           method: "POST",
           body: JSON.stringify({
             template: templateName,
-            source_url: sourceUrl,
+            source_url: opts?.sourceUrlOverride ?? sourceUrl,
             include_source_link: includeSourceLink,
             custom_text: templateBody,
             template_body: templateBody,
@@ -1604,9 +2163,71 @@ function App() {
         },
       );
       setDescription(response.description);
-      setMessage("已按当前模板内容生成简介（草稿内容优先于已保存模板）。");
+      if (!opts?.silent) {
+        setMessage("已按当前模板内容生成简介（草稿内容优先于已保存模板）。");
+      }
+      return response.description;
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "生成简介失败");
+      if (!opts?.silent) {
+        setMessage(error instanceof Error ? error.message : "生成简介失败");
+      }
+      return null;
+    }
+  };
+  const applyPublishCopy = (copy: { title?: string; tags?: string[]; source_url?: string }, opts?: { force?: boolean }) => {
+    const force = Boolean(opts?.force);
+    const nextTitle = (copy.title || "").trim();
+    if (nextTitle && (force || !options.title.trim() || !mostlyCjk(options.title))) {
+      updateOptions("title", nextTitle);
+    }
+    if ((copy.tags?.length ?? 0) > 0 && (force || !tags.trim())) {
+      setTags((copy.tags ?? []).join(", "));
+    }
+    if (copy.source_url && !sourceUrl.trim()) {
+      setSourceUrl(copy.source_url);
+    }
+  };
+  const loadPublishCopy = async (opts?: { generate?: boolean; force?: boolean }) => {
+    if (!publishVideoReady && !job?.result && !job?.id) {
+      setMessage("请先选择成片，再加载投稿文案。");
+      return null;
+    }
+    try {
+      const response = await api<{
+        title: string;
+        tags: string[];
+        has_metadata: boolean;
+        generated: boolean;
+        source_url: string;
+        video_name: string;
+      }>("/api/publish/copy", {
+        method: "POST",
+        body: JSON.stringify({
+          job_id: !nativePublishToken && !selectedPublishVideo && job?.id ? job.id : "",
+          video_id: selectedPublishVideo === "__native__" ? "" : selectedPublishVideo,
+          native_video_token: nativePublishToken,
+          output_dir: options.output_dir,
+          generate: Boolean(opts?.generate),
+        }),
+      });
+      applyPublishCopy(response, { force: opts?.force || opts?.generate });
+      if (!description.trim() || opts?.force || opts?.generate) {
+        await generateDescription({
+          silent: true,
+          sourceUrlOverride: response.source_url || sourceUrl,
+        });
+      }
+      setMessage(
+        opts?.generate
+          ? `已根据字幕重新生成投稿标题/标签：${response.title || response.video_name}`
+          : response.has_metadata
+            ? `已载入投稿文案：${response.title || response.video_name}`
+            : `已载入基础投稿信息：${response.title || response.video_name}`,
+      );
+      return response;
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "加载投稿文案失败");
+      return null;
     }
   };
   const saveTemplate = async () => {
@@ -1671,21 +2292,29 @@ function App() {
     )
       return;
     try {
+      let nextDescription = description;
+      if (!nextDescription.trim()) {
+        nextDescription = (await generateDescription({ silent: true })) ?? "";
+      }
       const response = await api<{ message: string }>("/api/publish/assist", {
         method: "POST",
         body: JSON.stringify({
-          job_id: !nativePublishToken && !selectedPublishVideo && job?.result ? job.id : "",
-          video_id: selectedPublishVideo,
+          job_id: !nativePublishToken && !selectedPublishVideo && job?.id ? job.id : "",
+          video_id: selectedPublishVideo === "__native__" ? "" : selectedPublishVideo,
           native_video_token: nativePublishToken,
           output_dir: options.output_dir,
           confirmed: true,
           browser: publishBrowser,
           title: options.title,
-          description,
+          description: nextDescription,
           tags: tags
             .split(",")
             .map((value) => value.trim())
             .filter(Boolean),
+          include_source_link: includeSourceLink,
+          template: templateName,
+          template_body: templateBody,
+          extra_lines: extraLine ? [extraLine] : [],
           close_after_fill: closeAfterFill,
         }),
       });
@@ -1709,31 +2338,47 @@ function App() {
     }
   };
   const deleteOutputs = async () => {
-    if (
-      !selectedOutputPaths.length ||
-      !window.confirm(
-        `将删除以下 ${selectedOutputPaths.length} 个项目，预计释放约 ${formatBytes(selectedOutputBytes)}：\n${selectedOutputPaths.join("\n")}\n\n此操作不可恢复，确定继续吗？`,
-      )
-    )
-      return;
+    if (!outputs || !selectedOutputPaths.length) return;
     try {
-      const response = await api<{ deleted_size: string }>(
-        "/api/outputs/delete",
-        {
-          method: "POST",
-          body: JSON.stringify({
-            output_dir: options.output_dir,
-            paths: selectedOutputPaths,
-            confirmed: true,
-          }),
-        },
-      );
-      setMessage(`已删除 ${response.deleted_size}。`);
-      setSelectedOutputPaths([]);
-      await loadOutputs();
+      const plan = await api<OutputDeletePlan>("/api/outputs/delete-preview", {
+        method: "POST", body: JSON.stringify({ output_dir: outputs.root, paths: selectedOutputPaths }),
+      });
+      setDeleteResults(null);
+      setPendingDelete({ source: "outputs", plan });
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "删除失败");
+      setMessage(error instanceof Error ? error.message : "读取删除预览失败");
     }
+  };
+  const confirmPendingDelete = async () => {
+    if (!pendingDelete || deleteBusy) return;
+    if (pendingDelete.source === "history" && pendingDelete.mode === "record_and_outputs" && (pendingDelete.plan.record_only_required_count ?? 0) > 0) {
+      if (!window.confirm(`其中 ${pendingDelete.plan.record_only_required_count} 条记录只能删除历史记录，不能删除磁盘文件。确认仅删除这些记录，并删除已验证输出吗？`)) return;
+    }
+    setDeleteBusy(true);
+    try {
+      const response = pendingDelete.source === "history"
+        ? await api<{ results: DeleteItemResult[] }>("/api/history/jobs/delete", {
+            method: "POST", body: JSON.stringify({ ids: pendingDelete.plan.job_ids, mode: pendingDelete.mode, fingerprint: pendingDelete.plan.fingerprint, confirmed: true }),
+          })
+        : await api<{ results: DeleteItemResult[] }>("/api/outputs/delete", {
+            method: "POST", body: JSON.stringify({ output_dir: pendingDelete.plan.root, paths: pendingDelete.plan.paths, fingerprint: pendingDelete.plan.fingerprint, confirmed: true }),
+          });
+      const succeeded = response.results.filter((item) => item.status === "deleted").map((item) => item.id);
+      succeeded.forEach((id) => clearLoadedTaskState(pendingDelete.source === "outputs" ? id.split("/")[0] : id));
+      if (pendingDelete.source === "history") {
+        setSelectedOutputTaskIds((current) => current.filter((id) => !succeeded.includes(id)));
+        if (succeeded.length === response.results.length) setLibraryBatchMode(false);
+      } else {
+        setSelectedOutputPaths((current) => current.filter((id) => !succeeded.includes(id)));
+      }
+      if (selectedPublishVideo && succeeded.some((id) => selectedPublishVideo.includes(id))) setSelectedPublishVideo("");
+      setDeleteResults(response.results);
+      setMessage(`已删除 ${succeeded.length} 项；${response.results.length - succeeded.length} 项未完成。详情见结果清单。`);
+      await Promise.all([loadJobHistory(), loadRestorableJobs(), loadOutputs().catch(() => undefined)]);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "删除失败；请刷新预览后再试");
+      setPendingDelete(null);
+    } finally { setDeleteBusy(false); }
   };
   const openOutput = async () => {
     try {
@@ -1760,6 +2405,9 @@ function App() {
       const selection = await bridge.choose_output_dir();
       if (!selection) return;
       updateOptions("output_dir", selection.path);
+      setOutputs(null);
+      setSelectedOutputPaths([]);
+      setViewedTaskId(null);
       setMessage(`输出目录已设为：${selection.path}`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "选择输出目录失败");
@@ -1767,6 +2415,7 @@ function App() {
   };
   const [rightsHint, setRightsHint] = useState(false);
   const chooseNativeMaterial = async () => {
+    if (running) return setMessage("当前阶段运行中，请先取消或等待完成后再切换素材。");
     if (!authorized) {
       setRightsHint(true);
       setMessage("请先勾选下方「我确认拥有处理、转载或发布该视频的授权/许可证」复选框，再导入本地视频。");
@@ -1781,16 +2430,17 @@ function App() {
     try {
       const selection = await bridge.choose_material_video();
       if (!selection) return;
+      if (!confirmDiscardSubtitles("切换到本地视频")) return;
       await loadMaterials();
+      resetForSourceSwitch();
       setMaterialId(selection.material_id);
       setSourceUrl("");
-      setJob(null);
-      setCues([]);
+      setMaterialSourceTab("local");
+      setMaterialDraftToken((value) => value + 1);
       updateOptions("title", selection.name.replace(/\.[^.]+$/, ""));
       setMessage(`已导入本地视频（直接使用原路径，不会复制到工作区）：${selection.name}。`);
     } catch (error) {
-      // 原生对话框异常时退回浏览器文件选择器，保证一定有反应
-      fileInput.current?.click();
+      setMessage(`导入本地视频失败：${error instanceof Error ? error.message : String(error)}`);
     }
   };
   const chooseNativePublishVideo = async () => {
@@ -1805,6 +2455,8 @@ function App() {
       const detail = await api<{ token: string; name: string; title: string; tags: string[] }>("/api/publish/native-video", { method: "POST", body: JSON.stringify(selection) });
       setNativePublishToken(detail.token); setNativePublishName(detail.name); setSelectedPublishVideo("__native__");
       updateOptions("title", detail.title); if (detail.tags.length) setTags(detail.tags.join(", "));
+      publishHydrateKey.current = "";
+      void generateDescription({ silent: true });
       setMessage(`已选择成品视频：${detail.name}。`);
     } catch (error) { setMessage(error instanceof Error ? error.message : "选择成品视频失败"); }
   };
@@ -1813,8 +2465,8 @@ function App() {
     <section className="workspace-card material-view">
       <header>
         <p className="eyebrow">素材来源</p>
-        <h1>从链接或本地视频开始</h1>
-        <p>仅处理你已获授权的内容。URL 会先由 yt-dlp 下载到本机。</p>
+        <h1>添加素材</h1>
+        <p>选择视频链接或本地文件；仅处理你已获授权的内容。</p>
       </header>
       {apiKeyConfigured === false && options.translator === "deepseek" && (
         <div className="welcome-banner">
@@ -1841,6 +2493,13 @@ function App() {
           <button className="text-button" onClick={() => setDependenciesOpen(true)}>打开依赖中心</button>
         </section>
       )}
+      <div className="source-tabs" role="tablist" aria-label="素材来源">
+        <button type="button" role="tab" aria-selected={materialSourceTab === "url"} aria-controls="material-url-panel" className={materialSourceTab === "url" ? "selected" : ""} onClick={() => setMaterialSourceTab("url")}>视频链接</button>
+        <button type="button" role="tab" aria-selected={materialSourceTab === "local"} aria-controls="material-local-panel" className={materialSourceTab === "local" ? "selected" : ""} onClick={() => setMaterialSourceTab("local")}>本地文件</button>
+      </div>
+      <div className="import-methods">
+        {materialSourceTab === "url" && <section className="material-source material-url" id="material-url-panel" role="tabpanel" aria-label="视频链接导入">
+          <p className="source-intro">粘贴 YouTube 或 B 站地址，读取标题与时长后再确认处理范围。</p>
       <div className="form-grid two">
         <label>
           视频链接
@@ -1850,9 +2509,15 @@ function App() {
             maxLength={2048}
             placeholder="粘贴 YouTube / B 站视频链接"
             onChange={(event) => {
+              if (job && !window.confirm(`修改素材链接会离开当前任务；原任务可在任务库重新载入。${dirty ? "当前未保存的字幕修改会丢失。" : ""}\n\n确定继续吗？`)) return;
+              if (job || selected) resetForSourceSwitch();
+              else sourceRevision.current += 1;
+              if (job || selected) setMessage("已切换到新链接草稿；原任务可在任务库重新载入。");
+              if (job || selected || metadataState === "success") updateOptions("title", "");
+              setMaterialId("");
               setSourceUrl(event.target.value);
+              setMaterialDraftToken((value) => value + 1);
               setFieldErrors((current) => ({ ...current, source_url: "" }));
-              setDemoPreview(false);
               setMetadata(null);
               setMetadataNotice("");
               setMetadataState("idle");
@@ -1866,23 +2531,18 @@ function App() {
           <button
             onClick={readMetadata}
             disabled={running || metadataState === "loading"}
+            aria-busy={metadataState === "loading"}
           >
+            {metadataState === "loading" && <ActivityBars />}
             {metadataState === "loading" ? "正在读取…" : "读取标题与时长"}
-          </button>
-          <button
-            className="primary"
-            onClick={start}
-            disabled={running || !sourceUrl.trim()}
-          >
-            保存素材并配置方案
           </button>
         </div>
       </div>
       {metadataState !== "idle" && (
         <div className="metadata-notice-wrap">
-          <p className={`metadata-notice ${metadataState}`} role="status">
-            {metadataNotice}
-          </p>
+          {metadataState === "error" && /ERROR:|WinError|Traceback|OSError|HTTP Error|FileNotFoundError/i.test(metadataNotice)
+            ? <TaskErrorSummary message={metadataNotice} fallbackTitle="视频信息读取失败" fallbackHint="请检查链接或访问设置，再重新读取。" />
+            : <p className={`metadata-notice ${metadataState}`} role="status">{metadataNotice}</p>}
           {metadataState === "error" && cookieHintMatches(metadataNotice) && (
             <button className="cookie-hint-button" onClick={() => setSettingsOpen(true)}>
               去设置 → YouTube 访问设置
@@ -1911,9 +2571,20 @@ function App() {
           这是 4K 素材。原始画质处理会明显增加负载；普通使用建议改为 1080p。
         </p>
       )}
-      <div className="divider">
-        <span>或导入本地素材</span>
-      </div>
+      {metadata?.max_height && options.download_quality !== "original" && metadata.max_height < (options.download_quality === "1080p" ? 1080 : 720) && (
+        <p className="metadata-notice warning" role="status">
+          源站最高为 {metadata.max_width ?? "?"}×{metadata.max_height}。低于当前画质选择；开始前会要求确认，应用不会静默降档。
+        </p>
+      )}
+      {job?.quality_proposal?.requires_consent && !job.quality_consent && (
+        <div className="metadata-notice warning" role="alert">
+          <p>服务器拟使用 {job.quality_proposal.width ?? "?"}×{job.quality_proposal.height ?? "?"}，{(job.quality_proposal.baseline_width ?? 0) > (job.quality_proposal.width ?? 0) || (job.quality_proposal.baseline_height ?? 0) > (job.quality_proposal.height ?? 0) ? `低于此前检查到的 ${job.quality_proposal.baseline_width ?? "?"}×${job.quality_proposal.baseline_height ?? "?"}` : `低于 ${job.quality_proposal.quality} 档位要求`}。未确认前不会下载低画质。</p>
+          <button className="primary small" onClick={() => void confirmQualityProposal()} disabled={running || preparingJob}>确认此画质方案</button>
+        </div>
+      )}
+        </section>}
+        {materialSourceTab === "local" && <section className="material-source material-local" id="material-local-panel" role="tabpanel" aria-label="本地视频导入">
+          <p className="source-intro">选择已导入视频，或从电脑中选择新视频。桌面版直接使用原路径。</p>
       <div className="form-grid two">
         <label>
           已导入视频
@@ -1921,13 +2592,17 @@ function App() {
             value={materialId}
             onChange={(event) => {
               if (dirty && !confirmDiscardSubtitles("切换素材会清空当前未保存的字幕修改")) return;
+              resetForSourceSwitch();
               setMaterialId(event.target.value);
               setSourceUrl("");
-              setJob(null);
-              setCues([]);
+              updateOptions("title", materials.find((item) => item.id === event.target.value)?.name.replace(/\.[^.]+$/, "") ?? "");
+              setMaterialDraftToken((value) => value + 1);
+              setMessage("已切换本地素材；原任务可在任务库重新载入。");
             }}
+            disabled={running}
           >
             <option value="">未选择视频</option>
+            {job && materialId && !selected && <option value={materialId}>当前历史任务 · {job.material.name}</option>}
             {materials.map((item) => (
               <option key={item.id} value={item.id}>
                 {item.is_demo ? "演示 · " : "本地 · "}
@@ -1943,19 +2618,15 @@ function App() {
           {!authorized && (
             <span className="rights-hint">导入前需先勾选下方授权确认</span>
           )}
-          <button
-            className="primary"
-            onClick={start}
-            disabled={running || !selected}
-          >
-            保存素材并配置方案
-          </button>
         </div>
       </div>
       <p className="material-hint">
-        桌面版导入本地视频时直接使用原路径，不会复制到工作区，也不占用双倍磁盘。
+        桌面版直接使用本地视频原路径，不占用双倍磁盘；处理期间请勿移动或删除原文件。
       </p>
-      <div className="form-grid three">
+        </section>}
+      </div>
+      <div className="material-detail-heading"><b>处理设置与授权</b><span>先确认这一步，再进入处理方案</span></div>
+      <div className={`form-grid three material-settings ${materialSourceTab === "local" ? "local-settings" : ""}`}>
         <label>
           标题
           <input
@@ -1965,41 +2636,44 @@ function App() {
           />
           {fieldErrors.title && <small className="field-error">{fieldErrors.title}</small>}
         </label>
-        <label>
-          URL 读取长度
-          <div className="duration-control">
-            <label className="check"><input type="checkbox" checked={fullVideo} disabled={!sourceUrl.trim()} onChange={(event) => setFullVideo(event.target.checked)} />完整视频</label>
-            <input type="number" min={durationUnit === "秒" ? 1 : 1 / 60} max={durationUnit === "小时" ? 24 : durationUnit === "分钟" ? 1440 : 86400} step={durationUnit === "秒" ? 1 : durationUnit === "分钟" ? 1 / 60 : 1 / 3600} value={durationValue} disabled={!sourceUrl.trim() || fullVideo} onChange={(event) => { setDurationValue(event.target.value); setFieldErrors((current) => ({ ...current, max_seconds: "" })); }} />
-            <select value={durationUnit} disabled={!sourceUrl.trim() || fullVideo} onChange={(event) => setDurationUnit(event.target.value as "秒" | "分钟" | "小时")}><option>秒</option><option>分钟</option><option>小时</option></select>
+        {materialSourceTab === "url" && <fieldset className="material-range">
+          <legend>处理范围</legend>
+          <label className="check"><input type="radio" name="material-range" checked={fullVideo} onChange={() => setFullVideo(true)} />完整视频</label>
+          <div className="range-limited">
+            <label className="check"><input type="radio" name="material-range" checked={!fullVideo} onChange={() => setFullVideo(false)} />仅处理前</label>
+            <input aria-label="处理前多少时长" type="number" min={durationUnit === "秒" ? 1 : 1 / 60} max={durationUnit === "小时" ? 24 : durationUnit === "分钟" ? 1440 : 86400} step={durationUnit === "秒" ? 1 : durationUnit === "分钟" ? 1 / 60 : 1 / 3600} value={durationValue} disabled={fullVideo} onChange={(event) => { setDurationValue(event.target.value); setFieldErrors((current) => ({ ...current, max_seconds: "" })); }} />
+            <select aria-label="处理范围单位" value={durationUnit} disabled={fullVideo} onChange={(event) => setDurationUnit(event.target.value as "秒" | "分钟" | "小时")}><option>秒</option><option>分钟</option><option>小时</option></select>
           </div>
+          <small>仅处理开头片段，便于快速测试识别、翻译和字幕效果。</small>
           {fieldErrors.max_seconds && <small className="field-error">{fieldErrors.max_seconds}</small>}
-        </label>
-        <label>
-          URL 下载画质
+        </fieldset>}
+        {materialSourceTab === "url" && <label>
+          下载画质
           <select
             value={options.download_quality}
             disabled={!sourceUrl.trim() || running}
             onChange={(event) => updateOptions("download_quality", event.target.value as Options["download_quality"])}
           >
-            <option value="720p">720p（低负载）</option>
-            <option value="1080p">1080p（推荐）</option>
-            <option value="original">原始画质（可能为 4K）</option>
+            <option value="720p">最高 720p（低负载）</option>
+            <option value="1080p">最高 1080p（推荐）</option>
+            <option value="original">原始画质（最高可用，不静默降档）</option>
           </select>
-        </label>
-        <label className="check">
+        </label>}
+        {materialSourceTab === "url" && <label className="check cc-reuse-check">
           <input
             type="checkbox"
             checked={options.require_reuse_allowed}
-            onChange={(event) =>
-              updateOptions("require_reuse_allowed", event.target.checked)
-            }
-            disabled={!sourceUrl.trim()}
+            onChange={(event) => void persistRequireReuseAllowed(event.target.checked)}
+            disabled={!sourceUrl.trim() || running}
           />
-          仅接受 CC reuse allowed
+          <span>仅接受可复用 CC 视频</span>
           <small className="check-hint">
-            （大多数视频无此标记，勾选后可能无法下载）
+            {job
+              ? `当前任务：${job.options.require_reuse_allowed ? "仅接受可复用 CC 视频" : "未启用 CC 限制"}`
+              : "大多数视频无此标记，勾选后可能无法下载"}
+            {job && job.options.require_reuse_allowed !== options.require_reuse_allowed ? "（正在同步到任务）" : ""}
           </small>
-        </label>
+        </label>}
       </div>
       <label className={`rights-row ${rightsHint && !authorized ? "rights-hint-active" : ""}`} id="rights-check">
         <input
@@ -2021,14 +2695,33 @@ function App() {
         <button onClick={() => void checkReadiness()} disabled={running}>检查配置</button>
         {readiness.length > 0 && <span className="readiness-error">{readiness.join("；")}</span>}
         {!readiness.length && preflightWarnings.length > 0 && <span className="readiness-warning">{preflightWarnings.join("；")}</span>}
+        <button className="primary material-submit" onClick={start} disabled={running || !materialSourceReady}>保存素材并配置方案 →</button>
       </div>
     </section>
   );
   const preparationBlocking = (job?.checks ?? []).some((item) => item.status === "blocking");
   const preparationReady = Boolean(job?.checks?.length) && !preparationBlocking;
+  const schemeDirty = Boolean(job && (
+    device !== job.device || computeType !== job.compute_type ||
+    Object.entries(taskOptions()).some(([key, value]) =>
+      !["cookies_file", "youtube_proxy"].includes(key) &&
+      key in job.options && !sameTaskOption(key, value, job.options[key as keyof Options]),
+    )
+  ));
+  schemeDirtyRef.current = schemeDirty;
+  const smallerInstalledWhisperModels = job?.recovery?.id === "retry_extract_with_lower_resource"
+    ? dependencies
+      .filter((item) => item.available && item.id.startsWith("whisper-"))
+      .map((item) => item.id.slice("whisper-".length))
+      .filter((model): model is typeof whisperModelOrder[number] =>
+        whisperModelOrder.includes(model as typeof whisperModelOrder[number]) &&
+        whisperModelOrder.indexOf(model as typeof whisperModelOrder[number]) < whisperModelOrder.indexOf(job.options.whisper_model_size as typeof whisperModelOrder[number]),
+      )
+      .sort((left, right) => whisperModelOrder.indexOf(right) - whisperModelOrder.indexOf(left))
+    : [];
   const handleCheckAction = (check: PreparationCheck) => {
     const action = check.action ?? "";
-    if (/安装|模型|FFmpeg|Tesseract/.test(action)) {
+    if (/安装|模型|FFmpeg|Tesseract|依赖中心|Ollama/.test(action)) {
       const dependency = dependencies.find((item) => item.id === check.id || (check.id === "ffprobe" && item.id === "ffmpeg"));
       setDependenciesOpen(true);
       if (dependency?.installable) void installDependency(dependency);
@@ -2043,14 +2736,37 @@ function App() {
         <div>
           <p className="eyebrow">任务工作流</p>
           <h2>先检查，再逐阶段运行</h2>
-          <p>已完成阶段会保留检查点。取消或关闭应用后，不会丢掉之前的有效产物。</p>
+          <p className={schemeDirty ? "scheme-warning" : undefined}>{schemeDirty ? "当前方案有未保存的修改。阶段状态仍对应上次保存的方案；先保存并检查准备。" : "已完成阶段会保留检查点。取消或关闭应用后，不会丢掉之前的有效产物。"}</p>
+          {job.quality_proposal?.requires_consent && !job.quality_consent && (
+            <div className="metadata-notice warning" role="alert">
+              <p>获取素材拟使用 {job.quality_proposal.width ?? "?"}×{job.quality_proposal.height ?? "?"}，{(job.quality_proposal.baseline_width ?? 0) > (job.quality_proposal.width ?? 0) || (job.quality_proposal.baseline_height ?? 0) > (job.quality_proposal.height ?? 0) ? `低于此前检查到的 ${job.quality_proposal.baseline_width ?? "?"}×${job.quality_proposal.baseline_height ?? "?"}` : `低于 ${job.quality_proposal.quality} 档位要求`}。请明确确认。</p>
+              <button className="primary small" onClick={() => void confirmQualityProposal()} disabled={running || preparingJob}>确认画质方案</button>
+            </div>
+          )}
         </div>
         <div className="workflow-actions">
-          <button onClick={() => void saveWorkflowOptions()} disabled={running || preparingJob}>保存方案</button>
-          <button className="primary" onClick={() => void prepareJob()} disabled={running || preparingJob} title={running ? "当前阶段运行中" : undefined}>
-            {preparingJob ? "正在检查链接与环境…" : job.checks?.length ? "重新检查准备" : "检查准备"}
+          <button onClick={() => void saveWorkflowOptions()} disabled={running || preparingJob}>{schemeDirty ? "保存修改" : "保存方案"}</button>
+          <button className="primary" onClick={() => void prepareJob()} disabled={running || preparingJob} aria-busy={preparingJob} title={running ? "当前阶段运行中" : undefined}>
+            {preparingJob && <ActivityBars />}
+            {preparingJob ? "正在检查素材与环境…" : job.checks?.length ? "重新检查准备" : "检查准备"}
           </button>
-          <button onClick={() => void runAll()} disabled={running || !preparationReady} title={!preparationReady ? "准备检查全部通过后才能运行" : undefined}>
+          <button
+            onClick={() => {
+              if (running || !preparationReady || schemeDirty) {
+                const reason = schemeDirty
+                  ? "先保存修改并重新检查准备"
+                  : !preparationReady
+                    ? "准备检查全部通过后才能运行"
+                    : "当前阶段运行中";
+                setMessage(reason);
+                return;
+              }
+              void runAll();
+            }}
+            disabled={false}
+            aria-disabled={running || !preparationReady || schemeDirty}
+            title={schemeDirty ? "先保存修改并重新检查准备" : !preparationReady ? "准备检查全部通过后才能运行" : undefined}
+          >
             一键运行到渲染
           </button>
         </div>
@@ -2067,7 +2783,7 @@ function App() {
       </ol>
       <section className="preparation-centre">
         <div className="section-title">
-          <div><b>开始前准备</b><small>模型、工具、API、设备和磁盘问题全部在下载前显示</small></div>
+          <div><b>开始前准备</b><small>模型、工具、API、设备和磁盘问题在运行前显示</small></div>
           {job.checks?.length ? <span className={preparationBlocking ? "blocking" : "passed"}>{preparationBlocking ? "存在阻断项" : "全部可运行"}</span> : <span>尚未检查</span>}
         </div>
         {job.checks?.length ? (
@@ -2085,17 +2801,74 @@ function App() {
       <section className="stage-list">
         {workflowStageMeta.map(([id, label, purpose], index) => {
           const state = job.stages?.[id];
-          const availability = stageAvailability(id, Object.fromEntries(workflowStageMeta.map(([name]) => [name, job.stages?.[name]?.status])), preparationReady, running, publishInPipeline);
-          const enabled = availability.enabled;
-          const disabledReason = availability.reason;
+          const availability = stageAvailability(id, Object.fromEntries(workflowStageMeta.map(([name]) => [name, job.stages?.[name]?.status])), preparationReady && !schemeDirty, running, publishInPipeline);
+          const publishButton = id === "publish"
+            ? publishStageButton({
+                publishEnabled: publishInPipeline,
+                renderStatus: job.stages?.render?.status,
+                publishStatus: state?.status,
+              })
+            : null;
+          const publishRun = publishButton?.action === "run";
+          const enabled = publishButton ? publishButton.enabled && (!publishRun || (preparationReady && !schemeDirty && !running)) : availability.enabled;
+          const disabledReason = schemeDirty && (state?.status !== "completed") ? "先保存修改并重新检查准备" : publishButton && !publishButton.enabled ? publishButton.reason : publishRun && !preparationReady ? "先通过准备检查" : publishRun && running ? "另一个阶段正在运行" : publishButton ? publishButton.reason : availability.reason;
+          const buttonLabel = state?.status === "running"
+            ? "取消当前阶段"
+            : publishButton
+              ? publishButton.label
+              : state?.status === "completed"
+                ? id === "extract"
+                  ? "重新提取字幕"
+                  : id === "translate"
+                    ? "重新翻译"
+                    : id === "render"
+                      ? "重新渲染"
+                      : "打开结果"
+                : ["failed", "cancelled", "stale", "interrupted"].includes(state?.status ?? "")
+                  ? "重试"
+                  : "开始";
+          const onStageClick = () => {
+            if (state?.status === "running") {
+              void cancel();
+              return;
+            }
+            if (!enabled) {
+              if (disabledReason) setMessage(disabledReason);
+              return;
+            }
+            // Completed extract/translate/render: re-run that stage (burn-in needs
+            // re-render after external subtitle updates).
+            if (
+              state?.status === "completed" &&
+              (id === "extract" || id === "translate" || id === "render")
+            ) {
+              void runStage(id);
+              return;
+            }
+            if (publishButton?.action === "open" || (id !== "publish" && state?.status === "completed")) {
+              openStageResult(id);
+              return;
+            }
+            if (id === "publish" && ["interrupted", "failed", "cancelled"].includes(state?.status ?? "") &&
+                !window.confirm("投稿辅助可能已经上传视频。请先在 B 站创作中心核对草稿，确认不会重复投稿后再重试。")) return;
+            void runStage(id);
+          };
+          const artifactKey = { acquire: "raw_video", extract: "source_srt", translate: "translated_srt", render: "rendered_video", publish: "" }[id];
+          const artifact = artifactKey ? job.artifacts?.[artifactKey] : null;
+          const elapsed = state?.started_at ? formatElapsed(Math.max(0, (state.finished_at ?? now / 1000) - state.started_at)) : null;
           return (
             <article key={id} className={`stage-card ${state?.status ?? "pending"}`}>
               <div className="stage-index">{index + 1}</div>
-              <div className="stage-copy"><div><b>{label}</b><span className={`stage-status ${state?.status ?? "pending"}`}>{stageStatusLabel[state?.status ?? "pending"]}</span></div><p>{purpose}</p>{state?.error && <small className="stage-error">{state.error}</small>}</div>
+              <div className="stage-copy"><div><b>{label}</b><span className={`stage-status ${state?.status ?? "pending"}`}>{state?.status === "running" && <ActivityBars />}{stageStatusLabel[state?.status ?? "pending"]}</span></div><p>{purpose}</p>{(state?.status === "running" || state?.status === "completed") && <small className="stage-metrics">{state.status === "running" ? `${Math.round(state.progress)}% · ` : ""}{elapsed ?? ""}{artifact?.available && artifact.name ? ` · ${artifact.name}` : ""}</small>}{state?.error && <TaskErrorSummary message={state.error} />}</div>
               <div className="stage-action">
                 {state?.status === "completed" && id !== "publish" ? <span className="checkpoint">检查点已保存</span> : null}
-                <button onClick={() => state?.status === "running" ? void cancel() : state?.status === "completed" ? openStageResult(id) : void runStage(id)} disabled={state?.status === "running" || state?.status === "completed" ? false : !enabled} title={!["running", "completed"].includes(state?.status ?? "") && !enabled ? disabledReason : undefined}>
-                  {state?.status === "running" ? "取消当前阶段" : state?.status === "completed" ? "打开结果" : ["failed", "cancelled", "stale", "interrupted"].includes(state?.status ?? "") ? "重试" : "开始"}
+                <button
+                  onClick={onStageClick}
+                  disabled={false}
+                  aria-disabled={state?.status === "running" ? false : !enabled}
+                  title={!enabled && disabledReason ? disabledReason : undefined}
+                >
+                  {buttonLabel}
                 </button>
                 {!["running", "completed"].includes(state?.status ?? "") && !enabled && disabledReason && <small>{disabledReason}</small>}
               </div>
@@ -2103,17 +2876,54 @@ function App() {
           );
         })}
       </section>
-      {job.can_resume && <div className="resume-banner"><div><b>检测到上次运行被中断</b><span>已完成阶段不会重做；翻译会复用已保存批次，其他未完成阶段从头执行。</span></div><button onClick={() => void resumeJob()} disabled={!preparationReady || running}>从 {workflowStageMeta.find(([id]) => id === job.next_stage)?.[1] ?? "检查点"}继续</button></div>}
+      {job.can_resume && <div className="resume-banner"><div><b>检测到上次运行被中断</b><span>已完成阶段不会重做；翻译会复用已保存批次，其他未完成阶段从头执行。</span></div><button onClick={() => void resumeJob()} disabled={!preparationReady || schemeDirty || running}>从 {workflowStageMeta.find(([id]) => id === job.next_stage)?.[1] ?? "检查点"}继续</button></div>}
     </section>
   ) : null;
+  const localTranslationPanel = options.translator !== "ollama" ? null : (
+    <section className="local-translation-panel" aria-label="本地翻译模型状态">
+      <div>
+        <b>本地翻译 · {localModelTag}</b>
+        <p>
+          {ollamaRuntimeDependency?.state === "ready"
+            ? selectedLocalModelDependency?.available
+              ? "模型已就绪。翻译内容只发给本机 Ollama，不需要 API Key。"
+              : selectedLocalModelDependency?.installable
+                ? "这个模型尚未下载。点击下载后会显示进度；完成后无需重启应用。"
+                : selectedLocalModelDependency?.state === "blocked"
+                  ? selectedLocalModelDependency.message
+                  : "正在检查模型状态…"
+            : ollamaRuntimeDependency?.state === "stopped"
+              ? "Ollama 已安装但未运行。请从 Windows 开始菜单启动 Ollama，再重新检测。"
+              : ollamaRuntimeDependency?.state === "unavailable"
+                ? ollamaRuntimeDependency.message
+              : ollamaRuntimeDependency?.state === "missing"
+                ? "这台电脑还没有 Ollama。先安装并启动 Ollama，再回到这里下载翻译模型。"
+                : "正在检查 Ollama；此功能需要单独安装本地运行环境和模型，不会打进 EXE。"}
+        </p>
+        {localModelTag === "qwen3.5:9b" && <small>9B 模型文件约 6.6 GB，运行时会额外占用内存。</small>}
+        {localModelTag === "translategemma:12b" && <small>专用多语言翻译模型，模型文件约 8.1 GB，运行时会占用更多显存和内存；当前逐条字幕翻译，不执行通用模型语义切句与源文校对。</small>}
+      </div>
+      <div className="local-translation-actions">
+        {ollamaRuntimeDependency?.state === "missing" && ollamaRuntimeDependency.action_url && (
+          <a className="secondary small" href={ollamaRuntimeDependency.action_url} target="_blank" rel="noreferrer">下载 Ollama</a>
+        )}
+        {ollamaRuntimeDependency?.state === "ready" && !selectedLocalModelDependency?.available && selectedLocalModelDependency?.installable && (
+          <button className="primary small" disabled={Boolean(dependencyJob && ["queued", "running", "cancelling"].includes(dependencyJob.status))} onClick={() => void installDependency(selectedLocalModelDependency)}>
+            {dependencyJob?.dependency_id === selectedLocalModelDependency.id && ["queued", "running"].includes(dependencyJob.status) ? "下载中…" : "下载所选模型"}
+          </button>
+        )}
+        <button className="small" onClick={() => setDependenciesOpen(true)}>查看依赖状态</button>
+      </div>
+    </section>
+  );
   const processView = (
     <>
-    {workflowPanel}
-    <section className="workspace-card">
-      <header>
+    <section className="workspace-card process-view">
+      <header className="process-header">
         <p className="eyebrow">处理配置</p>
         <h1>字幕、翻译与推理</h1>
-        <p>这些参数会与任务一起保存，并显示在检查器中。</p>
+        <p>先选择主要处理方式；模型、精度和 OCR 细节可在高级设置中调整。</p>
+        <button className="process-mode-toggle" onClick={toggleMode}>{mode === "basic" ? "高级设置 ›" : "收起高级设置 ‹"}</button>
       </header>
       {options.translator === "deepseek" && apiKeyConfigured === false && (
         <p className="metadata-notice error">
@@ -2135,6 +2945,7 @@ function App() {
           人工复核提醒：{warning}
         </p>
       ))}
+      {localTranslationPanel}
       {mode === "basic" ? (
         <div className="settings-grid">
           <label>
@@ -2145,27 +2956,37 @@ function App() {
                 updateOptions("subtitle_source", event.target.value)
               }
             >
-              <option value="auto">自动检测</option>
+              <option value="auto">自动：平台/语音优先，空结果再尝试 OCR</option>
               <option value="merged">音频 + OCR 合并</option>
               <option value="audio">仅音频转写</option>
               <option value="ocr">仅画面字幕 OCR</option>
             </select>
-            <FieldGuide summary="决定源字幕来自声音、画面文字，或两者合并。" detail="一般视频推荐仅音频；画面已有清晰外语字幕时可选 OCR；合并模式更慢且需要额外安装 Tesseract。" badges={options.subtitle_source === "audio" ? ["推荐"] : options.subtitle_source.includes("ocr") || options.subtitle_source === "merged" ? ["需要额外安装", "高负载"] : []} />
+            <FieldGuide summary="自动模式优先读取平台字幕/语音；只有没有可用字幕时才尝试 OCR。" detail="仅音频不会读取画面文字；仅 OCR 不会调用 Whisper，OCR 失败会明确报错。合并模式更慢且需要 Tesseract。" badges={options.subtitle_source === "audio" ? ["推荐"] : options.subtitle_source === "ocr" || options.subtitle_source === "merged" ? ["需要额外安装", "高负载"] : []} />
           </label>
           <label>
             翻译器
             <select
               value={options.translator}
-              onChange={(event) =>
-                updateOptions("translator", event.target.value)
-              }
+              onChange={(event) => changeTranslator(event.target.value)}
             >
-              <option value="deepseek">DeepSeek</option>
-              <option value="openai">OpenAI</option>
+              <option value="deepseek">DeepSeek（在线付费）</option>
+              <option value="openai">OpenAI（在线付费）</option>
+              <option value="ollama">Ollama（本机运行，无 API 费用）</option>
               <option value="none">不翻译</option>
             </select>
-            <FieldGuide summary="把源字幕翻译为目标语言。" detail="DeepSeek/OpenAI 会调用在线 API，可能产生少量费用；不翻译只适合保留原文或调试提取结果。" badges={options.translator === "none" ? [] : ["可能产生费用"]} />
+            <FieldGuide summary="把源字幕翻译为目标语言。" detail={options.translator === "ollama" ? "Ollama 在本机运行，不需要 API Key，也不会把字幕发送到云端。需先安装 Ollama，再明确下载模型；模型不包含在 EXE 中。" : "DeepSeek/OpenAI 会调用在线 API，可能产生费用；不翻译只适合保留原文或调试提取结果。"} badges={options.translator === "none" ? [] : options.translator === "ollama" ? ["本机运行", "需下载模型"] : ["可能产生费用"]} />
           </label>
+          {options.translator === "ollama" && (
+            <label>
+              本地翻译模型
+              <select value={localModelTag} onChange={(event) => updateOptions("translate_model", event.target.value)}>
+                <option value="qwen3.5:4b">Qwen 3.5 4B · 约 3.4 GB（通用，推荐）</option>
+                <option value="qwen3.5:9b">Qwen 3.5 9B · 约 6.6 GB</option>
+                <option value="translategemma:12b">TranslateGemma 12B · 约 8.1 GB（专用翻译，需复核）</option>
+              </select>
+              <FieldGuide summary="模型文件需要单独下载到本机。" detail={localModelTag === "translategemma:12b" ? "TranslateGemma 专门用于多语言翻译；应用使用专用翻译提示并逐条请求，保留字幕编号。模型不执行源文校对或语义切句；较大的模型文件和运行时内存占用也更高。" : "选择只会更改方案，不会自动下载。下载完成后状态会实时刷新，不需要重启应用。"} badges={["首次下载需要联网", "模型不随 EXE 打包"]} />
+            </label>
+          )}
           <label>
             字幕排版
             <select
@@ -2178,6 +2999,60 @@ function App() {
               <option value="bilingual-source-first">原文在上 + 中文在下</option>
               <option value="bilingual-translation-first">中文在上 + 原文在下</option>
             </select>
+          </label>
+          <label>
+            字体
+            <input
+              value={options.font_name}
+              maxLength={100}
+              onChange={(event) => updateOptions("font_name", event.target.value)}
+            />
+            {fieldErrors.font_name && <small className="field-error">{fieldErrors.font_name}</small>}
+          </label>
+          <label>
+            字号
+            <input
+              type="number"
+              min="8"
+              max="96"
+              step="1"
+              value={options.font_size}
+              onChange={(event) => updateOptions("font_size", Number(event.target.value || 24))}
+            />
+          </label>
+          <label>
+            字幕颜色
+            <select
+              value={options.subtitle_color}
+              onChange={(event) => updateOptions("subtitle_color", event.target.value)}
+            >
+              {["白色", "黄色", "青色", "绿色", "黑色"].map((value) => (
+                <option key={value}>{value}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            边框颜色
+            <select
+              value={options.subtitle_outline_color}
+              onChange={(event) => updateOptions("subtitle_outline_color", event.target.value)}
+            >
+              {["黑色", "白色", "灰色", "蓝色"].map((value) => (
+                <option key={value}>{value}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            字幕效果
+            <select
+              value={options.subtitle_effect}
+              onChange={(event) => updateOptions("subtitle_effect", event.target.value)}
+            >
+              {["描边", "阴影", "描边+阴影", "无"].map((value) => (
+                <option key={value}>{value}</option>
+              ))}
+            </select>
+            <FieldGuide summary="控制硬字幕的描边与阴影。" detail="改完样式后需重新渲染成片才会生效；已完成的渲染检查点会提示重做。" />
           </label>
           <label>
             字幕渲染
@@ -2203,18 +3078,6 @@ function App() {
             </select>
             <FieldGuide summary="限制下载带宽和 CPU 线程，避免处理视频时整台电脑变卡。" detail="后台模式优先保证其他软件流畅；均衡模式默认保留一部分算力和网络；极速模式会尽量使用全部资源。切换模式不会让已完成阶段失效。" badges={options.resource_profile === "balanced" ? ["推荐"] : options.resource_profile === "maximum" ? ["高负载"] : ["低占用"]} />
           </label>
-          <p className="mode-note">
-            其余参数（模型、精度、OCR、字幕样式等）已隐藏，当前使用推荐默认值。
-            <button
-              className="mode-expand"
-              onClick={() => {
-                setMode("advanced");
-                localStorage.setItem("ybl-mode", "advanced");
-              }}
-            >
-              展开全部选项
-            </button>
-          </p>
         </div>
       ) : (
       <div className="settings-grid">
@@ -2226,7 +3089,7 @@ function App() {
               updateOptions("subtitle_source", event.target.value)
             }
           >
-            <option value="auto">自动检测</option>
+            <option value="auto">自动：平台/语音优先，空结果再尝试 OCR</option>
             <option value="merged">音频 + OCR 合并</option>
             <option value="audio">仅音频转写</option>
             <option value="ocr">仅画面字幕 OCR</option>
@@ -2236,6 +3099,7 @@ function App() {
           Whisper 模型
           <select
             value={options.whisper_model_size}
+            disabled={options.subtitle_source === "ocr"}
             onChange={(event) =>
               updateOptions("whisper_model_size", event.target.value)
             }
@@ -2244,7 +3108,7 @@ function App() {
               <option key={value}>{value}</option>
             ))}
           </select>
-          <FieldGuide summary="模型越大通常更准确，也越慢、越占显存和磁盘。" detail="small 是桌面使用的平衡选择。所选模型必须在准备中心明确安装，转写阶段不会自动联网下载。" badges={["需要预先安装"]} />
+          <FieldGuide summary={options.subtitle_source === "ocr" ? "纯 OCR 不使用 Whisper 模型。" : "模型越大通常更准确，也越慢、越占显存和磁盘。"} detail="small 是桌面使用的平衡选择。所选模型必须在准备中心明确安装，转写阶段不会自动联网下载。" badges={options.subtitle_source === "ocr" ? [] : ["需要预先安装"]} />
         </label>
         <label>
           源语言
@@ -2264,25 +3128,30 @@ function App() {
           翻译器
           <select
             value={options.translator}
-            onChange={(event) =>
-              updateOptions("translator", event.target.value)
-            }
+            onChange={(event) => changeTranslator(event.target.value)}
           >
-            <option value="deepseek">DeepSeek</option>
-            <option value="openai">OpenAI</option>
+            <option value="deepseek">DeepSeek（在线付费）</option>
+            <option value="openai">OpenAI（在线付费）</option>
+              <option value="ollama">Ollama（本机运行，无 API 费用）</option>
             <option value="none">不翻译</option>
           </select>
         </label>
         <label>
           翻译模型
-          <input
-            value={options.translate_model}
-            maxLength={128}
-            placeholder="使用默认模型"
-            onChange={(event) =>
-              updateOptions("translate_model", event.target.value)
-            }
-          />
+          {options.translator === "ollama" ? (
+            <select value={localModelTag} onChange={(event) => updateOptions("translate_model", event.target.value)}>
+              <option value="qwen3.5:4b">Qwen 3.5 4B · 约 3.4 GB（通用，推荐）</option>
+              <option value="qwen3.5:9b">Qwen 3.5 9B · 约 6.6 GB</option>
+              <option value="translategemma:12b">TranslateGemma 12B · 约 8.1 GB（专用翻译，需复核）</option>
+            </select>
+          ) : (
+            <input
+              value={options.translate_model}
+              maxLength={128}
+              placeholder="使用默认模型"
+              onChange={(event) => updateOptions("translate_model", event.target.value)}
+            />
+          )}
           {fieldErrors.translate_model && <small className="field-error">{fieldErrors.translate_model}</small>}
         </label>
         <label>
@@ -2295,6 +3164,20 @@ function App() {
             }
           />
           {fieldErrors.target_lang && <small className="field-error">{fieldErrors.target_lang}</small>}
+        </label>
+        <label>
+          字幕排版
+          <select
+            value={options.subtitle_display_mode}
+            onChange={(event) =>
+              updateOptions("subtitle_display_mode", event.target.value)
+            }
+          >
+            <option value="translated">中文单语</option>
+            <option value="bilingual-source-first">原文在上 + 中文在下</option>
+            <option value="bilingual-translation-first">中文在上 + 原文在下</option>
+          </select>
+          <FieldGuide summary="选择成品字幕是中文单语，还是中英双语叠放。" detail="双语会同时显示原文和译文；单语只保留翻译结果。改完后需重新渲染才会写进成片。" />
         </label>
         <label>
           推理设备
@@ -2343,6 +3226,7 @@ function App() {
           转写束宽（beam_size）
           <select
             value={options.beam_size}
+            disabled={options.subtitle_source === "ocr"}
             onChange={(event) => updateOptions("beam_size", Number(event.target.value))}
           >
             <option value={1}>1（快）</option>
@@ -2412,6 +3296,70 @@ function App() {
           </select>
         </label>
         <label>
+          字幕排版
+          <select
+            value={options.subtitle_display_mode}
+            onChange={(event) => updateOptions("subtitle_display_mode", event.target.value)}
+          >
+            <option value="translated">中文单语</option>
+            <option value="bilingual-source-first">原文在上 + 中文在下</option>
+            <option value="bilingual-translation-first">中文在上 + 原文在下</option>
+          </select>
+        </label>
+        <label>
+          字体
+          <input
+            value={options.font_name}
+            maxLength={100}
+            onChange={(event) => updateOptions("font_name", event.target.value)}
+          />
+          {fieldErrors.font_name && <small className="field-error">{fieldErrors.font_name}</small>}
+        </label>
+        <label>
+          字号
+          <input
+            type="number"
+            min="8"
+            max="96"
+            step="1"
+            value={options.font_size}
+            onChange={(event) => updateOptions("font_size", Number(event.target.value || 24))}
+          />
+        </label>
+        <label>
+          字幕颜色
+          <select
+            value={options.subtitle_color}
+            onChange={(event) => updateOptions("subtitle_color", event.target.value)}
+          >
+            {["白色", "黄色", "青色", "绿色", "黑色"].map((value) => (
+              <option key={value}>{value}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          边框颜色
+          <select
+            value={options.subtitle_outline_color}
+            onChange={(event) => updateOptions("subtitle_outline_color", event.target.value)}
+          >
+            {["黑色", "白色", "灰色", "蓝色"].map((value) => (
+              <option key={value}>{value}</option>
+            ))}
+          </select>
+        </label>
+        <label>
+          字幕效果
+          <select
+            value={options.subtitle_effect}
+            onChange={(event) => updateOptions("subtitle_effect", event.target.value)}
+          >
+            {["描边", "阴影", "描边+阴影", "无"].map((value) => (
+              <option key={value}>{value}</option>
+            ))}
+          </select>
+        </label>
+        <label>
           渲染质量（CRF）
           <select
             value={options.render_crf}
@@ -2439,9 +3387,7 @@ function App() {
           <div className="output-dir-control">
             <input
               value={options.output_dir}
-              onChange={(event) =>
-                updateOptions("output_dir", event.target.value)
-              }
+              onChange={(event) => { updateOptions("output_dir", event.target.value); setOutputs(null); setSelectedOutputPaths([]); setViewedTaskId(null); }}
             />
             <button onClick={() => void chooseOutputDir()} disabled={running}>
               选择文件夹
@@ -2451,7 +3397,7 @@ function App() {
       </div>
       )}
       <div className="toggle-row">
-        <label className="check">
+        {(job?.material.source_url || (!job && sourceUrl.trim())) && ["auto", "merged"].includes(options.subtitle_source) && <label className="check">
           <input
             type="checkbox"
             checked={options.prefer_platform_subtitles}
@@ -2460,7 +3406,7 @@ function App() {
             }
           />
           优先使用 YouTube 字幕（更快；没有时自动转写）
-        </label>
+        </label>}
         <label className="check">
           <input
             type="checkbox"
@@ -2526,12 +3472,13 @@ function App() {
         <button
           className="primary"
           onClick={() => job ? void prepareJob() : void start()}
-          disabled={running || preparingJob || (!job && !selected && !sourceUrl.trim())}
+          disabled={running || preparingJob || (!job && !materialSourceReady)}
         >
           {running ? "当前阶段运行中" : job ? "保存方案并检查准备" : "保存素材并配置方案"}
         </button>
       </footer>
     </section>
+    {workflowPanel}
     </>
   );
   const subtitleView = (
@@ -2558,7 +3505,10 @@ function App() {
             <button
               className={preview === "rendered" ? "selected" : ""}
               disabled={!job?.result && !demoPreview}
-              onClick={() => setPreview("rendered")}
+              onClick={() => {
+                setMediaNonce(Date.now());
+                setPreview("rendered");
+              }}
             >
               成片
             </button>
@@ -2570,7 +3520,20 @@ function App() {
           src={previewSrc}
           controls
           preload="metadata"
+          onLoadStart={() => {
+            setMediaDuration(null);
+            if (timelinePlayhead.current) timelinePlayhead.current.style.left = "0%";
+            if (timelineCurrentTime.current) timelineCurrentTime.current.textContent = "00:00";
+          }}
+          onLoadedMetadata={(event) => {
+            const actual = event.currentTarget.duration;
+            setMediaDuration(Number.isFinite(actual) && actual > 0 ? actual : null);
+          }}
           onTimeUpdate={(event) => {
+            if (timelinePlayhead.current) {
+              timelinePlayhead.current.style.left = `${Math.min(100, Math.max(0, (event.currentTarget.currentTime / (event.currentTarget.duration || duration)) * 100))}%`;
+            }
+            if (timelineCurrentTime.current) timelineCurrentTime.current.textContent = timecode(event.currentTarget.currentTime);
             const cue = cues.find(
               (item) =>
                 event.currentTarget.currentTime >= item.start &&
@@ -2580,37 +3543,38 @@ function App() {
           }}
         />
         <div className="timeline-wrap">
-          <div className="time-ruler">
-            <span>00:00</span>
-            <span>{timecode(duration / 2)}</span>
-            <span>{timecode(duration)}</span>
+          <div className="time-ruler" aria-label="视频时间刻度">
+            {previewSrc ? [0, 0.25, 0.5, 0.75, 1].map((position) => (
+              <span key={position} className={`ruler-tick ${position === 0 ? "first" : position === 1 ? "last" : ""}`} style={{ left: `${position * 100}%` }}>
+                {timecode(duration * position, duration < 40)}
+              </span>
+            )) : <span className="ruler-placeholder">等待视频素材</span>}
           </div>
-          <div className="timeline">
+          <div className={`timeline ${cuePositions.length ? "has-cues" : "is-empty"}`}>
+            <span className="timeline-track-name">字幕轨 <small>{cues.length ? `${cues.length} 段` : ""}</small></span>
+            {previewSrc && <span className="timeline-current"><span ref={timelineCurrentTime}>00:00</span> / {timecode(duration)}</span>}
+            {previewSrc && <div className="timeline-playhead" ref={timelinePlayhead} aria-hidden="true" />}
             {cuePositions.length ? (
               cuePositions.map(({ cue, left, width }) => (
                 <button
                   key={cue.id}
-                  className={
-                    activeCue === cue.id ? "cue-mark active" : "cue-mark"
-                  }
+                  className={["cue-mark", selectedCue === cue.id ? "selected" : "", activeCue === cue.id ? "current" : ""].join(" ")}
                   style={{ left, width }}
                   onClick={() => seek(cue)}
-                >
-                  {cue.id + 1}
-                </button>
+                  title={`${formatTime(cue.start)}–${formatTime(cue.end)}：${cue.translated || cue.source}`}
+                  aria-label={`跳转到第 ${cue.id + 1} 段字幕，${formatTime(cue.start)}`}
+                  aria-pressed={selectedCue === cue.id}
+                />
               ))
             ) : (
-              <span>转写完成后，真实字幕段会显示在此时间轴。</span>
+              <span className="timeline-empty">{previewSrc ? "字幕提取完成后，段落会显示在这条轨道上。" : "选择视频后，这里会显示真实字幕轨道。"}</span>
             )}
           </div>
         </div>
       </section>
-      <section className="workspace-card trim-card">
-        <header>
-          <p className="eyebrow">视频修改</p>
-          <h1>删除、保留、静音、导出与重排</h1>
-          <p>修改后字幕时间轴自动对齐并重新压制；修改基于当前任务，可连续操作。</p>
-        </header>
+      <details className="workspace-card trim-card">
+        <summary className="studio-drawer-summary"><span><b>剪辑工具</b><small>删除 / 保留 / 静音 / 导出 / 重排</small></span><span>展开</span></summary>
+        <p className="studio-drawer-note">修改后字幕时间轴自动对齐并重新压制；修改基于当前任务，可连续操作。</p>
         <div className="mod-op-row">
           {(
             [
@@ -2706,17 +3670,14 @@ function App() {
         <p className="trim-note">
           提示：修改会重写当前成片（可连续操作）；导出片段会另存新文件，不影响当前成片。修改前请先「保存」字幕。
         </p>
-      </section>
-      <section className="workspace-card subtitle-config">
-        <header>
+      </details>
+      <details className="workspace-card subtitle-config" open>
+        <summary className="studio-drawer-summary"><span><b>字幕样式</b><small>与处理页同步；改完后需重新渲染</small></span><span>展开</span></summary>
+        <header className="subtitle-config-header">
           <p className="eyebrow">字幕样式</p>
           <h1>排版与硬字幕成片</h1>
+          <p>字体、字号与颜色也可在「处理」页直接设置。</p>
         </header>
-        {mode === "basic" ? (
-          <p className="metadata-notice">
-            字幕样式当前使用推荐默认值（微软雅黑 24 号、中文单语、描边）。可在右上角切换到「高级模式」调整字体、字号与颜色。
-          </p>
-        ) : (
         <div className="settings-grid compact">
           <label>
             显示模式
@@ -2799,17 +3760,12 @@ function App() {
             </select>
           </label>
         </div>
-        )}
-      </section>
+      </details>
       <section className="subtitle-editor">
         <div className="subtitle-toolbar">
-          <div>
+          <div className="subtitle-toolbar-heading">
             <p className="eyebrow">字幕编辑</p>
-            <div className="column-labels">
-              <span>时间</span>
-              <span>原文</span>
-              <span>中文翻译</span>
-            </div>
+            <h2>字幕段落 <small>{cues.length} 段</small></h2>
           </div>
           <div className="editor-actions">
             {dirty && <span className="dirty">未保存修改</span>}
@@ -2819,6 +3775,20 @@ function App() {
             <button onClick={redo} disabled={!future.length || running}>
               重做
             </button>
+            <button onClick={save} disabled={!dirty || running || !job || cueOwner.current !== job.id || !cuesReady}>
+              保存字幕
+            </button>
+            <button
+              className="primary small"
+              onClick={rerender}
+              disabled={!job?.result || running || dirty || job?.edit_state === "legacy-ambiguous"}
+              title={job?.edit_state === "legacy-ambiguous" ? "旧任务的后期版本顺序无法确认；为保护现有成片，已禁用重新渲染" : "使用当前活动视频和字幕重新渲染"}
+            >
+              重新渲染
+            </button>
+          </div>
+          <div className="editor-timing-actions">
+            <span>时间校正</span>
             <input
               className="offset-input"
               value={offsetValue}
@@ -2838,33 +3808,32 @@ function App() {
             >
               自动对齐
             </button>
-            <button onClick={save} disabled={!dirty || running}>
-              保存
-            </button>
-            <button
-              className="primary small"
-              onClick={rerender}
-              disabled={!job?.result || running || dirty || job?.edit_state === "legacy-ambiguous"}
-              title={job?.edit_state === "legacy-ambiguous" ? "旧任务的后期版本顺序无法确认；为保护现有成片，已禁用重新渲染" : "使用当前活动视频和字幕重新渲染"}
-            >
-              重新渲染
-            </button>
+          </div>
+          <div className="column-labels">
+            <span>#</span>
+            <span>时间</span>
+            <span>原文</span>
+            <span>中文翻译</span>
+            <span />
           </div>
         </div>
         {cues.length ? (
           <div className="cue-table">
-            {cues.map((cue) => (
+            {cues.map((cue, index) => (
               <article
                 key={cue.id}
                 className={[
                   "cue-row",
-                  activeCue === cue.id ? "active" : "",
+                  activeCue === cue.id ? "current" : "",
+                  selectedCue === cue.id ? "selected" : "",
                   cue.deleted ? "deleted" : "",
                 ].join(" ")}
               >
+                <button className="cue-index" onClick={() => seek(cue)} title={`播放第 ${index + 1} 段字幕`}>{String(index + 1).padStart(2, "0")}</button>
                 <div className="cue-time-edit">
                   <input
                     value={formatTime(cue.start)}
+                    aria-label={`第 ${index + 1} 段开始时间`}
                     title="开始时间（分:秒，如 0:05.0）"
                     disabled={!job?.result || running || cue.deleted}
                     onChange={(event) => updateCueTime(cue.id, "start", event.target.value)}
@@ -2872,6 +3841,7 @@ function App() {
                   <span>–</span>
                   <input
                     value={formatTime(cue.end)}
+                    aria-label={`第 ${index + 1} 段结束时间`}
                     title="结束时间（分:秒，如 0:05.0）"
                     disabled={!job?.result || running || cue.deleted}
                     onChange={(event) => updateCueTime(cue.id, "end", event.target.value)}
@@ -2883,7 +3853,8 @@ function App() {
                 <p>{cue.source}</p>
                 <textarea
                   value={cue.translated}
-                  onFocus={() => setActiveCue(cue.id)}
+                  aria-label={`第 ${index + 1} 段中文翻译`}
+                  onFocus={() => { setActiveCue(cue.id); setSelectedCue(cue.id); }}
                   onChange={(event) => updateCue(cue.id, event.target.value)}
                   disabled={!job?.result || running || cue.deleted}
                 />
@@ -2909,173 +3880,205 @@ function App() {
       </section>
     </>
   );
+  const publishSelectedTask = outputs?.tasks.find((task) => task.files.some((file) => file.id === selectedPublishVideo));
+  const publishSelectedFile = publishSelectedTask?.files.find((file) => file.id === selectedPublishVideo);
+  const publishVideoName = selectedPublishVideo === "__native__"
+    ? nativePublishName
+    : publishSelectedFile && publishSelectedTask
+      ? formatPublishSourceLabel(publishSelectedTask, publishSelectedFile, outputTaskTitles)
+      : (job?.options.title || job?.material.name || job?.result?.rendered_video?.split(/[\\/]/).pop() || (publishVideoReady ? "当前任务成片" : "尚未选择成片"));
+  const currentTaskPublishLabel = truncateLabel(job?.options.title || job?.material.name || "当前任务成片", 40);
   const publishView = (
-    <section className="workspace-card">
+    <section className="workspace-card publish-view">
       <header>
         <p className="eyebrow">B 站发布辅助</p>
         <h1>准备文案，人工确认后投稿</h1>
         <p>工具只打开页面、选择视频并辅助填写；不会自动点击“立即投稿”。</p>
       </header>
-      <div className="form-grid three">
-        <label>
-          浏览器
-          <select
-            value={publishBrowser}
-            onChange={(event) => setPublishBrowser(event.target.value)}
-          >
-            <option value="chromium">Chromium</option>
-            <option value="msedge">Microsoft Edge</option>
-          </select>
+
+      <section className="publish-section">
+        <div className="publish-section-head"><b>01 · 选定成片</b><small>当前任务成片或任意本地视频</small></div>
+        <div className="publish-file-strip"><span className={publishVideoReady ? "ready" : ""}>▶</span><div><b title={publishVideoName}>{publishVideoName}</b><small>{publishVideoReady ? "成片已就绪 · 投稿前仍需人工预览" : "请先选择一份可投稿的成片"}</small></div></div>
+        <div className="form-grid publish-file-select">
+          <label>
+            成品来源
+            <select
+              value={selectedPublishVideo}
+              onChange={(event) => {
+                setSelectedPublishVideo(event.target.value);
+                setNativePublishToken("");
+                setNativePublishName("");
+                publishHydrateKey.current = "";
+              }}
+            >
+              <option value="">{publishVideoReady && !selectedPublishVideo && !nativePublishToken ? `当前任务 · ${currentTaskPublishLabel}` : "当前任务成片（如已完成）"}</option>
+              {nativePublishToken && <option value="__native__">本地选择 · {nativePublishName}</option>}
+              {outputs?.tasks.flatMap((task) =>
+                task.files
+                  .filter((file) => file.kind === "成品视频")
+                  .map((file) => (
+                    <option key={file.id} value={file.id} title={`${outputTaskDisplayTitle(task, outputTaskTitles)} · ${task.name} · ${file.name}`}>
+                      {formatPublishSourceLabel(task, file, outputTaskTitles)}
+                    </option>
+                  )),
+              )}
+            </select>
+          </label>
+        </div>
+        <div className="inline-actions publish-file-actions">
+          <button onClick={() => void chooseNativePublishVideo()}>选择本地成片</button>
+          <button onClick={() => setView("subtitle")} disabled={!job?.result || Boolean(selectedPublishVideo)}>在字幕页预览当前成片</button>
+        </div>
+      </section>
+
+      <section className="publish-section">
+        <div className="publish-section-head">
+          <b>02 · 投稿文案</b>
+          <small>标题、简介、标签会填入 B 站投稿页，仍需人工确认</small>
+        </div>
+        <label className="publish-template-select">文案模板
+          <select value={templateName} onChange={(event) => {
+            if (templateDraftDirty && !window.confirm("「模板内容」中有未保存的草稿修改。切换模板会丢失这些修改，确定继续吗？")) return;
+            setTemplateName(event.target.value);
+            setTemplateBody(templates.find((item) => item.name === event.target.value)?.body ?? "");
+          }}>{templates.map((item) => <option key={item.name}>{item.name}</option>)}</select>
         </label>
-        <label>
-          文案模板
-          <select
-            value={templateName}
-            onChange={(event) => {
-              if (
-                templateDraftDirty &&
-                !window.confirm(
-                  `「模板内容」中有未保存的草稿修改。切换模板会丢失这些修改，确定继续吗？`,
-                )
-              )
-                return;
-              setTemplateName(event.target.value);
-              setTemplateBody(
-                templates.find((item) => item.name === event.target.value)
-                  ?.body ?? "",
-              );
-            }}
-          >
-            {templates.map((item) => (
-              <option key={item.name}>{item.name}</option>
-            ))}
-          </select>
-        </label>
-        <label>
-          成品来源
-          <select
-            value={selectedPublishVideo}
-            onChange={(event) => { setSelectedPublishVideo(event.target.value); setNativePublishToken(""); setNativePublishName(""); }}
-          >
-            <option value="">当前任务成片（如已完成）</option>
-            {nativePublishToken && <option value="__native__">本地选择 · {nativePublishName}</option>}
-            {outputs?.tasks.flatMap((task) =>
-              task.files
-                .filter((file) => file.kind === "成品视频")
-                .map((file) => (
-                  <option key={file.id} value={file.id}>
-                    {file.name}
-                  </option>
-                )),
-            )}
-          </select>
-        </label>
-      </div>
-      <div className="inline-actions">
-        <button onClick={publishCheck}>登录检查</button>
-        <button onClick={() => void loadPublishStatus()}>检查 Profile</button>
-        <button onClick={() => void chooseNativePublishVideo()}>选择任意本地成片</button>
-        <button onClick={generateDescription}>更新文案</button>
-        <button onClick={() => openTemplateEditor()}>新建/编辑模板</button>
-        <button onClick={deleteTemplate}>删除自定义模板</button>
-      </div>
-      {profileMessage && <p className="publish-status" role="status">{profileMessage}</p>}
-      <div className="template-draft-bar">
-        {templateDraftDirty && (
-          <span className="dirty">
-            草稿未保存：点击「更新文案」会优先使用当前草稿内容生成简介。
-          </span>
-        )}
-        {templateDraftDirty && (
-          <button onClick={() => setTemplateBody(savedTemplateBody)}>恢复模板内容</button>
-        )}
-        <button onClick={() => openTemplateEditor()}>新建/保存为模板</button>
-      </div>
-      <label>
-        模板内容
-        <textarea
-          value={templateBody}
-          maxLength={5000}
-          onChange={(event) => setTemplateBody(event.target.value)}
-          placeholder="模板支持 {source} 与 {custom_text}"
-        />
-      </label>
-      <label>
-        简介
-        <textarea
-          value={description}
-          maxLength={5000}
-          onChange={(event) => { setDescription(event.target.value); setFieldErrors((current) => ({ ...current, description: "" })); }}
-          placeholder="生成后可继续人工修改"
-        />
-        {fieldErrors.description && <small className="field-error">{fieldErrors.description}</small>}
-      </label>
-      <div className="form-grid two">
-        <label>
-          标签（逗号分隔）
-          <input
-            value={tags}
-            onChange={(event) => { setTags(event.target.value); setFieldErrors((current) => ({ ...current, tags: "" })); }}
-          />
-          {fieldErrors.tags && <small className="field-error">{fieldErrors.tags}</small>}
-        </label>
-        <label>
-          追加备注
-          <input
-            value={extraLine}
-            onChange={(event) => setExtraLine(event.target.value)}
-          />
-        </label>
-      </div>
-      <div className="publish-warning">
-        <label className="check">
-          <input type="checkbox" checked={includeSourceLink} onChange={(event) => setIncludeSourceLink(event.target.checked)} />
-          简介自动附原视频链接
-        </label>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={closeAfterFill}
-            onChange={(event) => setCloseAfterFill(event.target.checked)}
-          />
-          填表完成后关闭自动化浏览器（上传可能中断）
-        </label>
-        <span>投稿前请检查分区、创作声明、封面、简介、标签与平台提示。</span>
-      </div>
-      {(publishSession.active || publishSession.status !== "idle") && (
-        <div className={`publish-session ${publishSession.status}`}>
-          <div className="publish-session-head">
-            <b>
-              {publishSession.status === "waiting_review"
-                ? "已到人工提交前"
-                : publishSession.status === "failed"
-                  ? "辅助失败"
-                  : publishSession.status === "finished"
-                    ? "辅助已结束"
-                    : "B 站投稿辅助进行中"}
-            </b>
-            <span>{publishSession.active ? "运行中" : "已停止"}</span>
+        <div className="inline-actions publish-copy-actions">
+            <button onClick={() => void loadPublishCopy({ force: true })} disabled={!publishVideoReady}>载入成片文案</button>
+            <button onClick={() => void loadPublishCopy({ generate: true, force: true })} disabled={!publishVideoReady}>重新生成标题标签</button>
+            <button onClick={() => void generateDescription()}>更新简介</button>
+        </div>
+        <details className="publish-template-tools">
+          <summary>模板编辑与管理 <span>展开 ›</span></summary>
+          <div className="inline-actions">
+            <button onClick={() => openTemplateEditor()}>新建/编辑模板</button>
+            <button onClick={deleteTemplate}>删除自定义模板</button>
           </div>
-          <p className="publish-session-message">{publishSession.message}</p>
-          {publishSession.error && <p className="error">{publishSession.error}</p>}
-          {publishSession.logs.length > 0 && (
-            <div className="publish-session-logs">
-              {publishSession.logs.slice(-6).map((line, index) => (
-                <p key={`${line}-${index}`}>{line}</p>
-              ))}
+          {templateDraftDirty && (
+            <div className="template-draft-bar">
+              <span className="dirty">草稿未保存：更新简介会优先使用当前模板草稿。</span>
+              <button onClick={() => setTemplateBody(savedTemplateBody)}>恢复模板内容</button>
+              <button onClick={() => openTemplateEditor()}>保存为模板</button>
             </div>
           )}
+          <div className="publish-fields">
+          <label>
+            模板内容
+            <textarea
+              className="publish-template-body"
+              value={templateBody}
+              maxLength={5000}
+              onChange={(event) => setTemplateBody(event.target.value)}
+              placeholder="模板支持 {source} 与 {custom_text}"
+            />
+          </label>
+          </div>
+        </details>
+        <div className="publish-fields">
+          <label>
+            标题
+            <input
+              value={options.title}
+              maxLength={200}
+              onChange={(event) => updateOptions("title", event.target.value)}
+              placeholder="优先使用翻译阶段生成的中文标题"
+            />
+            {fieldErrors.title && <small className="field-error">{fieldErrors.title}</small>}
+          </label>
+          <label>
+            简介
+            <textarea
+              className="publish-description-body"
+              value={description}
+              maxLength={5000}
+              onChange={(event) => { setDescription(event.target.value); setFieldErrors((current) => ({ ...current, description: "" })); }}
+              placeholder="生成后可继续人工修改"
+            />
+            {fieldErrors.description && <small className="field-error">{fieldErrors.description}</small>}
+          </label>
+          <div className="publish-meta-grid">
+            <label>
+              标签（逗号分隔）
+              <input
+                value={tags}
+                onChange={(event) => { setTags(event.target.value); setFieldErrors((current) => ({ ...current, tags: "" })); }}
+              />
+              {fieldErrors.tags && <small className="field-error">{fieldErrors.tags}</small>}
+            </label>
+            <label>
+              追加备注
+              <input
+                value={extraLine}
+                onChange={(event) => setExtraLine(event.target.value)}
+              />
+            </label>
+          </div>
         </div>
-      )}
+      </section>
+
+      <section className="publish-section">
+        <div className="publish-section-head"><b>03 · 连接 B 站并填表</b><small>自动化在人工提交前停止</small></div>
+        <div className="publish-browser-row">
+          <label>投稿浏览器<select value={publishBrowser} onChange={(event) => setPublishBrowser(event.target.value)}><option value="chromium">Chromium</option><option value="msedge">Microsoft Edge</option></select></label>
+          <div className="inline-actions"><button onClick={publishCheck}>登录检查</button><button onClick={() => void loadPublishStatus()}>检查 Profile</button></div>
+        </div>
+        {profileMessage && <p className="publish-status" role="status">{profileMessage}</p>}
+        <div className="publish-warning">
+          <div className="publish-warning-checks">
+            <label className="check">
+              <input type="checkbox" checked={includeSourceLink} onChange={(event) => setIncludeSourceLink(event.target.checked)} />
+              简介自动附原视频链接
+            </label>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={closeAfterFill}
+                onChange={(event) => setCloseAfterFill(event.target.checked)}
+              />
+              填表完成后关闭自动化浏览器（上传可能中断）
+            </label>
+          </div>
+          <span>投稿前请检查分区、创作声明、封面、简介、标签与平台提示。</span>
+        </div>
+        {(publishSession.active || publishSession.status !== "idle") && (
+          <div className={`publish-session ${publishSession.status}`}>
+            <div className="publish-session-head">
+              <b>
+                {publishSession.status === "waiting_review"
+                  ? "已到人工提交前"
+                  : publishSession.status === "failed"
+                    ? "辅助失败"
+                    : publishSession.status === "finished"
+                      ? "辅助已结束"
+                      : "B 站投稿辅助进行中"}
+              </b>
+              <span>{publishSession.active ? "运行中" : "已停止"}</span>
+            </div>
+            {publishSession.error ? (
+              <p className="error">{publishSession.error}</p>
+            ) : (
+              <p className="publish-session-message">{publishSession.message}</p>
+            )}
+            {publishSession.logs.length > 0 && (
+              <div className="publish-session-logs">
+                {publishSession.logs.slice(-12).map((line, index) => (
+                  <p key={`${line}-${index}`}>{line}</p>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+
       <footer className="card-footer">
         <div className="publish-submit-hint">
           {!publishVideoReady && <span>请先选择一份可投稿的成片。</span>}
         </div>
-        <button className="primary" onClick={publishAssist} disabled={!publishVideoReady} title={!publishVideoReady ? "请先选择成片" : "打开 B 站投稿辅助"}>
-          打开投稿辅助
-        </button>
         <button className="danger" onClick={closePublishBrowser}>
           关闭后台 B 站浏览器
+        </button>
+        <button className="primary" onClick={publishAssist} disabled={!publishVideoReady} title={!publishVideoReady ? "请先选择成片" : "打开 B 站投稿辅助"}>
+          打开 B 站投稿页面并填充 →
         </button>
       </footer>
       {templateEditorOpen && <div className="modal-backdrop" role="presentation">
@@ -3095,11 +4098,20 @@ function App() {
       <header className="library-header">
         <div>
           <p className="eyebrow">视频任务库</p>
-          <h1>所有视频都在这里</h1>
+          <h1>任务库</h1>
           <p>汇总待处理、处理中、可继续和已完成任务。同一时间只运行一个耗资源阶段。</p>
         </div>
         <div className="library-header-actions">
           <button onClick={() => void Promise.all([loadJobHistory(), loadRestorableJobs()])}>刷新</button>
+          <button
+            className={libraryBatchMode ? "danger" : ""}
+            onClick={() => {
+              setLibraryBatchMode((current) => !current);
+              setSelectedOutputTaskIds([]);
+            }}
+          >
+            {libraryBatchMode ? "退出批量" : "批量管理"}
+          </button>
           <button className="primary" onClick={() => setView("material")}>添加视频</button>
         </div>
       </header>
@@ -3117,7 +4129,7 @@ function App() {
           <b>{libraryCounts.completed}</b><span>已完成</span>
         </button>
       </div>
-      <div className="library-tools">
+      <div className={`library-tools ${libraryBatchMode ? "batch-mode" : ""}`}>
         <label>
           搜索任务
           <input value={libraryQuery} onChange={(event) => setLibraryQuery(event.target.value)} placeholder="输入视频标题、阶段或错误信息" />
@@ -3130,24 +4142,75 @@ function App() {
           </select>
         </label>
         <small>{historyTotal > 200 ? `共 ${historyTotal} 条，当前显示最近 200 条` : `共 ${historyTotal} 条任务记录`}</small>
+        {libraryBatchMode ? (
+          <>
+            <label className="library-select-all">
+              <input
+                type="checkbox"
+                checked={allVisibleLibraryTasksSelected}
+                disabled={!visibleLibraryTaskIds.length}
+                onChange={(event) => {
+                  if (!event.target.checked) {
+                    setSelectedOutputTaskIds([]);
+                    return;
+                  }
+                  if (visibleLibraryTaskIds.length > 200) setMessage("批量删除每次最多选择 200 个任务，已选择当前页前 200 个。 ");
+                  setSelectedOutputTaskIds(visibleLibraryTaskIds.slice(0, 200));
+                }}
+              />
+              已选 {selectedOutputTaskIds.length} / 200 项
+            </label>
+            <button
+              className="history-clear"
+              disabled={deleteBusy}
+              onClick={() => void deleteSelectedHistoryTasks("record_only")}
+              title="只删任务库记录，保留磁盘文件"
+            >
+              仅删记录
+            </button>
+            <button
+              className="danger"
+              disabled={deleteBusy}
+              onClick={() => void deleteSelectedHistoryTasks("record_and_outputs")}
+              title="删除任务库记录及其输出目录"
+            >
+              删除记录和文件
+            </button>
+            {historyDeleteError && <small className="library-batch-error" role="alert">{historyDeleteError}</small>}
+          </>
+        ) : (
+          <small className="library-batch-hint">需要清理时再点右上角「批量管理」</small>
+        )}
       </div>
       <div className="video-library-list" aria-live="polite">
         {libraryJobs.length ? libraryJobs.map((item) => {
           const resumable = restorableJobs.some((candidate) => candidate.id === item.id);
           const category = videoLibraryCategory(item, resumable);
           const isCurrent = job?.id === item.id;
+          const missingOutput = item.output_exists === false;
           const statusText = category === "active"
             ? item.status === "cancelling" ? "正在取消" : "处理中"
             : category === "completed"
               ? "已完成"
+              : missingOutput && !resumable ? "输出已删除"
               : resumable ? "可继续" : item.status === "failed" ? "失败" : item.status === "cancelled" ? "已取消" : "待处理";
           return (
-            <article className={`video-library-row ${category}`} key={item.id}>
-              <div className="video-library-icon" aria-hidden="true">▶</div>
+            <article className={`video-library-row ${category}${missingOutput ? " missing-output" : ""}`} key={item.id}>
+              {libraryBatchMode && (
+                <label className="library-select" title={category === "active" ? "运行中的任务不可删除" : "选择任务进行批量删除"}>
+                  <input
+                    type="checkbox"
+                    checked={selectedOutputTaskIds.includes(item.id)}
+                    disabled={category === "active" || (!selectedOutputTaskIds.includes(item.id) && selectedOutputTaskIds.length >= 200)}
+                    onChange={(event) => setSelectedOutputTaskIds((current) => event.target.checked ? [...current, item.id] : current.filter((id) => id !== item.id))}
+                  />
+                </label>
+              )}
               <div className="video-library-main">
                 <div className="video-library-title">
                   <b title={item.title}>{item.title}</b>
                   {isCurrent && <span className="current-task">当前任务</span>}
+                  {missingOutput && <span className="missing-output-tag">无输出目录</span>}
                 </div>
                 <div className="video-library-meta">
                   <span className={`library-status ${category}`}>{statusText}</span>
@@ -3157,14 +4220,31 @@ function App() {
                 {(category === "active" || (item.progress > 0 && item.progress < 100)) && (
                   <div className="library-progress" aria-label={`处理进度 ${item.progress}%`}><i style={{ width: `${item.progress}%` }} /></div>
                 )}
-                {item.error && <small className="library-error" title={item.error}>{item.error}</small>}
+                {item.error && <TaskErrorSummary message={item.error} />}
               </div>
               <div className="video-library-actions">
-                <button className={resumable || category === "active" ? "primary small" : ""} onClick={() => isCurrent && running ? setView("process") : void loadRestoredJob(item.id)}>
-                  {isCurrent && running ? "查看进度" : resumable ? "继续处理" : category === "completed" ? "打开任务" : "检查任务"}
-                </button>
-                <button onClick={() => void openHistoryPath(item.rendered_video || "")} disabled={!item.rendered_exists} title={item.rendered_exists ? "打开最终成片" : "尚未生成成片"}>成片</button>
-                <button onClick={() => void openHistoryPath(item.output_dir || "")} disabled={!item.output_exists} title={item.output_exists ? "打开该任务的输出目录" : "输出目录不存在"}>文件</button>
+                {resumable || category === "active" || !missingOutput ? (
+                  <button className="library-open" onClick={() => isCurrent && running ? setView("process") : void loadRestoredJob(item.id)}>
+                    {isCurrent && running ? "查看进度" : resumable ? "继续处理" : category === "completed" ? "打开任务" : "检查任务"}
+                  </button>
+                ) : (
+                  <button
+                    className="history-clear small"
+                    onClick={() => {
+                      setLibraryBatchMode(true);
+                      setSelectedOutputTaskIds([item.id]);
+                    }}
+                  >
+                    清理记录
+                  </button>
+                )}
+                <details className="library-row-more">
+                  <summary aria-label={`更多操作：${item.title}`} title="更多操作">⋯</summary>
+                  <div>
+                    <button onClick={() => void openHistoryPath(item.rendered_video || "")} disabled={!item.rendered_exists} title={item.rendered_exists ? "打开最终成片" : "尚未生成成片"}>打开成片</button>
+                    <button onClick={() => void openHistoryPath(item.output_dir || "")} disabled={!item.output_exists} title={item.output_exists ? "打开该任务的输出目录" : "输出目录不存在"}>打开文件夹</button>
+                  </div>
+                </details>
               </div>
             </article>
           );
@@ -3175,10 +4255,21 @@ function App() {
             {!libraryQuery && libraryFilter === "all" && <button className="primary" onClick={() => setView("material")}>添加第一个视频</button>}
           </div>
         )}
+        {historyHasMore && (
+          <button className="history-load-more" onClick={() => void loadJobHistory(true)} disabled={historyLoadingMore}>
+            {historyLoadingMore ? "正在加载…" : "加载更早任务"}
+          </button>
+        )}
       </div>
     </section>
   );
   const viewedTask = outputs?.tasks.find((task) => task.id === viewedTaskId) ?? null;
+  const viewOutputTask = (taskId: string) => {
+    setViewedTaskId(taskId);
+    setSelectedOutputPaths((current) => current.filter((id) => outputs?.tasks.some((row) => row.id === id) || id.startsWith(`${taskId}/`)));
+  };
+  const storageKinds = ["下载/原视频", "成品视频", "字幕", "中间文件", "预览图", "其他"];
+  const storageTotalBytes = storageKinds.reduce((sum, kind) => sum + (outputs?.category_totals[kind]?.bytes ?? 0), 0);
   const filesView = (
     <section className="workspace-card files-view">
       <header>
@@ -3196,15 +4287,14 @@ function App() {
           <div className="output-dir-control">
             <input
               value={options.output_dir}
-              onChange={(event) =>
-                updateOptions("output_dir", event.target.value)
-              }
+              onChange={(event) => { updateOptions("output_dir", event.target.value); setOutputs(null); setSelectedOutputPaths([]); setViewedTaskId(null); }}
             />
             <button onClick={() => void chooseOutputDir()}>选择文件夹</button>
           </div>
         </label>
         <button onClick={loadOutputs}>刷新</button>
         <button onClick={openOutput}>打开目录</button>
+        <small>已选 {selectedOutputPaths.length} 项</small>
         <button
           className="danger"
           disabled={!selectedOutputPaths.length}
@@ -3213,8 +4303,12 @@ function App() {
           删除选中项
         </button>
       </div>
+      <div className="storage-total"><strong>{outputs?.total_size ?? "—"}</strong><span>当前输出目录占用</span><small>{outputs?.task_count ?? 0} 个任务</small></div>
       <div className="storage-summary">
-        {["下载/原视频", "成品视频", "字幕", "中间文件", "预览图", "其他"].map((kind) => <span key={kind}><b>{outputs?.category_totals[kind]?.label ?? "0 B"}</b>{kind}</span>)}
+        {storageKinds.map((kind) => <span key={kind}><b>{outputs?.category_totals[kind]?.label ?? "0 B"}</b>{kind}</span>)}
+      </div>
+      <div className="storage-rail" role="img" aria-label="输出目录空间分类占比">
+        {storageKinds.map((kind, index) => <i key={kind} className={`storage-segment segment-${index}`} style={{ width: `${storageTotalBytes ? ((outputs?.category_totals[kind]?.bytes ?? 0) / storageTotalBytes) * 100 : 0}%` }} title={`${kind}：${outputs?.category_totals[kind]?.label ?? "0 B"}`} />)}
       </div>
       <section className="history-section">
         <header>
@@ -3254,6 +4348,11 @@ function App() {
                 </button>
               </article>
             ))}
+            {historyHasMore && (
+              <button className="history-load-more" onClick={() => void loadJobHistory(true)} disabled={historyLoadingMore}>
+                {historyLoadingMore ? "正在加载…" : "加载更早任务"}
+              </button>
+            )}
           </div>
         )}
       </section>
@@ -3262,13 +4361,13 @@ function App() {
       </p>
       <div className="file-manager">
         <section className="task-pane">
-          <header><b>1. 任务列表</b><small>点「查看」显示该任务文件</small></header>
+          <header><b>1. 任务列表</b><small>点「查看」显示该任务文件</small><button onClick={() => { const ids = (outputs?.tasks ?? []).slice(0, 200).map((task) => task.id); setSelectedOutputPaths(ids); if ((outputs?.tasks.length ?? 0) > 200) setMessage("本次已选前 200 个任务；其余任务可下一批处理。"); }} disabled={!outputs?.tasks.length}>选择当前任务{(outputs?.tasks.length ?? 0) > 200 ? "（前 200）" : ""}</button><button onClick={() => setSelectedOutputPaths([])} disabled={!selectedOutputPaths.length}>清空选择</button></header>
           {outputs?.tasks.length ? outputs.tasks.map((task) => (
             <article key={task.id} className={viewedTaskId === task.id ? "task-row selected" : "task-row"}>
-              <label className="delete-check" title="勾选后点上方“删除选中项”"><input type="checkbox" checked={selectedOutputPaths.includes(task.id)} onChange={(event) => setSelectedOutputPaths((values) => event.target.checked ? [...values, task.id] : values.filter((value) => value !== task.id))} /><small>删除</small></label>
-              <div><b>{task.name}</b><small>{task.files.length} 个文件 · {new Date(task.modified_at * 1000).toLocaleString()}</small></div>
+              <label className="delete-check" title="勾选后点上方“删除选中项”"><input type="checkbox" checked={selectedOutputPaths.includes(task.id)} disabled={selectedOutputPaths.length >= 200 && !selectedOutputPaths.includes(task.id)} onChange={(event) => setSelectedOutputPaths((values) => event.target.checked ? [...values.filter((id) => !id.startsWith(`${task.id}/`)), task.id] : values.filter((value) => value !== task.id))} /><small>删除</small></label>
+              <button className="task-row-main" onClick={() => viewOutputTask(task.id)} aria-pressed={viewedTaskId === task.id} title="查看该任务的文件"><b title={outputTaskDisplayTitle(task, outputTaskTitles)}>{truncateLabel(outputTaskDisplayTitle(task, outputTaskTitles), 48)}</b><small>{task.name} · {task.files.length} 个文件 · {new Date(task.modified_at * 1000).toLocaleString()}</small></button>
               <span>{task.size_label}</span>
-              <button className="view-button" onClick={() => setViewedTaskId(task.id)}>查看</button>
+              <button className="view-button" onClick={() => viewOutputTask(task.id)}>查看</button>
               <button onClick={(event) => { event.stopPropagation(); void openOutputPath(task.id); }}>打开</button>
             </article>
           )) : <div className="empty-editor"><b>还没有输出任务</b><span>完成一次处理后，文件会显示在这里。</span></div>}
@@ -3277,7 +4376,7 @@ function App() {
           <header><b>2. 文件列表</b><small>{viewedTask ? viewedTask.name : "尚未选择任务"}</small></header>
           {viewedTask ? viewedTask.files.map((file) => (
             <article key={file.id} className="file-row">
-              <label className="delete-check" title="勾选后点上方“删除选中项”"><input type="checkbox" checked={selectedOutputPaths.includes(file.id)} onChange={(event) => setSelectedOutputPaths((values) => event.target.checked ? [...values, file.id] : values.filter((value) => value !== file.id))} /><small>删除</small></label>
+              <label className="delete-check" title={selectedOutputPaths.includes(viewedTask.id) ? "已选择整个任务，无需重复选择内部文件" : "勾选后点上方“删除选中项”"}><input type="checkbox" disabled={selectedOutputPaths.includes(viewedTask.id) || (selectedOutputPaths.length >= 200 && !selectedOutputPaths.includes(file.id))} checked={selectedOutputPaths.includes(file.id) || selectedOutputPaths.includes(viewedTask.id)} onChange={(event) => setSelectedOutputPaths((values) => event.target.checked ? [...values, file.id] : values.filter((value) => value !== file.id))} /><small>删除</small></label>
               <span>{file.kind}</span>
               <b>{file.name}</b>
               <small>{file.size_label}</small>
@@ -3302,7 +4401,8 @@ function App() {
         </a>
         <div className="project-name">
           <strong>{job?.material.name ?? selected?.name ?? "等待素材"}</strong>
-          <span>
+          <span className={running ? "project-activity" : undefined}>
+            {running && <ActivityBars />}
             {running
               ? `${job?.stage} ${job?.progress}% · ${formatElapsed(job?.started_at ? (now - job.started_at * 1000) / 1000 : 0)}`
               : selected?.duration_seconds
@@ -3317,26 +4417,20 @@ function App() {
           <button className="text-button" onClick={() => setSettingsOpen(true)}>
             设置
           </button>
-          <button className="text-button" onClick={() => setDependenciesOpen(true)}>
-            依赖
-          </button>
-          <button className="text-button" onClick={() => setShortcutHelpOpen(true)}>
-            帮助
-          </button>
           <button className="text-button" onClick={() => setInspectorOpen((value) => !value)}>
             检查器
           </button>
-          <button
-            className="text-button"
-            onClick={toggleMode}
-            title="切换基础/高级模式：高级模式显示全部处理参数"
-          >
-            {mode === "basic" ? "切到高级模式" : "切到基础模式"}
-          </button>
+          <details className="top-more">
+            <summary>更多</summary>
+            <div className="top-more-menu">
+              <button onClick={() => setDependenciesOpen(true)}>依赖中心</button>
+              <button onClick={() => setShortcutHelpOpen(true)}>使用帮助</button>
+            </div>
+          </details>
           <button
             className="primary"
             onClick={topAction}
-            disabled={preparingJob || (running ? !job : !job && !selected && !sourceUrl.trim())}
+            disabled={preparingJob || (running ? !job : !job && !materialSourceReady)}
           >
             {topActionLabel}
           </button>
@@ -3345,8 +4439,8 @@ function App() {
       {restorableJobs.length > 0 && !running && (
         <section className="restore-banner" aria-live="polite">
           <div>
-            <b>发现 {restorableJobs.length} 个可继续任务</b>
-            <span>载入只会检查该任务的产物，不会自动开始下载、转写或渲染。</span>
+            <b>↻ {restorableJobs.length} 个任务可继续</b>
+            <span>选择任务恢复上次进度；载入不会自动开始处理。</span>
           </div>
           <select aria-label="选择可继续任务" defaultValue="" onChange={(event) => { if (event.target.value) void loadRestoredJob(event.target.value); event.currentTarget.value = ""; }}>
             <option value="" disabled>选择并载入…</option>
@@ -3399,7 +4493,7 @@ function App() {
             <b>{authorized ? "已确认" : "待确认"}</b>
           </div>
         </nav>
-        <section className="main-workspace">
+        <section className={`main-workspace workspace-${view}`}>
           {view === "material" && materialView}
           {view === "library" && libraryView}
           {view === "process" && processView}
@@ -3425,8 +4519,9 @@ function App() {
               <>
                 <div className="progress-area">
                   <b>{job.progress}%</b>
+                  {running && <ActivityBars />}
                   <small>{formatElapsed(job.finished_at && job.started_at ? job.finished_at - job.started_at : job.started_at ? (now - job.started_at * 1000) / 1000 : job.elapsed_seconds)}</small>
-                  <div className="progress">
+                  <div className={`progress ${running ? "is-active" : ""}`}>
                     <i style={{ width: `${job.progress}%` }} />
                   </div>
                 </div>
@@ -3476,8 +4571,22 @@ function App() {
                     <dd>{job.options.download_quality}</dd>
                   </div>
                   <div>
+                    <dt>CC 限制</dt>
+                    <dd>{job.options.require_reuse_allowed ? "仅 reuse allowed" : "未启用"}</dd>
+                  </div>
+                  <div>
                     <dt>字幕渲染</dt>
                     <dd>{job.options.render_encoder}</dd>
+                  </div>
+                  <div>
+                    <dt>字幕排版</dt>
+                    <dd>
+                      {job.options.subtitle_display_mode === "bilingual-source-first"
+                        ? "原文在上 + 中文在下"
+                        : job.options.subtitle_display_mode === "bilingual-translation-first"
+                          ? "中文在上 + 原文在下"
+                          : "中文单语"}
+                    </dd>
                   </div>
                 </dl>
                 <section className="compact-log">
@@ -3489,13 +4598,36 @@ function App() {
                       <p key={`${line}-${index}`}>{line}</p>
                     ))}
                 </section>
-                {job.error && (
+                {(job.error || job.recovery) && (
                   <div className="error-block">
-                    <p className="error">{job.error}</p>
-                    {job.suggested_action && <p className="error-suggestion">建议：{job.suggested_action}</p>}
+                    {job.error && <TaskErrorSummary message={job.error} />}
+                    {job.error && job.suggested_action && <p className="error-suggestion">建议：{job.suggested_action}</p>}
+                    {job.recovery && (
+                      <section className="stage-recovery" aria-label="可选恢复操作">
+                        <b>可选恢复操作</b>
+                        <p>{job.recovery.impact}</p>
+                        {job.recovery.id === "retry_extract_with_lower_resource" && (
+                          <div className="recovery-buttons">
+                            <button className="primary small" disabled={running || preparingJob} onClick={() => void runRecoveryAction(job.recovery!, { device: "cpu", compute_type: "int8" })}>
+                              确认改用 CPU / int8 重试转写
+                            </button>
+                            {smallerInstalledWhisperModels.map((model) => (
+                              <button className="small" key={model} disabled={running || preparingJob} onClick={() => void runRecoveryAction(job.recovery!, { options: { whisper_model_size: model } })}>
+                                改用已安装的 {model} 模型
+                              </button>
+                            ))}
+                            {!smallerInstalledWhisperModels.length && (
+                              <button className="small" disabled={running || preparingJob} onClick={() => setDependenciesOpen(true)}>
+                                查看或安装较小模型
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </section>
+                    )}
                     <div className="error-actions">
-                      <CopyButton text={job.error} label="复制错误" />
-                      {cookieHintMatches(job.error) && (
+                      {job.error && <CopyButton text={job.error} label="复制错误" />}
+                      {job.error && cookieHintMatches(job.error) && (
                         <button className="cookie-hint-button" onClick={() => setSettingsOpen(true)}>
                           去设置 → YouTube 访问设置
                         </button>
@@ -3520,17 +4652,18 @@ function App() {
           <p>密钥只会写入本机 `.env`，不会通过接口重新读取或显示。</p>
           <label>
             当前翻译器
-            <select
-              value={options.translator}
-              onChange={(event) =>
-                updateOptions("translator", event.target.value)
-              }
-            >
+          <select
+            value={options.translator}
+            onChange={(event) => changeTranslator(event.target.value)}
+          >
               <option value="deepseek">DeepSeek</option>
               <option value="openai">OpenAI</option>
+              <option value="ollama">Ollama 本地模型</option>
             </select>
           </label>
-          <label>
+          {options.translator === "ollama" ? (
+            <p className="drawer-note">Ollama 不需要 API Key。模型状态会在依赖中心动态检测。</p>
+          ) : <label>
             API Key
             <input
               type="password"
@@ -3538,7 +4671,7 @@ function App() {
               placeholder="仅在需要更新时填写"
               onChange={(event) => setApiKey(event.target.value)}
             />
-          </label>
+          </label>}
           <label>
             YouTube Cookies 来源
             <select
@@ -3621,6 +4754,44 @@ function App() {
           </button>
         </div>
       )}
+      {pendingDelete && (
+        <div className="modal-backdrop" role="presentation">
+          <section className="template-modal delete-preview-modal" role="dialog" aria-modal="true" aria-label="确认删除目标">
+            <header>
+              <div><p className="eyebrow">删除确认</p><h2>{deleteResults ? "删除结果" : "核对将要删除的内容"}</h2></div>
+              <button onClick={() => { setPendingDelete(null); setDeleteResults(null); }} disabled={deleteBusy} aria-label="关闭">×</button>
+            </header>
+            <p className="delete-preview-summary">
+              {pendingDelete.source === "history"
+                ? pendingDelete.mode === "record_only"
+                  ? `仅删除 ${pendingDelete.plan.task_count} 条任务库记录；磁盘文件保留。`
+                  : `已验证 ${pendingDelete.plan.verified_files_count ?? 0} 条输出可删除（${pendingDelete.plan.file_count} 个文件，${formatBytes(pendingDelete.plan.bytes)}）；${pendingDelete.plan.record_only_required_count ?? 0} 条仅删除记录，磁盘文件保留。`
+                : `删除 ${pendingDelete.plan.target_count} 个目标、${pendingDelete.plan.file_count} 个文件，预计 ${formatBytes(pendingDelete.plan.bytes)}；已登记的整任务会同步移除记录。`}
+            </p>
+            <div className="delete-preview-list">
+              {(pendingDelete.source === "history" ? pendingDelete.plan.tasks : pendingDelete.plan.targets).map((item) => {
+                const id = item.id;
+                const result = deleteResults?.find((entry) => entry.id === id);
+                const name = pendingDelete.source === "history" ? pendingDelete.plan.tasks.find((row) => row.id === id)?.title : pendingDelete.plan.targets.find((row) => row.id === id)?.name;
+                const target = pendingDelete.source === "history"
+                  ? pendingDelete.mode === "record_and_outputs" ? pendingDelete.plan.tasks.find((row) => row.id === id)?.output_dir : `任务记录：${id}`
+                  : `${pendingDelete.plan.root.replace(/[\\/]$/, "")}\\${id.replace(/\//g, "\\")}`;
+                return <div key={id} className="delete-preview-row">
+                  <b>{name}</b><small>{target}</small>
+                  <span>{result ? result.status === "deleted" ? "已删除" : result.status === "partial" ? "部分完成，请核对磁盘" : "未删除" : ("disposition" in item && item.disposition === "record_only_required") ? "仅删除记录 · 磁盘文件保留" : `${"files" in item ? item.files.length : item.file_count} 个文件 · ${formatBytes(item.bytes)}`}</span>
+                  {pendingDelete.source === "history" && pendingDelete.mode === "record_and_outputs" && (item as HistoryDeletePlan["tasks"][number]).reason && <em>{(item as HistoryDeletePlan["tasks"][number]).reason}</em>}
+                  {result?.error && <em>{result.error}</em>}
+                </div>;
+              })}
+            </div>
+            {!deleteResults && <p className="delete-preview-warning">请核对目标。确认后无法撤销；若预览期间文件发生变化，操作会被拒绝。</p>}
+            <footer>
+              <button onClick={() => { setPendingDelete(null); setDeleteResults(null); }} disabled={deleteBusy}>{deleteResults ? "关闭" : "取消"}</button>
+              {!deleteResults && <button className="danger" onClick={() => void confirmPendingDelete()} disabled={deleteBusy}>{deleteBusy ? "正在删除…" : "确认删除"}</button>}
+            </footer>
+          </section>
+        </div>
+      )}
       {testHistoryOpen && (
         <div className="modal-backdrop" role="presentation">
           <section className="template-modal test-history-modal" role="dialog" aria-modal="true" aria-label="测试历史清理">
@@ -3651,7 +4822,7 @@ function App() {
               <div><p className="eyebrow">首次使用</p><h2>依赖中心</h2></div>
               <button onClick={() => setDependenciesOpen(false)} aria-label="关闭依赖中心">×</button>
             </header>
-            <p className="dependency-intro">默认流程只强制需要 FFmpeg。模型、OCR 与投稿浏览器按你实际使用的功能安装；已经安装的组件不会重复下载。</p>
+            <p className="dependency-intro">默认流程只强制需要 FFmpeg。模型、OCR 与投稿浏览器按你实际使用的功能安装；状态会在应用运行期间自动刷新，安装完成后无需重启即可使用。</p>
             <div className="dependency-list">
               {dependencies.map((dependency) => {
                 const active = dependencyJob?.dependency_id === dependency.id && ["queued", "running", "cancelling"].includes(dependencyJob.status);
@@ -3670,11 +4841,11 @@ function App() {
                     <div className="dependency-actions">
                       {dependency.available ? <span>可用</span> : dependency.installable ? (
                         <button className="primary small" disabled={Boolean(dependencyJob && ["queued", "running", "cancelling"].includes(dependencyJob.status))} onClick={() => void installDependency(dependency)}>
-                          {active ? dependencyJob?.status === "cancelling" ? "取消中" : "安装中" : dependencyJob?.dependency_id === dependency.id && ["failed", "cancelled"].includes(dependencyJob.status) ? "重试" : "安装"}
+                          {active ? dependencyJob?.status === "cancelling" ? "取消中" : dependency.action_label === "下载模型" ? "下载中" : "安装中" : dependencyJob?.dependency_id === dependency.id && ["failed", "cancelled"].includes(dependencyJob.status) ? "重试" : dependency.action_label ?? "安装"}
                         </button>
                       ) : dependency.action_url ? (
-                        <a href={dependency.action_url} target="_blank" rel="noreferrer">安装说明</a>
-                      ) : <span>需手动安装</span>}
+                        <a href={dependency.action_url} target="_blank" rel="noreferrer">{dependency.action_label ?? "安装说明"}</a>
+                      ) : <span>{dependency.state === "stopped" ? "请启动 Ollama" : dependency.state === "unavailable" ? "请重新检测" : dependency.depends_on ? "等待运行环境" : "需手动安装"}</span>}
                     </div>
                   </article>
                 );
@@ -3691,7 +4862,7 @@ function App() {
             )}
             <footer>
               <span className="dependency-note">组件安装到当前 Windows 用户环境，不会写入项目仓库。</span>
-              <button onClick={() => void loadDependencies()}>重新检测</button>
+              <button onClick={() => void loadDependencies(true)}>重新检测</button>
               <button className="primary" onClick={() => setDependenciesOpen(false)}>完成</button>
             </footer>
           </section>

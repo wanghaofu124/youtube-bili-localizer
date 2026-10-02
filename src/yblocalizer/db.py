@@ -105,7 +105,7 @@ def recover_interrupted_jobs(now: float) -> int:
         connection = _connect()
         try:
             rows = connection.execute(
-                "SELECT id, owner_pid FROM jobs WHERE status IN ('queued', 'running', 'cancelling') AND owner_pid IS NOT NULL"
+                "SELECT id, owner_pid FROM jobs WHERE status IN ('queued', 'running', 'preparing', 'cancelling') AND owner_pid IS NOT NULL"
             ).fetchall()
             abandoned = [job_id for job_id, pid in rows if int(pid) != os.getpid() and not _process_is_alive(int(pid))]
             if not abandoned:

@@ -19,6 +19,9 @@ os.environ.setdefault("YBLOCALIZER_DATA_DIR", str(_USER_DATA_ROOT))
 if __name__ == "__main__" and len(sys.argv) >= 2 and sys.argv[1] == "--whisper-worker":
     from yblocalizer.whisper_worker import main as whisper_worker_main
     raise SystemExit(whisper_worker_main(sys.argv[2:]))
+if __name__ == "__main__" and len(sys.argv) >= 2 and sys.argv[1] == "--ollama-worker":
+    from yblocalizer.ollama_worker import main as ollama_worker_main
+    raise SystemExit(ollama_worker_main())
 
 import webview
 
@@ -104,10 +107,7 @@ class DesktopBridge:
         )
         if not selected:
             return None
-        try:
-            material = self._server.RequestHandlerClass.jobs.add_local_file(Path(selected[0]), authorized=True)
-        except Exception:
-            return None
+        material = self._server.RequestHandlerClass.jobs.add_local_file(Path(selected[0]), authorized=True)
         return {"material_id": material.id, "name": material.name}
 
     def choose_output_dir(self) -> dict[str, str] | None:

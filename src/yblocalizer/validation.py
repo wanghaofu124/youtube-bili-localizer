@@ -17,7 +17,7 @@ def validate_target_language(segments: list[Segment], target_lang: str, provider
     if provider.lower() == "none":
         raise RuntimeError(
             "translator=none is only for debugging. It cannot produce Chinese subtitles. "
-            "Choose openai or deepseek, and configure the matching API key."
+            "Choose openai, deepseek, or the locally installed ollama model."
         )
     if not contains_cjk(final_text):
         raise RuntimeError(

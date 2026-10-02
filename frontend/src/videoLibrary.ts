@@ -8,7 +8,7 @@ export type VideoLibraryItem = {
   error: string | null;
 };
 
-const ACTIVE_STATUSES = new Set(["queued", "running", "cancelling"]);
+const ACTIVE_STATUSES = new Set(["queued", "running", "preparing", "cancelling"]);
 const COMPLETED_STATUSES = new Set(["completed"]);
 
 export function videoLibraryCategory(
@@ -31,4 +31,16 @@ export function videoLibraryMatches(
     .join("\n")
     .toLocaleLowerCase()
     .includes(needle);
+}
+
+export function selectableVideoLibraryIds(items: VideoLibraryItem[]): string[] {
+  return items.filter((item) => !ACTIVE_STATUSES.has(item.status)).map((item) => item.id);
+}
+
+export function retainVisibleVideoLibrarySelection(
+  selectedIds: string[],
+  visibleItems: VideoLibraryItem[],
+): string[] {
+  const visible = new Set(selectableVideoLibraryIds(visibleItems));
+  return selectedIds.filter((id) => visible.has(id));
 }

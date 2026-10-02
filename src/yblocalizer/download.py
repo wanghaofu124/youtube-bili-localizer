@@ -2,18 +2,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import contextmanager
+import hashlib
 import importlib.util
+import json
+import re
 from pathlib import Path
 import os
 import shutil
 import subprocess
-from typing import Callable
+import time
+import uuid
+from typing import Any, Callable
 from urllib.parse import urlparse
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from .cancellation import check_cancelled as legacy_check_cancelled
 from .dependencies import resolve_command
 from .models import VideoJob
+from .runtime import CancellationRequested
 from .performance import download_rate_limit, lower_process_priority, normalize_resource_profile
 from .util import require_command, slugify
 
@@ -25,6 +31,252 @@ class YouTubeAccessError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.suggested_action = suggested_action
+
+
+class DownloadResolutionMismatch(RuntimeError):
+    """A downloaded file does not match the resolution yt-dlp selected."""
+
+    code = "download_resolution_mismatch"
+
+    def __init__(self, selected: tuple[int, int], actual: tuple[int, int] | None) -> None:
+        expected_text = f"{selected[0]}×{selected[1]}"
+        actual_text = f"{actual[0]}×{actual[1]}" if actual else "无法读取"
+        super().__init__(
+            f"下载画质校验未通过：下载器选择了 {expected_text} 视频流，但成品文件实测为 {actual_text}。"
+            "已停止后续处理，没有把较低画质当作原画继续使用。请重试获取素材；如需降低画质，请在任务失败后明确确认。"
+        )
+
+
+class DownloadProposalMismatch(RuntimeError):
+    code = "download_proposal_mismatch"
+
+    def __init__(self, detail: str | None = None) -> None:
+        super().__init__(detail or "下载前媒体流方案已变化，需要重新准备并确认当前画质方案。")
+
+
+@dataclass(frozen=True)
+class _PartialSnapshot:
+    path: Path
+    backup: Path
+    size: int
+    sha256: str
+    directory: Path
+
+
+def _sha256_prefix(path: Path, length: int) -> str | None:
+    digest = hashlib.sha256()
+    remaining = length
+    try:
+        with path.open("rb") as handle:
+            while remaining:
+                block = handle.read(min(1024 * 1024, remaining))
+                if not block:
+                    return None
+                digest.update(block)
+                remaining -= len(block)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _snapshot_existing_partials(work_dir: Path, log: Callable[[str], None] | None) -> list[_PartialSnapshot]:
+    partials: list[tuple[Path, os.stat_result]] = []
+    for path in sorted(work_dir.glob("*.part")):
+        if path.is_symlink():
+            raise RuntimeError("发现符号链接形式的未完成下载；为避免覆盖其他文件，已停止获取素材。")
+        try:
+            details = path.stat()
+        except OSError as exc:
+            raise RuntimeError(f"无法安全检查未完成下载文件：{path.name}") from exc
+        if not path.is_file():
+            raise RuntimeError("发现非普通文件形式的未完成下载；为避免覆盖其他文件，已停止获取素材。")
+        if details.st_size > 0:
+            partials.append((path, details))
+    if not partials:
+        return []
+
+    if len(partials) > 16:
+        raise RuntimeError("未完成下载文件数量异常；为避免误改现有文件，已停止获取素材。")
+    total_size = sum(details.st_size for _, details in partials)
+    if shutil.disk_usage(work_dir).free < total_size + 8 * 1024 * 1024:
+        raise RuntimeError(
+            "磁盘剩余空间不足，无法在安全续传前保护现有未完成文件；原文件未改动，本次下载未开始。"
+        )
+
+    protection_root = work_dir / ".resume-protection"
+    if protection_root.exists() and (
+        protection_root.is_symlink() or protection_root.resolve().parent != work_dir.resolve()
+    ):
+        raise RuntimeError("续传保护目录路径不安全；原未完成文件未改动，本次下载未开始。")
+    protection_root.mkdir(exist_ok=True)
+    snapshot_dir = protection_root / uuid.uuid4().hex
+    snapshot_dir.mkdir()
+    snapshots: list[_PartialSnapshot] = []
+    try:
+        for path, before in partials:
+            backup = snapshot_dir / path.name
+            digest = hashlib.sha256()
+            copied = 0
+            with path.open("rb") as source, backup.open("xb") as target:
+                while True:
+                    block = source.read(1024 * 1024)
+                    if not block:
+                        break
+                    target.write(block)
+                    digest.update(block)
+                    copied += len(block)
+                target.flush()
+                os.fsync(target.fileno())
+            shutil.copystat(path, backup)
+            after = path.stat()
+            if (
+                copied != before.st_size
+                or after.st_size != before.st_size
+                or after.st_mtime_ns != before.st_mtime_ns
+                or backup.stat().st_size != before.st_size
+            ):
+                raise RuntimeError(f"未完成下载在保护期间发生变化：{path.name}；原文件保持不动。")
+            snapshots.append(_PartialSnapshot(path, backup, before.st_size, digest.hexdigest(), snapshot_dir))
+    except BaseException:
+        shutil.rmtree(snapshot_dir, ignore_errors=True)
+        try:
+            protection_root.rmdir()
+        except OSError:
+            pass
+        raise
+
+    if log:
+        log(f"续传保护已就绪：保留了 {len(snapshots)} 个已有部分文件，共 {total_size} 字节。")
+    return snapshots
+
+
+def _clean_empty_snapshot_dirs(snapshot_dir: Path) -> None:
+    try:
+        snapshot_dir.rmdir()
+    except OSError:
+        return
+    try:
+        snapshot_dir.parent.rmdir()
+    except OSError:
+        pass
+
+
+def _restore_changed_partials(snapshots: list[_PartialSnapshot], log: Callable[[str], None] | None) -> None:
+    for snapshot in snapshots:
+        current_size = 0
+        current_matches = False
+        try:
+            if snapshot.path.is_file() and not snapshot.path.is_symlink():
+                current_size = snapshot.path.stat().st_size
+                current_matches = (
+                    current_size >= snapshot.size
+                    and _sha256_prefix(snapshot.path, snapshot.size) == snapshot.sha256
+                )
+        except OSError:
+            current_matches = False
+
+        if current_matches:
+            try:
+                snapshot.backup.unlink(missing_ok=True)
+            except OSError:
+                if log:
+                    log("续传校验通过，但无法清理临时保护副本；保护副本仍保留在续传保护目录。")
+                continue
+            if log:
+                log(f"续传检查通过：已有数据 {snapshot.size} 字节，当前部分文件 {current_size} 字节，未覆盖原数据。")
+            _clean_empty_snapshot_dirs(snapshot.directory)
+            continue
+
+        restarted_candidate_exists = snapshot.path.exists() or snapshot.path.is_symlink()
+        try:
+            if restarted_candidate_exists:
+                rejected_dir = snapshot.directory / "restarted"
+                rejected_dir.mkdir(exist_ok=True)
+                rejected = rejected_dir / f"{snapshot.path.name}.{uuid.uuid4().hex[:8]}.restarted"
+                snapshot.path.replace(rejected)
+            snapshot.backup.replace(snapshot.path)
+        except OSError as exc:
+            if log:
+                log(
+                    f"续传保护无法恢复原路径：{type(exc).__name__}；原数据副本仍保存在保护目录中，"
+                    "未完成下载文件均已保留。"
+                )
+            continue
+        if log:
+            attempted_state = (
+                f"失败时文件大小 {current_size} 字节；已恢复原部分，并将改写版本隔离保留。"
+                if restarted_candidate_exists
+                else "失败时原路径文件已消失；已从保护副本恢复原部分。"
+            )
+            log(f"检测到下载器重启或改写已有部分文件（原大小 {snapshot.size} 字节，{attempted_state}）")
+        _clean_empty_snapshot_dirs(snapshot.directory)
+
+
+def _discard_partial_snapshots(snapshots: list[_PartialSnapshot]) -> None:
+    for directory in {snapshot.directory for snapshot in snapshots}:
+        shutil.rmtree(directory, ignore_errors=True)
+        _clean_empty_snapshot_dirs(directory)
+
+
+def _safe_diagnostic_text(value: str) -> str:
+    text = " ".join(str(value).split())
+
+    def redact_url(match: re.Match[str]) -> str:
+        raw = match.group(0).rstrip(".,;:)]}")
+        trailing = match.group(0)[len(raw):]
+        parsed = urlparse(raw)
+        host = parsed.hostname or "redacted-host"
+        return f"{parsed.scheme}://{host}/[redacted]" + ("?[redacted]" if parsed.query else "") + trailing
+
+    text = re.sub(r"(?i)\b(?:https?|socks5h?|socks4a?)://[^\s\"'<>]+", redact_url, text)
+    text = re.sub(
+        r"(?i)\b(cookie|set-cookie|authorization|proxy-authorization|token|signature|sig|api[_-]?key|password)\s*[:=]\s*[^,\s;]+",
+        r"\1=[redacted]",
+        text,
+    )
+    text = re.sub(r"(?i)\b[A-Z]:\\[^\s\"'<>]+", "[local path]", text)
+    return text[:500]
+
+
+def _safe_exception_chain(exc: BaseException, limit: int = 6) -> str:
+    entries: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and len(entries) < limit and id(current) not in seen:
+        seen.add(id(current))
+        name = type(current).__name__
+        message = _safe_diagnostic_text(str(current))
+        entries.append(f"{name}: {message}" if message else name)
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
+    return " <- ".join(entries)
+
+
+class _YtDlpTaskLogger:
+    """Persist useful yt-dlp diagnostics without echoing routine progress or secrets."""
+
+    def __init__(self, log: Callable[[str], None]) -> None:
+        self._log = log
+
+    def debug(self, message: str) -> None:
+        message = str(message)
+        if (
+            "Retrying" in message
+            or message.startswith("[download] Got error:")
+            or message.startswith("[download] Unable to resume")
+            or message.startswith("[download] Resuming download")
+        ):
+            self._log(f"yt-dlp: {_safe_diagnostic_text(message)}")
+
+    def warning(self, message: str) -> None:
+        self._log(f"yt-dlp warning: {_safe_diagnostic_text(message)}")
+
+    def error(self, message: str) -> None:
+        self._log(f"yt-dlp error: {_safe_diagnostic_text(message)}")
 
 
 def po_token_provider_status() -> dict[str, str | bool | None]:
@@ -143,20 +395,147 @@ class VideoMetadata:
     thumbnail_url: str | None
     max_width: int | None
     max_height: int | None
+    quality_proposal: dict[str, Any] | None = None
 
 
-def _format_for_quality(quality: str) -> str:
+def _quality_proposal(info: dict, quality: str) -> dict[str, Any]:
+    """Describe yt-dlp's actual selection; never rank its format table ourselves."""
+    requested = info.get("requested_formats")
+    selected = requested if isinstance(requested, list) and requested else [info]
+    video = next((item for item in selected if isinstance(item, dict) and str(item.get("vcodec") or "none") != "none"), {})
+    audio = next((item for item in selected if isinstance(item, dict) and str(item.get("acodec") or "none") != "none" and item is not video), {})
+    width, height = _selected_video_dimensions(info) or (0, 0)
+    cap = {"720p": 720, "1080p": 1080}.get(str(quality).lower())
+    muxed = str(video.get("acodec") or "none") != "none"
+    return {
+        "version": 3,
+        "quality": str(quality),
+        "video_format_id": str(video.get("format_id") or ""),
+        "audio_format_id": "" if muxed else str(audio.get("format_id") or ""),
+        "width": width or None,
+        "height": height or None,
+        "has_audio": muxed or bool(audio),
+        "requires_consent": bool(cap and (height <= 0 or height < cap)),
+    }
+
+
+def _format_for_quality(
+    quality: str,
+    minimum_resolution: tuple[int, int] | None = None,
+) -> str:
     normalized = str(quality or "1080p").strip().lower()
     heights = {"720p": 720, "1080p": 1080}
-    if normalized == "original":
-        return "bestvideo+bestaudio/best"
-    if normalized not in heights:
+    if normalized != "original" and normalized not in heights:
         raise ValueError("下载画质必须是 720p、1080p 或 original。")
-    height = heights[normalized]
-    return (
-        f"bestvideo[height<={height}]+bestaudio/"
-        f"best[height<={height}]/worst"
-    )
+    width_floor = height_floor = 0
+    if minimum_resolution is not None:
+        try:
+            width_floor, height_floor = (int(minimum_resolution[0]), int(minimum_resolution[1]))
+        except (TypeError, ValueError, IndexError) as exc:
+            raise DownloadProposalMismatch("画质确认记录不完整，无法安全开始下载。") from exc
+        if width_floor <= 0 or height_floor <= 0:
+            raise DownloadProposalMismatch("画质确认记录不完整，无法安全开始下载。")
+
+    cap = heights.get(normalized)
+    filters = "" if minimum_resolution is None else f"[width>={width_floor}][height>={height_floor}]"
+    if cap is not None:
+        filters += f"[height<={cap}]"
+    # Each alternative carries the same confirmed-resolution floor. yt-dlp may
+    # use a muxed stream when that is the best available match, but can never
+    # fall through to an unbounded low-resolution "best" format.
+    return f"bestvideo{filters}+bestaudio/best{filters}"
+
+
+def _quarantine_below_resolution(
+    work_dir: Path,
+    minimum_resolution: tuple[int, int],
+) -> list[Path]:
+    """Move stale low-resolution finals aside so yt-dlp cannot reuse them."""
+    minimum_width, minimum_height = minimum_resolution
+    quarantine_dir = work_dir / ".quarantined-low-resolution"
+    moved: list[Path] = []
+    media_suffixes = {".mp4", ".mkv", ".webm", ".mov"}
+    for candidate in work_dir.iterdir():
+        if not candidate.is_file() or candidate.suffix.lower() not in media_suffixes:
+            continue
+        dimensions = _probe_video_dimensions(candidate)
+        if dimensions and dimensions[0] >= minimum_width and dimensions[1] >= minimum_height:
+            continue
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        size = f"{dimensions[0]}x{dimensions[1]}" if dimensions else "unverified"
+        preserved = quarantine_dir / f"{candidate.stem}-{size}-{uuid.uuid4().hex[:8]}{candidate.suffix}"
+        candidate.replace(preserved)
+        moved.append(preserved)
+    return moved
+
+
+def _format_meets_proposal(current: dict[str, Any], promised: dict[str, Any]) -> None:
+    """Format IDs may change; the promised resolution and audio may not."""
+    try:
+        width, height = int(current.get("width") or 0), int(current.get("height") or 0)
+        minimum_width = int(promised.get("width") or 0)
+        minimum_height = int(promised.get("height") or 0)
+    except (TypeError, ValueError) as exc:
+        raise DownloadProposalMismatch("原有画质方案不完整，请重新执行准备检查。") from exc
+    if minimum_width <= 0 or minimum_height <= 0:
+        raise DownloadProposalMismatch("当前画质方案不完整，请重新执行准备检查。")
+    if width < minimum_width or height < minimum_height:
+        raise DownloadProposalMismatch(
+            f"先前确认的画质为 {minimum_width}×{minimum_height}，本次实际画质为 {width}×{height}。"
+            "应用不会把较低画质文件提交为有效素材；请重新准备并明确确认新画质，或稍后重试。"
+        )
+    if promised.get("has_audio") is True and not current.get("has_audio"):
+        raise DownloadProposalMismatch("先前确认的素材含音频，但当前可用视频流没有音频。请重新准备并确认。")
+
+
+def _selected_video_dimensions(info: dict) -> tuple[int, int] | None:
+    """Return the selected video stream size reported by yt-dlp, not max available."""
+    selected = info.get("requested_formats")
+    if isinstance(selected, list):
+        candidates: list[tuple[int, int]] = []
+        for item in selected:
+            if not isinstance(item, dict) or str(item.get("vcodec") or "none").lower() == "none":
+                continue
+            try:
+                width, height = int(item.get("width") or 0), int(item.get("height") or 0)
+            except (TypeError, ValueError):
+                continue
+            if width > 0 and height > 0:
+                candidates.append((width, height))
+        if candidates:
+            return max(candidates, key=lambda size: (size[1], size[0]))
+
+    try:
+        width, height = int(info.get("width") or 0), int(info.get("height") or 0)
+    except (TypeError, ValueError):
+        return None
+    return (width, height) if width > 0 and height > 0 else None
+
+
+def _probe_video_dimensions(path: Path) -> tuple[int, int] | None:
+    ffprobe = resolve_command("ffprobe")
+    if ffprobe is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [
+                str(ffprobe), "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height", "-of", "json", str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if completed.returncode != 0:
+            return None
+        streams = json.loads(completed.stdout).get("streams") or []
+        if not streams:
+            return None
+        width, height = int(streams[0].get("width") or 0), int(streams[0].get("height") or 0)
+        return (width, height) if width > 0 and height > 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, json.JSONDecodeError):
+        return None
 
 
 def _is_youtube_url(url: str) -> bool:
@@ -355,6 +734,7 @@ def get_video_metadata(
         thumbnail_url=_best_thumbnail_url(info),
         max_width=max_width,
         max_height=max_height,
+        quality_proposal=_quality_proposal(info, download_quality),
     )
 
 
@@ -375,6 +755,7 @@ def download_with_ytdlp(
     source_language: str | None = None,
     prefer_platform_subtitles: bool = True,
     log: Callable[[str], None] | None = None,
+    quality_proposal: dict[str, Any] | None = None,
 ) -> VideoJob:
     check = cancel_check or legacy_check_cancelled
     profile = normalize_resource_profile(resource_profile)
@@ -385,7 +766,20 @@ def download_with_ytdlp(
         raise RuntimeError("yt-dlp is not installed. Run: pip install -r requirements.txt") from exc
 
     work_dir.mkdir(parents=True, exist_ok=True)
+    # yt-dlp owns stream selection and its .part continuation; do not force
+    # overwrite, disable resume, or clear partial downloads here.
     outtmpl = str(work_dir / "%(id)s.%(ext)s")
+    minimum_resolution: tuple[int, int] | None = None
+    if quality_proposal is not None:
+        try:
+            minimum_resolution = (
+                int(quality_proposal.get("width") or 0),
+                int(quality_proposal.get("height") or 0),
+            )
+        except (TypeError, ValueError) as exc:
+            raise DownloadProposalMismatch("已确认的画质记录不完整，请重新准备素材。") from exc
+        if minimum_resolution[0] <= 0 or minimum_resolution[1] <= 0:
+            raise DownloadProposalMismatch("已确认的画质记录不完整，请重新准备素材。")
 
     def download_progress(status: dict) -> None:
         check()
@@ -400,7 +794,7 @@ def download_with_ytdlp(
             progress(1.0)
 
     opts = {
-        "format": _format_for_quality(download_quality),
+        "format": _format_for_quality(download_quality, minimum_resolution),
         "merge_output_format": "mp4",
         "outtmpl": outtmpl,
         "noplaylist": True,
@@ -411,7 +805,31 @@ def download_with_ytdlp(
         "progress_hooks": [download_progress],
         "postprocessor_hooks": [download_progress],
         "socket_timeout": 15,
+        "continuedl": True,
+        "nopart": False,
+        "retries": 10,
     }
+
+    def sleep_before_http_retry(n: int | float) -> float:
+        try:
+            retry_number = int(n)
+        except (TypeError, ValueError):
+            retry_number = 0
+        remaining = float(min(2 ** max(0, retry_number), 8))
+        if log:
+            log(f"yt-dlp HTTP 重试 {retry_number + 1}/10，退避 {int(remaining)} 秒。")
+        # yt-dlp normally sleeps the returned delay; wait here so cancellation
+        # remains responsive during backoff, then return zero to avoid sleeping twice.
+        while remaining > 0:
+            check()
+            pause = min(0.25, remaining)
+            time.sleep(pause)
+            remaining -= pause
+        return 0.0
+
+    opts["retry_sleep_functions"] = {"http": sleep_before_http_retry}
+    if log:
+        opts["logger"] = _YtDlpTaskLogger(log)
     rate_limit = download_rate_limit(profile)
     if rate_limit is not None:
         opts["ratelimit"] = rate_limit
@@ -431,8 +849,10 @@ def download_with_ytdlp(
     elif cookies_from_browser:
         opts["cookiesfrombrowser"] = (cookies_from_browser,)
 
+    partial_snapshots: list[_PartialSnapshot] = []
     try:
         check()
+        partial_snapshots = _snapshot_existing_partials(work_dir, log)
         with _cancellable_external_ffmpeg(check, profile):
             with yt_dlp.YoutubeDL(opts) as ydl:
                 # The common path performs a single extraction.  A metadata-only
@@ -446,22 +866,71 @@ def download_with_ytdlp(
                             "该视频未被 YouTube 标记为“可转载”（reuse allowed，yt-dlp 元数据中许可证为空或未知）。\n"
                             "如果你确认已获得处理或转载授权，请在素材页取消勾选「仅接受 CC reuse allowed」后重新开始任务。"
                         )
+                if minimum_resolution is not None:
+                    quarantined = _quarantine_below_resolution(work_dir, minimum_resolution)
+                    if quarantined and log:
+                        log(
+                            f"发现 {len(quarantined)} 个不符合已确认分辨率的旧缓存，已保留到隔离目录；"
+                            "本次只会选择达到已确认画质的流。"
+                        )
                 info = ydl.extract_info(url, download=True)
         check()
     except Exception as exc:
+        _restore_changed_partials(partial_snapshots, log)
+        if isinstance(exc, CancellationRequested):
+            raise
+        if log:
+            log(f"素材获取异常详情（URL 与凭据已脱敏）：{_safe_exception_chain(exc)}")
+        if quality_proposal is not None and _is_requested_format_unavailable_error(exc):
+            width, height = minimum_resolution or (0, 0)
+            raise DownloadProposalMismatch(
+                f"当前源站没有达到已确认的 {width}×{height} 视频流，本次未下载较低画质。"
+                "请重新读取素材信息，并在确认新的画质方案后重试。"
+            ) from exc
         _raise_with_youtube_hint(exc, cookies_from_browser, po_token_mode)
 
-    video_id = info.get("id") or slugify(info.get("title") or "video")
-    candidates = sorted(work_dir.glob(f"{video_id}.*"), key=lambda path: path.stat().st_mtime, reverse=True)
-    video_files = [path for path in candidates if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}]
-    if not video_files:
-        video_files = sorted(
-            [path for path in work_dir.iterdir() if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}],
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
+    try:
+        video_id = info.get("id") or slugify(info.get("title") or "video")
+        candidates = sorted(work_dir.glob(f"{video_id}.*"), key=lambda path: path.stat().st_mtime, reverse=True)
+        video_files = [path for path in candidates if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}]
+        if not video_files:
+            video_files = sorted(
+                [path for path in work_dir.iterdir() if path.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}],
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        if not video_files:
+            raise RuntimeError(f"Download finished but no video file was found in {work_dir}")
+
+        selected_dimensions = _selected_video_dimensions(info or {})
+        actual_dimensions = _probe_video_dimensions(video_files[0])
+        if not actual_dimensions:
+            raise RuntimeError("下载后无法通过 ffprobe 读取视频分辨率。")
+        if selected_dimensions and (
+            actual_dimensions[0] < selected_dimensions[0]
+            or actual_dimensions[1] < selected_dimensions[1]
+        ):
+            raise DownloadResolutionMismatch(selected_dimensions, actual_dimensions)
+        if quality_proposal:
+            _format_meets_proposal(
+                {"width": actual_dimensions[0], "height": actual_dimensions[1], "has_audio": _quality_proposal(info, download_quality)["has_audio"]},
+                quality_proposal,
+            )
+    except Exception as exc:
+        _restore_changed_partials(partial_snapshots, log)
+        if log:
+            log(f"下载后素材校验诊断（URL 与凭据已脱敏）：{_safe_exception_chain(exc)}")
+        raise
+
+    if any(work_dir.glob("*.part")):
+        _restore_changed_partials(partial_snapshots, log)
+    else:
+        _discard_partial_snapshots(partial_snapshots)
+    if actual_dimensions and log:
+        log(
+            f"原片分辨率校验通过：{actual_dimensions[0]}×{actual_dimensions[1]}；"
+            f"画质选择为 {download_quality}，未自动降低画质。"
         )
-    if not video_files:
-        raise RuntimeError(f"Download finished but no video file was found in {work_dir}")
 
     thumbnail_url = _best_thumbnail_url(info)
     thumbnail_path = _download_thumbnail(thumbnail_url, work_dir, video_id, proxy) if thumbnail_url else None
@@ -627,7 +1096,49 @@ def _raise_with_youtube_hint(
             "YouTube 拒绝了媒体请求（HTTP 403）。可能是本次媒体令牌失效、网络出口受限，或视频需要登录；不能仅凭 403 判定为 Cookies 问题。",
             action,
         ) from exc
+    if _is_stale_partial_download_error(exc):
+        raise YouTubeAccessError(
+            "youtube_stale_partial",
+            "媒体流续传失败（HTTP 416 或文件被占用无法重命名）；已下载的部分仍保留。",
+            "请先关闭占用文件的播放器或杀毒扫描后重试；若源站媒体流已变更，请重新执行准备检查。",
+        ) from exc
+    if _is_network_timeout_error(exc):
+        raise YouTubeAccessError(
+            "youtube_network_timeout",
+            "下载 YouTube 媒体流时连接中断或超时；未完成文件已保留，不会自动降低画质。",
+            "检查代理/VPN 连接后重试「获取素材」；yt-dlp 会尝试续传同一画质的已下载部分。",
+        ) from exc
     raise exc
+
+
+def _is_stale_partial_download_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        "http error 416" in message
+        or "requested range not satisfiable" in message
+        or "unable to rename file" in message
+        or "winerror 32" in message
+        or ("另一个程序正在使用此文件" in str(exc))
+    )
+
+
+def _is_network_timeout_error(exc: BaseException) -> bool:
+    """Identify interrupted network transfers without suggesting lower quality."""
+    message = str(exc).lower()
+    return any(marker in message for marker in (
+        "winerror 10060",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection aborted",
+        "unexpected_eof_while_reading",
+        "eof occurred in violation of protocol",
+    ))
+
+
+def _is_requested_format_unavailable_error(exc: BaseException) -> bool:
+    message = str(exc).casefold()
+    return "requested format is not available" in message or "requested format not available" in message
 
 
 # Compatibility name for external callers that imported the old private helper.

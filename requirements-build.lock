@@ -44,6 +44,7 @@ pyee==13.0.1
 pyinstaller==6.22.0
 pyinstaller-hooks-contrib==2026.6
 pytesseract==0.3.13
+pysubs2==1.9.0
 python-dotenv==1.2.2
 pythonnet==3.1.0
 pywebview==6.2.1

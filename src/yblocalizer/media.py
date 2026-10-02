@@ -16,9 +16,13 @@ def extract_audio(video_path: Path, output_path: Path | None = None, cancel_chec
         [
             "ffmpeg",
             "-y",
+            "-copyts",
+            "-start_at_zero",
             "-i",
             str(video_path),
             "-vn",
+            "-af",
+            "aresample=async=1:first_pts=0",
             "-ac",
             "1",
             "-ar",

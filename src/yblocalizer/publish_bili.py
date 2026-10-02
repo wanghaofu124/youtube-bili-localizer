@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Callable
+import re
 import time
 
 
@@ -56,7 +57,6 @@ def assist_publish(
     log: LogFn | None = None,
 ) -> None:
     try:
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise RuntimeError("playwright is not installed. Run: pip install -r requirements.txt && playwright install chromium") from exc
@@ -76,35 +76,44 @@ def assist_publish(
     with sync_playwright() as playwright:
         context = _launch_bilibili_context(playwright, profile_dir=profile_dir, browser=browser, headless=headless)
         page = context.new_page()
-        logger(f"Opening Bilibili upload page with {browser} profile {profile_dir}: {UPLOAD_URL}")
+        logger(f"正在打开 B 站投稿页（{browser}）…")
         page_load_started = time.monotonic()
-        page.goto(UPLOAD_URL, wait_until="domcontentloaded")
-        logger(f"Bilibili upload page loaded in {_elapsed(page_load_started)}.")
-        logger("If Bilibili shows the creator home page or login page, log in first. The helper will retry the upload page.")
+        page.goto(UPLOAD_URL, wait_until="domcontentloaded", timeout=60_000)
+        logger(f"投稿页已加载（{_elapsed(page_load_started)}）。当前页面：{page.url}")
+        logger("若出现登录页，请先在打开的浏览器里完成登录；程序会自动重试投稿页。")
         _dismiss_existing_draft_prompt(page, logger, wait_seconds=6)
+        _ensure_upload_page_ready(page, logger)
 
         select_started = time.monotonic()
-        if not _select_video_file(page, video_path, logger):
+        # Prefer click + Playwright file chooser. Direct set_input_files can
+        # succeed on a non-active input without Bilibili starting the upload.
+        if _select_video_file(page, video_path, logger):
+            pass
+        elif _set_video_via_hidden_input(page, video_path, logger):
+            pass
+        else:
             file_input = _wait_for_upload_input(page, logger)
             file_input.set_input_files(str(video_path))
-        logger(f"Selected video for upload in {_elapsed(select_started)}: {video_path}")
-        publish_form_timeout = _publish_form_timeout_seconds(video_path)
-        logger(f"Waiting up to {_format_seconds(publish_form_timeout)} for Bilibili upload/processing to reach the publish form.")
+            logger(f"已通过隐藏文件控件选择成片（{_elapsed(select_started)}）。")
+        logger(f"已选择成片：{video_path.name}（{_elapsed(select_started)}）")
         try:
+            _wait_for_upload_acknowledgement(page, video_path, logger, timeout_seconds=45)
+            publish_form_timeout = _publish_form_timeout_seconds(video_path)
+            logger(f"正在等待 B 站上传/转码完成并进入发布表单，最长 {_format_seconds(publish_form_timeout)}…")
             _wait_for_publish_form(page, logger, timeout_seconds=publish_form_timeout)
         except Exception:
             if screenshot_path:
                 screenshot_path = screenshot_path.resolve()
                 screenshot_path.parent.mkdir(parents=True, exist_ok=True)
                 page.screenshot(path=str(screenshot_path), full_page=True)
-                logger(f"Saved Bilibili timeout diagnostic screenshot: {screenshot_path}")
+                logger(f"已保存诊断截图：{screenshot_path}")
             raise
         if cover_path:
             cover_started = time.monotonic()
             if _upload_cover(page, cover_path, logger=logger):
-                logger(f"Uploaded Bilibili cover in {_elapsed(cover_started)}: {cover_path}")
+                logger(f"已尝试上传封面（{_elapsed(cover_started)}）。")
             else:
-                logger("Could not find the Bilibili cover upload control. Please set the cover manually.")
+                logger("未找到封面上传控件，请手动设置封面。")
         if _fill_first_available(
             page,
             _title_selectors(),
@@ -113,9 +122,9 @@ def assist_publish(
             keywords=TITLE_KEYWORDS,
             candidate_selector="input, textarea, [contenteditable='true'], [contenteditable='plaintext-only']",
         ):
-            logger("Filled Bilibili title.")
+            logger("已填写标题。")
         else:
-            logger("Could not find the Bilibili title field. Please fill it manually.")
+            logger("未找到标题栏，请手动填写。")
         if description:
             if _fill_first_available(
                 page,
@@ -125,56 +134,79 @@ def assist_publish(
                 keywords=DESCRIPTION_KEYWORDS,
                 candidate_selector="textarea, [contenteditable='true'], [contenteditable='plaintext-only'], input",
             ):
-                logger("Filled Bilibili description.")
+                logger("已填写简介。")
             else:
-                logger("Could not find the Bilibili description field. Please fill it manually.")
+                logger("未找到简介栏，请手动填写。")
         if tags:
             if _fill_tags(page, tags, logger=logger):
-                logger("Filled Bilibili tags.")
+                logger("已填写标签。")
             else:
-                logger("Could not find the Bilibili tag field. Please fill tags manually.")
+                logger("未找到标签栏，请手动填写。")
         if screenshot_path:
             screenshot_path = screenshot_path.resolve()
             screenshot_path.parent.mkdir(parents=True, exist_ok=True)
             page.screenshot(path=str(screenshot_path), full_page=True)
-            logger(f"Saved Bilibili upload page screenshot: {screenshot_path}")
+            logger(f"已保存投稿页截图：{screenshot_path}")
 
         logger("Bilibili upload assistance reached the pre-submit step.")
-        logger("Video, cover, title, description, and tags have been prepared where possible.")
-        logger("This is NOT published yet. Review category, creator statement, cover, platform prompts, then click '立即投稿' manually if everything is correct.")
+        logger("视频、封面、标题、简介、标签已尽量填好。尚未正式投稿，请人工检查后手动点「立即投稿」。")
         if wait_for_review:
-            logger("The browser will stay open. Close the Bilibili browser window after you finish reviewing/submitting.")
+            logger("浏览器会保持打开。检查/投稿结束后请关闭该 B 站浏览器窗口。")
             _wait_until_browser_closed(context)
         context.close()
 
 
 def _wait_for_upload_input(page, logger: LogFn):
     started = time.monotonic()
-    deadline = time.monotonic() + 1800
+    deadline = time.monotonic() + 600
     last_url = ""
+    last_heartbeat = 0.0
+    login_seen_at: float | None = None
     while time.monotonic() < deadline:
+        status = _page_blocker_status(page)
+        if status == "login":
+            login_seen_at = login_seen_at or time.monotonic()
+            if time.monotonic() - login_seen_at >= 120:
+                raise RuntimeError(
+                    "B 站投稿页仍需要登录。请先在打开的浏览器窗口完成登录，然后重新点击「打开投稿辅助」。"
+                )
+        else:
+            login_seen_at = None
         try:
-            file_input = _find_video_upload_input(page, timeout_ms=5_000)
-            logger(f"Bilibili upload control ready after {_elapsed(started)}.")
+            file_input = _find_video_upload_input(page, timeout_ms=3_000)
+            logger(f"已找到上传控件（{_elapsed(started)}）。")
             return file_input
         except Exception:
-            current_url = page.url
-            if current_url != last_url:
-                logger(f"Waiting for Bilibili upload control ({_elapsed(started)}). Current page: {current_url}")
+            current_url = ""
+            try:
+                current_url = page.url
+            except Exception:
+                pass
+            now = time.monotonic()
+            if current_url and current_url != last_url:
+                logger(f"等待上传控件（{_elapsed(started)}）。当前页面：{current_url}")
                 last_url = current_url
+                last_heartbeat = now
+            elif now - last_heartbeat >= 10:
+                hint = {
+                    "login": "检测到登录页，请在浏览器中登录。",
+                    "draft": "检测到未提交草稿弹窗，正在尝试关闭…",
+                    "home": "当前不像投稿页，正在重试打开投稿入口…",
+                }.get(status or "", "仍在等待投稿上传控件…")
+                logger(f"等待上传控件（{_elapsed(started)}）。{hint}")
+                last_heartbeat = now
             _dismiss_existing_draft_prompt(page, logger)
             _try_open_upload_entry(page)
-            if "/platform/upload/video" not in current_url:
+            if "/platform/upload/video" not in (current_url or ""):
                 try:
                     retry_started = time.monotonic()
                     page.goto(UPLOAD_URL, wait_until="domcontentloaded", timeout=30_000)
-                    logger(f"Retried Bilibili upload page load in {_elapsed(retry_started)}.")
+                    logger(f"已重新打开投稿页（{_elapsed(retry_started)}）。")
                 except Exception:
                     pass
             time.sleep(2)
     raise RuntimeError(
-        "Bilibili upload control was not found within 30 minutes. "
-        "Make sure the opened browser is logged in and can access the video upload page."
+        "10 分钟内仍未找到 B 站上传控件。请确认浏览器已登录并可打开创作中心投稿页后重试。"
     )
 
 
@@ -202,36 +234,129 @@ def _launch_bilibili_context(playwright, profile_dir: Path, browser: str, headle
     return playwright.chromium.launch_persistent_context(**options)
 
 
+def _page_blocker_status(page) -> str | None:
+    """Return a coarse page state used for progress and early failure hints."""
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        url = ""
+    try:
+        text = page.locator("body").inner_text(timeout=1_000)
+    except Exception:
+        text = ""
+    compact = text.replace(" ", "")
+    if any(marker in url for marker in ("passport.bilibili.com", "login", "account")):
+        return "login"
+    if any(marker in compact for marker in ("扫码登录", "密码登录", "短信登录", "登录后即可")):
+        return "login"
+    if any(marker in compact for marker in ("未提交的视频", "继续编辑", "不用了")):
+        return "draft"
+    if "/platform/upload/video" not in url and any(marker in compact for marker in ("创作中心", "数据中心", "首页")):
+        return "home"
+    return None
+
+
+def _ensure_upload_page_ready(page, logger: LogFn) -> None:
+    status = _page_blocker_status(page)
+    if status == "login":
+        logger("当前是登录页：请在打开的浏览器完成登录，程序会继续等待投稿页。")
+        return
+    if status == "home":
+        logger("当前不在投稿页，正在尝试进入上传入口…")
+        _try_open_upload_entry(page)
+        try:
+            page.goto(UPLOAD_URL, wait_until="domcontentloaded", timeout=30_000)
+        except Exception:
+            pass
+
+
+def _set_video_via_hidden_input(page, video_path: Path, logger: LogFn) -> bool:
+    """Fallback: assign files only to a strict video upload input."""
+    try:
+        file_input = _find_video_upload_input(page, timeout_ms=4_000)
+        file_input.set_input_files(str(video_path))
+        logger("已向投稿上传控件写入成片（备用路径）。")
+        return True
+    except Exception:
+        return False
+
+
 def _select_video_file(page, video_path: Path, logger: LogFn) -> bool:
     started = time.monotonic()
-    candidates = [
-        ".bcc-upload-wrapper",
-        ".upload-btn",
+    # Click the visible upload affordance first so Bilibili wires the real chooser.
+    click_candidates = [
         "button:has-text('上传视频')",
         "div:has-text('上传视频') button",
+        ".upload-btn",
+        ".bcc-upload-wrapper",
         "text=上传视频",
     ]
-    for selector in candidates:
+    for selector in click_candidates:
         try:
             locator = page.locator(selector).first
             locator.wait_for(state="visible", timeout=1_500)
-            with page.expect_file_chooser(timeout=5_000) as chooser_info:
-                locator.click()
+            with page.expect_file_chooser(timeout=4_000) as chooser_info:
+                locator.click(timeout=2_000)
             chooser_info.value.set_files(str(video_path))
-            logger(f"Selected video through Bilibili file chooser in {_elapsed(started)}: {selector}")
+            logger(f"已通过文件选择器选择成片（{_elapsed(started)}）：{selector}")
             return True
         except Exception:
             continue
-    logger(f"Bilibili file chooser was not available after {_elapsed(started)}; falling back to file input.")
+
+    input_candidates = [
+        "input[type='file'][name='buploader']",
+        ".bcc-upload-wrapper input[type='file']",
+        "input[type='file'][accept*='.mp4']",
+    ]
+    for selector in input_candidates:
+        try:
+            locator = page.locator(selector).first
+            locator.wait_for(state="attached", timeout=1_500)
+            if not _locator_is_video_upload_input(locator):
+                continue
+            locator.set_input_files(str(video_path))
+            logger(f"已通过控件选择成片（{_elapsed(started)}）：{selector}")
+            return True
+        except Exception:
+            continue
+    logger(f"点击选择成片未成功（{_elapsed(started)}），改为等待隐藏文件控件。")
     return False
+
+
+_VIDEO_UPLOAD_INPUT_JS = """element => {
+    const accept = (element.getAttribute("accept") || "").toLowerCase();
+    const name = (element.getAttribute("name") || "").toLowerCase();
+    if (accept.includes("image") && !accept.includes("video") && !accept.includes(".mp4")) {
+        return false;
+    }
+    if (name === "buploader") {
+        return true;
+    }
+    if (accept.includes(".mp4") || accept.includes("video") || accept.includes(".flv") || accept.includes(".mkv")) {
+        return true;
+    }
+    // Empty accept is only trusted inside the known upload wrapper.
+    if (!accept) {
+        return !!element.closest(".bcc-upload-wrapper");
+    }
+    return false;
+}"""
+
+
+def _locator_is_video_upload_input(locator) -> bool:
+    try:
+        return bool(locator.evaluate(_VIDEO_UPLOAD_INPUT_JS))
+    except Exception:
+        return False
 
 
 def _find_video_upload_input(page, timeout_ms: int = 5_000):
     deadline = time.monotonic() + (timeout_ms / 1000)
     last_error: Exception | None = None
     selectors = [
-        "input[type='file'][name='buploader'][accept*='.mp4']",
+        "input[type='file'][name='buploader']",
         "input[type='file'][accept*='.mp4']",
+        ".bcc-upload-wrapper input[type='file']",
         "input[type='file']",
     ]
     while time.monotonic() < deadline:
@@ -247,12 +372,7 @@ def _find_video_upload_input(page, timeout_ms: int = 5_000):
             for index in range(count):
                 candidate = locator.nth(index)
                 try:
-                    if not candidate.evaluate(
-                        """element => {
-                            const accept = (element.getAttribute("accept") || "").toLowerCase();
-                            return accept.includes(".mp4") || accept.includes("video");
-                        }"""
-                    ):
+                    if not _locator_is_video_upload_input(candidate):
                         continue
                     if attached_match is None:
                         attached_match = candidate
@@ -384,44 +504,142 @@ def _publish_form_timeout_seconds(video_path: Path) -> int:
     try:
         size_mb = video_path.stat().st_size / (1024 * 1024)
     except OSError:
-        return 300
-    # Large videos need time for browser upload and Bilibili server-side processing.
-    return max(300, min(1800, int(120 + size_mb * 1.2)))
+        return 600
+    # Only used after upload start is acknowledged. Keep headroom for slow links.
+    return max(600, min(3600, int(240 + size_mb * 3.0)))
+
+
+def _wait_for_upload_acknowledgement(
+    page,
+    video_path: Path,
+    logger: LogFn,
+    timeout_seconds: int = 45,
+) -> None:
+    """Fail fast if Bilibili never reacts after a file was assigned."""
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    last_heartbeat = 0.0
+    video_name = video_path.name
+    while time.monotonic() < deadline:
+        state = _read_upload_state(page, video_name)
+        if _upload_state_acknowledged(state):
+            logger(f"B 站已确认开始处理成片（{_elapsed(started)}）。{_format_upload_state(state)}")
+            return
+        now = time.monotonic()
+        if now - last_heartbeat >= 5:
+            logger(f"等待 B 站确认上传开始（{_elapsed(started)}）…{_format_upload_state(state)}")
+            last_heartbeat = now
+        time.sleep(1)
+    raise RuntimeError(
+        "成片已写入控件，但 B 站未开始上传（约 45 秒内无进度/文件名/转码提示）。"
+        "这通常是选错了上传控件或投稿页未就绪，请确认已登录后重新点击「打开投稿辅助」。"
+    )
 
 
 def _wait_for_publish_form(page, logger: LogFn, timeout_seconds: int = 180) -> None:
     started = time.monotonic()
     deadline = time.monotonic() + timeout_seconds
     last_url = ""
+    last_heartbeat = 0.0
+    last_state_key = ""
     while time.monotonic() < deadline:
         if _first_visible(page, _title_selectors(), timeout_ms=1_500):
-            logger(f"Bilibili publish form ready after {_elapsed(started)}.")
+            logger(f"发布表单已就绪（{_elapsed(started)}）。")
             return
         if _find_field_index(
             page,
             "input, textarea, [contenteditable='true'], [contenteditable='plaintext-only']",
             TITLE_KEYWORDS,
         ) is not None:
-            logger(f"Bilibili publish form ready after {_elapsed(started)}.")
+            logger(f"发布表单已就绪（{_elapsed(started)}）。")
             return
         if _publish_form_markers_present(page):
-            logger(f"Bilibili publish form ready after {_elapsed(started)}.")
+            logger(f"发布表单已就绪（{_elapsed(started)}）。")
             return
         current_url = ""
         try:
             current_url = page.url
         except Exception:
             pass
+        now = time.monotonic()
+        state = _read_upload_state(page)
+        state_text = _format_upload_state(state)
+        state_key = f"{state.get('marker')}|{state.get('percent')}|{current_url}"
         if current_url and current_url != last_url:
-            logger(f"Waiting for Bilibili publish form ({_elapsed(started)}). Current page: {current_url}")
+            logger(f"等待发布表单（{_elapsed(started)}）。当前页面：{current_url}{state_text}")
             last_url = current_url
-        else:
-            logger(f"Waiting for Bilibili publish form ({_elapsed(started)})...")
+            last_heartbeat = now
+            last_state_key = state_key
+        elif state_key != last_state_key and state_text:
+            logger(f"等待发布表单（{_elapsed(started)}）…{state_text}")
+            last_heartbeat = now
+            last_state_key = state_key
+        elif now - last_heartbeat >= 8:
+            logger(f"等待发布表单（{_elapsed(started)}）…{state_text or ' 仍在等待上传/转码'}")
+            last_heartbeat = now
         time.sleep(2)
     raise RuntimeError(
-        "Bilibili publish form did not appear after selecting the video. "
-        "The upload may still be processing, or Bilibili may be waiting for a manual prompt in the browser."
+        "成片已开始上传，但发布表单长时间未出现。可能仍在上传/转码，或页面有弹窗需要你在浏览器里手动处理。"
     )
+
+
+def _read_upload_state(page, video_name: str = "") -> dict[str, object]:
+    try:
+        text = page.locator("body").inner_text(timeout=800)
+    except Exception:
+        text = ""
+    marker = None
+    for candidate in ("上传完成", "转码中", "上传中", "处理中", "解析中", "上传失败", "重新上传"):
+        if candidate in text:
+            marker = candidate
+            break
+    percent = None
+    match = re.search(r"(\d{1,3})\s*%", text)
+    if match:
+        value = int(match.group(1))
+        if 0 <= value <= 100:
+            percent = value
+    filename_seen = False
+    if video_name:
+        stem = Path(video_name).stem
+        filename_seen = video_name in text or (bool(stem) and stem in text)
+    return {
+        "marker": marker,
+        "percent": percent,
+        "filename_seen": filename_seen,
+        "form_ready": _publish_form_markers_present(page),
+        "text_excerpt": text[:240],
+    }
+
+
+def _upload_state_acknowledged(state: dict[str, object]) -> bool:
+    marker = state.get("marker")
+    if marker in {"上传失败"}:
+        return False
+    if marker in {"上传完成", "转码中", "上传中", "处理中", "解析中", "重新上传"}:
+        return True
+    if state.get("percent") is not None:
+        return True
+    if state.get("filename_seen"):
+        return True
+    if state.get("form_ready"):
+        return True
+    return False
+
+
+def _format_upload_state(state: dict[str, object]) -> str:
+    parts: list[str] = []
+    marker = state.get("marker")
+    percent = state.get("percent")
+    if marker:
+        parts.append(str(marker))
+    if percent is not None:
+        parts.append(f"{percent}%")
+    if state.get("filename_seen") and not parts:
+        parts.append("已显示成片文件名")
+    if not parts:
+        return ""
+    return " 状态：" + " / ".join(parts)
 
 
 def _publish_form_markers_present(page) -> bool:

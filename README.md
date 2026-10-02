@@ -27,13 +27,13 @@ flowchart LR
 - URL 或本地文件输入；`yt-dlp` 可按需通过本机 Chrome/Edge 获取 YouTube PO Token，并支持用户自己的登录 Cookies（不会绕过账号权限或平台验证）。
 - `faster-whisper` 支持 CPU、CUDA 和可配置精度；OCR 可识别画面内英文字幕与信息标签。
 - 音频/OCR 可分别使用，或按时间轴合并；转写、翻译和输出均保留可检查的 JSON/SRT 中间产物。
-- OpenAI / DeepSeek 可进行源字幕校对、上下文分批翻译和投稿元数据生成。
+- OpenAI / DeepSeek 可进行源字幕校对、上下文分批翻译和投稿元数据生成；也可选择 Ollama 在本机运行 Qwen 3.5 或专用翻译模型 TranslateGemma，无需在线翻译 API。
 - 支持中文、原文、双语字幕，动态换行、字体、描边、阴影和位置配置。
 - 图形工作台（WebView 界面）：素材、处理、字幕精修、视频修改（删除/保留/静音/导出/重排）、发布辅助、任务历史；另保留 CLI。
 - 三档资源模式：默认“均衡”限制下载带宽与 CPU 线程；“后台”优先保证其他软件流畅；“极速”释放全部资源。
 - 自适应画面字幕 OCR：一次抽帧，优先上次成功区域，低置信度时再扩大搜索；支持配置 Tesseract 语言并明确显示是否回退到 Whisper。
 - 桌面任务按“获取素材 → 字幕提取 → 翻译 → 渲染 → 发布辅助”独立运行；每阶段保存检查点，可取消、重试并在应用重启后从最后有效产物继续。
-- 创建任务不会立即下载。链接、授权、Cookies、FFmpeg/ffprobe、所选 Whisper 模型、OCR、翻译 API、CUDA/精度、渲染编码器和磁盘空间会先在准备中心检查；缺失模型只允许用户明确点击安装。
+- 创建任务不会立即下载。链接、授权、Cookies、FFmpeg/ffprobe、所选 Whisper 模型、OCR、翻译 API/本地模型、CUDA/精度、渲染编码器和磁盘空间会先在准备中心检查；缺失模型只允许用户明确点击安装。
 - 字幕时间轴精修与视频片段级编辑均自动保持字幕对齐，处理结果（转写/OCR/翻译对照）实时可见。
 - URL 默认限制为 1080p，可选 720p/原始画质；4K 原画会在开始前警告。截取视频开头使用快速封装，字幕渲染自动优先 NVIDIA NVENC，失败时降级 CPU。
 
@@ -42,6 +42,8 @@ flowchart LR
 ### 0. 前置要求（Windows）
 
 直接使用发布页 EXE 的普通用户：双击启动后按“素材 → 处理 → 检查准备”操作。默认音频流程需要 FFmpeg 和所选 Whisper 模型；OCR 与投稿浏览器只在启用对应功能时需要。安装必须由用户在准备清单或顶部「依赖」中明确确认，完成后只重新检查，不会自动开始下载。应用会显示实际安装状态、进度、失败日志与重试入口，不要求手工配置 PATH。缺少 WebView2 时，桌面壳会在启动前提示并打开微软官方安装页。
+
+需要免费本地翻译时，在「处理」选择 **Ollama（本地模型）**。每台电脑需单独安装并启动 [Ollama for Windows](https://ollama.com/download/windows)，再在应用中明确下载所选模型。可选 **Qwen 3.5 4B**（约 3.4 GB，通用模型）、**Qwen 3.5 9B**（约 6.6 GB，通用模型），以及 **TranslateGemma 12B**（约 8.1 GB，专用多语言翻译模型，支持 55 种语言）。选择 Ollama 时默认使用 TranslateGemma 12B；该模型逐条翻译以保持字幕对应关系，不执行通用模型语义切句或源文校对，也不提供跨字幕上下文。口语残句和领域专有名词可能误译，需人工复核。模型不会打进 EXE；下载完后无需重启应用，字幕翻译请求只发给本机 Ollama，断网后也可使用已安装模型。模型体积与官方信息见 [Qwen 3.5](https://ollama.com/library/qwen3.5) 和 [TranslateGemma](https://ollama.com/library/translategemma)。
 
 下面仅适用于从源码运行：
 
@@ -102,7 +104,7 @@ outputs/demo/job-*/
 powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 ```
 
-产物位于 `dist\`（`YouTubeBiliLocalizer.exe` 为图形界面、`yblocalizer.exe` 为命令行）。图形界面的「依赖中心」可检查内置的 YouTube 浏览器验证组件，并安装或预下载 FFmpeg、Whisper small、Node.js、Tesseract 与投稿辅助浏览器；OCR、投稿等未选功能不会强迫安装。安装任务可以取消，关闭应用会终止其外部安装进程。命令行用户仍可自行管理这些系统组件。
+产物位于 `dist\`（`YouTubeBiliLocalizer.exe` 为图形界面、`yblocalizer.exe` 为命令行）。图形界面的「依赖中心」可检查内置的 YouTube 浏览器验证组件，并安装或预下载 FFmpeg、Whisper small、Node.js、Tesseract、Ollama 翻译模型与投稿辅助浏览器；OCR、投稿等未选功能不会强迫安装。安装任务可以取消，关闭应用会终止其外部安装进程。Ollama 本体和模型均由用户按需安装，不会包含在 EXE 中。命令行用户仍可自行管理这些系统组件。
 
 公开交付应使用固定的 Python 3.12 构建环境：
 

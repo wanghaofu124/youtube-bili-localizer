@@ -17,8 +17,33 @@ from .dependencies import require_whisper_model, resolve_command
 from .models import Segment, save_segments
 from .performance import cpu_thread_limit, normalize_resource_profile
 from .subtitle import write_srt
+from .subtitle_speech_pack import (
+    TimedWord,
+    normalize_word_stream,
+    pack_cues_from_words,
+    save_words,
+    timed_words_from_whisper_item,
+    words_path_for_segments,
+)
 
 LogFn = Callable[[str], None]
+
+
+class WhisperCudaOutOfMemory(RuntimeError):
+    """A definite Whisper CUDA OOM that needs an explicit recovery choice."""
+
+    code = "cuda_oom"
+
+
+def _is_cuda_oom(error: BaseException | str) -> bool:
+    text = str(error).lower()
+    return (
+        "cuda out of memory" in text
+        or "cuda_error_out_of_memory" in text
+        or "cuda error: out of memory" in text
+        or "cublas_status_alloc_failed" in text
+        or ("memory allocation failed" in text and ("cuda" in text or "cublas" in text))
+    )
 
 
 def transcribe_audio(
@@ -85,30 +110,58 @@ def _transcribe_audio_in_process(
                 cpu_threads=thread_limit,
                 num_workers=1,
             )
-            # word_timestamps=True：让 whisper 用词级对齐重算段边界。
-            # 实测不开启时（仅 VAD 粗块），有 BGM 的视频会把数秒静默并入同一条段
-            # （如 0-11s 一条字幕），开启后能精确切到真实语音边界（如 0.0-1.0 / 5.9-7.5）。
-            whisper_segments, _info = model.transcribe(
-                str(audio_path),
-                language=language,
-                initial_prompt=_clean_initial_prompt(initial_prompt),
-                vad_filter=True,
-                beam_size=max(1, min(10, beam_size)),
-                condition_on_previous_text=True,
-                word_timestamps=True,
-            )
-            raw_segments = []
+            # word_timestamps=True：用词级起止覆盖 VAD 粗块。只读 segment.start/end
+            # 时，有 BGM/空镜的视频会把一句台词拖到下一段说话前（实测可超过 50 秒）。
+            transcribe_kwargs = {
+                "language": language,
+                "initial_prompt": _clean_initial_prompt(initial_prompt),
+                "vad_filter": True,
+                "beam_size": max(1, min(10, beam_size)),
+                "condition_on_previous_text": False,
+                "word_timestamps": True,
+            }
+            try:
+                whisper_segments, _info = model.transcribe(
+                    str(audio_path),
+                    # The previous 120 ms pad clipped quiet leading words at
+                    # speech onsets (verified at 07:17 in the current video).
+                    vad_parameters={"min_silence_duration_ms": 400, "speech_pad_ms": 400},
+                    **transcribe_kwargs,
+                )
+            except TypeError:
+                whisper_segments, _info = model.transcribe(str(audio_path), **transcribe_kwargs)
+            # Flatten every Whisper chunk into one word clock, then cut by speech
+            # pauses. Per-chunk packing leaves mid-phrase breaks at VAD boundaries
+            # (e.g. "handed me" | "this box") that no later merge reliably fixes.
+            whisper_items = []
             for item in whisper_segments:
                 check()
-                text = item.text.strip()
-                if text:
-                    raw_segments.append(Segment(start=float(item.start), end=float(item.end), text=text))
-            segments = _split_long_segments(raw_segments)
-            segments = _align_segment_starts(segments, audio_path)
+                whisper_items.append(item)
+            all_words = _timed_words_with_fallback(whisper_items)
+            if all_words:
+                all_words = normalize_word_stream(all_words)
+                all_words = _recover_vad_speech_gaps(
+                    audio_path, model, all_words, transcribe_kwargs, check, logger,
+                )
+                save_words(words_path_for_segments(segments_json), all_words)
+                segments = pack_cues_from_words(all_words)
+                logger(f"按说话时间切分：{len(all_words)} 词 → {len(segments)} 条字幕。")
+            else:
+                segments = []
+                for item in whisper_items:
+                    segments.extend(_segments_from_whisper(item))
+                words_path_for_segments(segments_json).unlink(missing_ok=True)
+            segments = _coalesce_micro_segments(segments)
             break
         except Exception as exc:
             last_error = exc
             if resolved_device == "cuda":
+                if device.strip().lower() == "cuda":
+                    if _is_cuda_oom(exc):
+                        raise WhisperCudaOutOfMemory(
+                            f"Whisper CUDA 显存不足，已停止自动切换设备。原始错误：{exc}"
+                        ) from exc
+                    raise RuntimeError(f"Whisper CUDA 转写失败，未自动切换设备。原始错误：{exc}") from exc
                 logger(
                     "CUDA transcription failed; trying a safer fallback. "
                     f"device={resolved_device}, compute_type={resolved_compute_type}, error={exc}"
@@ -123,6 +176,101 @@ def _transcribe_audio_in_process(
     save_segments(segments_json, segments)
     write_srt(srt_path, segments, display_mode="source")
     return segments
+
+
+def _uncovered_speech_gaps(
+    speech_intervals: list[tuple[float, float]], words: list[TimedWord],
+    *, min_duration: float = 1.25,
+) -> list[tuple[float, float]]:
+    """Find sustained VAD speech with no word-timed ASR result."""
+    gaps: list[tuple[float, float]] = []
+    for speech_start, speech_end in speech_intervals:
+        cursor = speech_start
+        for word in words:
+            if word.end <= cursor or word.start >= speech_end:
+                continue
+            if word.start - cursor >= min_duration:
+                gaps.append((cursor, word.start))
+            cursor = max(cursor, word.end)
+            if cursor >= speech_end:
+                break
+        if speech_end - cursor >= min_duration:
+            gaps.append((cursor, speech_end))
+    return gaps
+
+
+def _recover_vad_speech_gaps(
+    audio_path: Path,
+    model: object,
+    words: list[TimedWord],
+    transcribe_kwargs: dict[str, object],
+    check: Callable[[], None],
+    logger: LogFn,
+) -> list[TimedWord]:
+    """Recheck only sustained uncovered speech; never invent word timings."""
+    from faster_whisper.audio import decode_audio
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    check()
+    audio = decode_audio(str(audio_path), sampling_rate=16000)
+    speech = get_speech_timestamps(
+        audio,
+        VadOptions(min_silence_duration_ms=400, speech_pad_ms=400),
+        sampling_rate=16000,
+    )
+    intervals = [(entry["start"] / 16000, entry["end"] / 16000) for entry in speech]
+    candidates = _uncovered_speech_gaps(intervals, words)
+    if not candidates:
+        logger("人声漏检复核：未发现持续有人声却没有词级字幕的区间。")
+        return words
+    if len(candidates) > 24 or sum(end - start for start, end in candidates) > 120:
+        raise RuntimeError(
+            f"人声漏检复核发现 {len(candidates)} 处大范围空白；"
+            "为避免把背景声音误转成字幕，已停止并要求人工检查源音频。"
+        )
+    logger(f"人声漏检复核：检查 {len(candidates)} 个有语音证据的空白区间。")
+    recovered: list[TimedWord] = []
+    for gap_start, gap_end in candidates:
+        check()
+        crop_start = max(0.0, gap_start - 2.0)
+        crop_end = min(len(audio) / 16000, gap_end + 2.0)
+        crop = audio[int(crop_start * 16000):int(crop_end * 16000)]
+        retry_kwargs = dict(transcribe_kwargs)
+        retry_kwargs["vad_filter"] = True
+        segments, _ = model.transcribe(
+            crop,
+            vad_parameters={"min_silence_duration_ms": 400, "speech_pad_ms": 400},
+            **retry_kwargs,
+        )
+        checked: list[TimedWord] = []
+        for segment in segments:
+            check()
+            if float(getattr(segment, "avg_logprob", -1.0)) < -0.7:
+                continue
+            if float(getattr(segment, "no_speech_prob", 1.0)) > 0.3:
+                continue
+            checked.extend(
+                TimedWord(crop_start + word.start, crop_start + word.end, word.word)
+                for word in _timed_words_with_fallback([segment])
+            )
+        if not any(gap_start <= (word.start + word.end) / 2 <= gap_end for word in checked):
+            continue
+        added = 0
+        for word in checked:
+            midpoint = (word.start + word.end) / 2
+            if not gap_start - 1.5 <= midpoint <= gap_end + 1.5:
+                continue
+            if any(word.start < old.end - 0.08 and word.end > old.start + 0.08 for old in words):
+                continue
+            recovered.append(word)
+            added += 1
+        if added:
+            logger(f"复核区间 {gap_start:.1f}–{gap_end:.1f}s：补入 {added} 个候选词。")
+    if not recovered:
+        logger("人声漏检复核：没有足够可靠的新词；原有转写保持不变。")
+        return words
+    logger(f"人声漏检复核：共补入 {len(recovered)} 个有真实时间戳的词。")
+    return normalize_word_stream(words + recovered)
 
 
 def _transcribe_audio_isolated(
@@ -145,7 +293,7 @@ def _transcribe_audio_isolated(
     control_dir = Path(tempfile.mkdtemp(prefix=".whisper-worker-", dir=segments_json.parent))
     try:
         attempts = [(device, compute_type)]
-        if device.strip().lower() in {"cuda", "auto"}:
+        if device.strip().lower() == "auto":
             attempts.append(("cpu", "int8"))
         last_error: RuntimeError | None = None
         for index, (attempt_device, attempt_compute) in enumerate(attempts):
@@ -156,11 +304,19 @@ def _transcribe_audio_isolated(
                     control_dir, audio_path, model_size, language, attempt_device,
                     attempt_compute, initial_prompt, beam_size, logger, check, resource_profile,
                 )
+            except WhisperCudaOutOfMemory as exc:
+                if device.strip().lower() == "cuda":
+                    raise
+                last_error = exc
+                continue
             except RuntimeError as exc:
                 last_error = exc
                 continue
             temporary_json.replace(segments_json)
             temporary_srt.replace(srt_path)
+            temporary_words = words_path_for_segments(temporary_json)
+            if temporary_words.is_file():
+                temporary_words.replace(words_path_for_segments(segments_json))
             return items
         raise last_error or RuntimeError("Whisper 子进程未能启动。")
     finally:
@@ -224,11 +380,16 @@ def _run_whisper_worker(
     if process.returncode != 0:
         code = process.returncode & 0xFFFFFFFF
         detail = ""
+        error_code = ""
         if result_path.is_file():
             try:
-                detail = str(json.loads(result_path.read_text(encoding="utf-8")).get("error") or "")
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+                detail = str(result.get("error") or "")
+                error_code = str(result.get("error_code") or "")
             except (OSError, ValueError):
                 pass
+        if error_code == WhisperCudaOutOfMemory.code:
+            raise WhisperCudaOutOfMemory(detail or "Whisper CUDA 显存不足。")
         if detail:
             raise RuntimeError(f"Whisper 转写失败：{detail}；主程序和已下载素材均已保留。")
         raise RuntimeError(f"Whisper 转写子进程异常退出（0x{code:08X}），主程序和已下载素材均已保留。")
@@ -236,6 +397,8 @@ def _run_whisper_worker(
         raise RuntimeError("Whisper 转写子进程未生成完整结果，已保留原有检查点。")
     result = json.loads(result_path.read_text(encoding="utf-8"))
     if result.get("status") != "completed":
+        if result.get("error_code") == WhisperCudaOutOfMemory.code:
+            raise WhisperCudaOutOfMemory(str(result.get("error") or "Whisper CUDA 显存不足。"))
         raise RuntimeError(f"Whisper 转写失败：{result.get('error') or '未知错误'}")
     from .models import load_segments
     return load_segments(temporary_json), temporary_json, temporary_srt
@@ -263,103 +426,139 @@ def _clean_initial_prompt(initial_prompt: str | None) -> str | None:
     return cleaned[:1000] or None
 
 
-def _split_long_segments(segments: list[Segment], max_duration: float = 4.8) -> list[Segment]:
+def _segment_from_whisper(item: object) -> Segment | None:
+    text = str(getattr(item, "text", "") or "").strip()
+    if not text:
+        return None
+    start = float(getattr(item, "start", 0.0) or 0.0)
+    end = float(getattr(item, "end", start) or start)
+    words = [
+        word
+        for word in (getattr(item, "words", None) or [])
+        if getattr(word, "start", None) is not None and getattr(word, "end", None) is not None
+    ]
+    if words:
+        start = float(words[0].start)
+        end = float(words[-1].end)
+    if end <= start:
+        end = start + 0.1
+    return Segment(start=start, end=end, text=text)
+
+
+def _timed_words_with_fallback(items: list[object]) -> list[TimedWord]:
+    words: list[TimedWord] = []
+    for item in items:
+        timed = timed_words_from_whisper_item(item)
+        if timed:
+            words.extend(timed)
+            continue
+        # Do not drop an entire spoken chunk merely because this one item has
+        # no word timestamps while the rest of the recording does.
+        fallback = _segment_from_whisper(item)
+        if fallback is not None:
+            words.append(TimedWord(fallback.start, fallback.end, fallback.text))
+    return words
+
+
+def _segments_from_whisper(item: object) -> list[Segment]:
+    """Build subtitle cues from Whisper's word clock without guessing timings.
+
+    Prefer the global packer when possible. A single Whisper chunk may still
+    span several sentences separated by B-roll, so boundaries are chosen
+    between words and retain those times.
+    """
+    words = timed_words_from_whisper_item(item)
+    if words:
+        return pack_cues_from_words(words)
+    segment = _segment_from_whisper(item)
+    return [segment] if segment is not None else []
+
+
+def _coalesce_micro_segments(segments: list[Segment]) -> list[Segment]:
+    """Remove word-timestamp fragments that make unusable subtitle cues.
+
+    Whisper occasionally emits a short prefix (for example ``"va a"`` or
+    ``"yo"``) immediately before the full cue. Keeping that prefix as its own
+    subtitle gives the translator a one-word line and can also create a small
+    overlap. Merge nearby micro-cues before translation; if the following cue
+    already starts with the same words, keep the full cue and discard the
+    duplicate prefix instead of repeating it.
+    """
+    if not segments:
+        return []
+    pending = [
+        Segment(float(item.start), float(item.end), str(item.text or "").strip(), item.translated_text)
+        for item in segments
+        if str(item.text or "").strip() and float(item.end) > float(item.start)
+    ]
     output: list[Segment] = []
-    for segment in segments:
-        output.extend(_split_long_segment(segment, max_duration=max_duration))
+    index = 0
+    while index < len(pending):
+        current = pending[index]
+        if index + 1 < len(pending) and _is_micro_segment(current):
+            following = pending[index + 1]
+            if _segments_are_near(current, following):
+                if _starts_with_same_words(following.text, current.text):
+                    # Whisper repeated the prefix at the next boundary. Keep
+                    # the complete following cue and extend it to the prefix's
+                    # true start so its timing remains anchored to the audio.
+                    pending[index + 1] = Segment(
+                        min(current.start, following.start),
+                        max(current.end, following.end),
+                        following.text,
+                        following.translated_text,
+                    )
+                    index += 1
+                    continue
+                # A short continuation such as "yo" belongs to the next
+                # phrase. Join it before sending the text to the translator.
+                pending[index + 1] = Segment(
+                    min(current.start, following.start),
+                    max(current.end, following.end),
+                    _join_segment_text(current.text, following.text),
+                    following.translated_text,
+                )
+                index += 1
+                continue
+        if output and _is_micro_segment(current) and _segments_are_near(output[-1], current):
+            previous = output[-1]
+            output[-1] = Segment(
+                previous.start,
+                max(previous.end, current.end),
+                _join_segment_text(previous.text, current.text),
+                previous.translated_text,
+            )
+        else:
+            output.append(current)
+        index += 1
     return output
 
 
-def _align_segment_starts(segments: list[Segment], audio_path: Path) -> list[Segment]:
-    """把每条字幕的开始时间对齐到音频里的真实语音起点。
-
-    faster-whisper 的段时间戳（含词级对齐）实测系统性比真实语音早
-    0.1~0.5 秒（尤其有 BGM 时），导致字幕在声音出现前就显示。
-    这里用短窗 RMS 能量在每条段 start 前后找第一个语音帧；
-    只后移不提前：若检测到更晚的语音起点则对齐过去，否则至少后移 0.25s，
-    保证字幕不早于声音出现。
-    """
-    try:
-        import numpy as np
-        from scipy.io import wavfile
-    except ImportError:
-        return segments
-    try:
-        sample_rate, data = wavfile.read(str(audio_path))
-        if data.ndim > 1:
-            mono = data.mean(axis=1)
-        else:
-            mono = data
-        mono = mono.astype(np.float32) / (np.iinfo(data.dtype).max if np.issubdtype(data.dtype, np.integer) else 1.0)
-    except Exception:
-        return segments
-    window = max(80, sample_rate // 40)  # 25ms
-    rms = np.sqrt(np.convolve(mono * mono, np.ones(window) / window, mode="same"))
-    # 阈值：取 40 百分位的 3 倍，且不低于 -30dBFS
-    threshold = max(0.0316, float(np.percentile(rms, 40)) * 3.0)
-
-    def _first_voice_frame(start: float, end: float) -> float | None:
-        begin = max(0, int((start - 0.6) * sample_rate))
-        stop = int((end + 0.2) * sample_rate)
-        segment = rms[begin:stop]
-        hits = np.where(segment > threshold)[0]
-        if len(hits) == 0:
-            return None
-        # 需要至少连续 3 帧（约 75ms）才算语音起点，避免瞬时噪声
-        groups = np.split(hits, np.where(np.diff(hits) > sample_rate // 25)[0] + 1)
-        for group in groups:
-            if len(group) >= 3:
-                return (begin + group[0]) / sample_rate
-        return None
-
-    aligned: list[Segment] = []
-    for segment in segments:
-        start = segment.start
-        end = segment.end
-        voice_at = _first_voice_frame(start, end)
-        if voice_at is not None and voice_at > start + 0.1:
-            start = voice_at
-        else:
-            # 能量检测不可靠（BGM 强时）也至少后移 0.25s，消除"字幕早于声音"
-            start = start + 0.25
-        shift = start - segment.start
-        aligned.append(Segment(start=start, end=end + shift, text=segment.text))
-    # 校正后可能出现重叠，规整一下
-    for index, segment in enumerate(aligned):
-        if index < len(aligned) - 1:
-            next_start = aligned[index + 1].start
-            if segment.end > next_start - 0.05:
-                segment.end = max(segment.start + 0.1, next_start - 0.05)
-    return aligned
+def _is_micro_segment(segment: Segment) -> bool:
+    tokens = re.findall(r"[\wÀ-ÿ]+|[\u3400-\u9fff]", segment.text or "", flags=re.UNICODE)
+    return (segment.end - segment.start) <= 0.55 or len(tokens) <= 2
 
 
-def _split_long_segment(segment: Segment, max_duration: float) -> list[Segment]:
-    duration = segment.end - segment.start
-    if duration <= max_duration:
-        return [segment]
-    parts = _sentence_parts(segment.text)
-    if len(parts) <= 1:
-        return [segment]
-    weights = [max(1, len(re.sub(r"\s+", "", part))) for part in parts]
-    total = sum(weights)
-    output: list[Segment] = []
-    cursor = segment.start
-    for index, part in enumerate(parts):
-        if index == len(parts) - 1:
-            end = segment.end
-        else:
-            end = cursor + duration * weights[index] / total
-        if end - cursor >= 0.25:
-            output.append(Segment(start=cursor, end=end, text=part))
-        cursor = end
-    return output or [segment]
+def _segments_are_near(left: Segment, right: Segment) -> bool:
+    gap = right.start - left.end
+    return gap <= 0.45 and gap >= -0.35
 
 
-def _sentence_parts(text: str) -> list[str]:
-    parts = [part.strip() for part in re.findall(r"[^.!?]+[.!?]*", text) if part.strip()]
-    if len(parts) <= 1:
-        return [text.strip()]
-    return parts
+def _starts_with_same_words(text: str, prefix: str) -> bool:
+    left = re.findall(r"[\wÀ-ÿ]+|[\u3400-\u9fff]", text.lower(), flags=re.UNICODE)
+    right = re.findall(r"[\wÀ-ÿ]+|[\u3400-\u9fff]", prefix.lower(), flags=re.UNICODE)
+    return bool(right) and len(left) >= len(right) and left[: len(right)] == right
+
+
+def _join_segment_text(left: str, right: str) -> str:
+    left, right = left.strip(), right.strip()
+    if not left:
+        return right
+    if not right:
+        return left
+    if right[0] in ",.;:!?，。！？、；：)]}」』”’":
+        return left + right
+    return f"{left} {right}"
 
 
 def _transcribe_attempts(device: str, compute_type: str) -> list[tuple[str, str, str]]:
@@ -369,11 +568,7 @@ def _transcribe_attempts(device: str, compute_type: str) -> list[tuple[str, str,
         requested_compute = "float16" if requested_device == "cuda" else "int8"
 
     if requested_device == "cuda":
-        attempts = [(requested_device, requested_compute, "Using CUDA for faster-whisper transcription.")]
-        if requested_compute not in {"float16", "int8_float16"}:
-            attempts.append(("cuda", "float16", "Retrying CUDA with compute_type=float16."))
-        attempts.append(("cpu", "int8", "Falling back to CPU transcription with compute_type=int8."))
-        return _dedupe_attempts(attempts)
+        return [(requested_device, requested_compute, "Using CUDA for faster-whisper transcription.")]
 
     if requested_device == "auto":
         return [

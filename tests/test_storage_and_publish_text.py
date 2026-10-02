@@ -9,7 +9,7 @@ from yblocalizer.publish_text import (
     save_custom_template,
     validate_template,
 )
-from yblocalizer.storage import delete_paths
+from yblocalizer.storage import delete_paths, resolve_task_title, scan_outputs
 from yblocalizer import db as job_db
 
 
@@ -27,6 +27,45 @@ def test_delete_paths_only_allows_output_root(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError, match="outside output directory"):
         delete_paths([outside], allowed)
     assert outside.exists()
+
+
+def test_delete_paths_rejects_output_root_itself(tmp_path: Path) -> None:
+    allowed = tmp_path / "outputs"
+    allowed.mkdir()
+    with pytest.raises(RuntimeError):
+        delete_paths([allowed], allowed)
+
+
+def test_resolve_task_title_prefers_publish_then_manifest(tmp_path: Path) -> None:
+    task = tmp_path / "abcdef123456"
+    task.mkdir()
+    assert resolve_task_title(task) == "abcdef123456"
+
+    (task / "job_manifest.json").write_text(
+        '{"options": {"title": "Source Title From Manifest"}}',
+        encoding="utf-8",
+    )
+    assert resolve_task_title(task) == "Source Title From Manifest"
+
+    (task / "publish_metadata.json").write_text(
+        '{"title": "中文投稿标题", "tags": ["标签"]}',
+        encoding="utf-8",
+    )
+    assert resolve_task_title(task) == "中文投稿标题"
+
+
+def test_scan_outputs_counts_nested_attempt_files_without_fake_tasks(tmp_path: Path) -> None:
+    task = tmp_path / "job-1"
+    task.mkdir()
+    attempt = task / ".attempt-extract-abc123"
+    attempt.mkdir()
+    (attempt / "segments.source.json").write_text("{}", encoding="utf-8")
+    (attempt / "audio.wav").write_bytes(b"audio")
+    tasks = scan_outputs(tmp_path)
+    assert len(tasks) == 1
+    assert tasks[0].path == task
+    assert tasks[0].size == 7
+    assert {item.path.name for item in tasks[0].files} == {"segments.source.json", "audio.wav"}
 
 
 def test_delete_job_history_records_does_not_touch_output_files(

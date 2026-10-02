@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from argparse import ArgumentParser, Namespace
 import os
+import hashlib
+import json
 from pathlib import Path
 import sys
 
@@ -11,14 +13,14 @@ except ImportError:  # pragma: no cover
     load_dotenv = None
 
 from .media import extract_audio
-from .download import download_with_ytdlp
+from .download import download_with_ytdlp, get_video_metadata
 from .pipeline import PipelineOptions, run_pipeline
 from .publish_bili import assist_publish
 from .publish_text import ensure_source_link
 from .render import burn_subtitles
 from .transcribe import transcribe_audio
 from .translate import translate_segments_file
-from .util import ensure_rights_confirmed, timestamp_id
+from .util import allocate_job_folder_name, ensure_rights_confirmed
 
 
 def main() -> None:
@@ -48,6 +50,7 @@ def build_parser() -> ArgumentParser:
     download.add_argument("--cookies-from-browser", choices=["chrome", "edge", "firefox", "brave", "chromium"], help="Use browser cookies for YouTube bot/login checks")
     download.add_argument("--resource-profile", default="balanced", choices=["background", "balanced", "maximum"], help="Limit bandwidth/CPU so the desktop stays responsive")
     download.add_argument("--i-have-rights", action="store_true", help="Confirm you have the rights/license to process this video")
+    download.add_argument("--quality-proposal-fingerprint", help="Explicitly confirm the server quality proposal (required in non-interactive shells)")
     download.set_defaults(func=cmd_download)
 
     transcribe = subparsers.add_parser("transcribe", help="Extract audio and transcribe it with faster-whisper")
@@ -63,7 +66,7 @@ def build_parser() -> ArgumentParser:
 
     translate = subparsers.add_parser("translate", help="Translate a segments JSON file and write SRT")
     translate.add_argument("--segments", required=True)
-    translate.add_argument("--translator", default="none", choices=["none", "openai", "deepseek"])
+    translate.add_argument("--translator", default="none", choices=["none", "openai", "deepseek", "ollama"])
     translate.add_argument("--target-lang", default="zh-Hans")
     translate.add_argument("--model", default=None, help="Translator model. Defaults depend on provider.")
     translate.add_argument("--batch-size", type=int, default=25)
@@ -116,6 +119,7 @@ def build_parser() -> ArgumentParser:
     process.add_argument("--require-reuse-allowed", action="store_true", help="Require YouTube metadata to say reuse is allowed")
     process.add_argument("--cookies-from-browser", choices=["chrome", "edge", "firefox", "brave", "chromium"], help="Use browser cookies for YouTube bot/login checks")
     process.add_argument("--i-have-rights", action="store_true", help="Confirm you have the rights/license to process this video")
+    process.add_argument("--quality-proposal-fingerprint", help="Explicitly confirm the server quality proposal (required in non-interactive shells)")
     process.add_argument(
         "--subtitle-source",
         default="audio",
@@ -129,7 +133,7 @@ def build_parser() -> ArgumentParser:
     process.add_argument("--ocr-language", default="eng", help="Tesseract language code, for example eng, chi_sim, or eng+chi_sim")
     process.add_argument("--device", default="cpu")
     process.add_argument("--compute-type", default="int8")
-    process.add_argument("--translator", default="none", choices=["none", "openai", "deepseek"])
+    process.add_argument("--translator", default="none", choices=["none", "openai", "deepseek", "ollama"])
     process.add_argument("--target-lang", default="zh-Hans")
     process.add_argument("--translate-model", default=None, help="Translator model. Defaults depend on provider.")
     process.add_argument("--batch-size", type=int, default=40)
@@ -159,9 +163,41 @@ def build_parser() -> ArgumentParser:
     return parser
 
 
+def _cli_quality_fingerprint(url: str, quality: str, max_seconds: int | None, proposal: dict) -> str:
+    payload = {
+        "source": url, "quality": quality, "max_seconds": max_seconds,
+        "proposal": {key: proposal.get(key) for key in ("width", "height", "has_audio")},
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+def _confirm_cli_quality(url: str, quality: str, max_seconds: int | None, supplied: str | None, *, cookies_from_browser: str | None = None, cookies_file: str | None = None, proxy: str | None = None) -> dict:
+    metadata = get_video_metadata(url, cookies_from_browser=cookies_from_browser, cookies_file=cookies_file, proxy=proxy, download_quality=quality)
+    proposal = metadata.quality_proposal or {}
+    if not proposal.get("width") or not proposal.get("height"):
+        raise RuntimeError("服务器无法确定可下载的视频流，请重新准备或检查链接。")
+    fingerprint = _cli_quality_fingerprint(url, quality, max_seconds, proposal)
+    if proposal.get("requires_consent") is not True:
+        return {**proposal, "fingerprint": fingerprint}
+    if supplied:
+        if supplied != fingerprint:
+            raise RuntimeError("画质 proposal fingerprint 不匹配；请重新准备并复制最新 fingerprint。")
+    elif not sys.stdin.isatty():
+        raise RuntimeError(f"非交互 CLI 必须显式确认画质方案：--quality-proposal-fingerprint {fingerprint}")
+    elif input(f"确认下载 {quality} proposal {proposal.get('width')}×{proposal.get('height')}？[y/N] ").strip().lower() not in {"y", "yes"}:
+        raise RuntimeError("用户未确认下载画质方案。")
+    return {**proposal, "fingerprint": fingerprint}
+
+
 def cmd_download(args: Namespace) -> None:
     ensure_rights_confirmed(args.i_have_rights)
-    work_dir = Path(args.output_dir) / timestamp_id()
+    proposal = _confirm_cli_quality(args.url, args.quality, args.max_seconds, args.quality_proposal_fingerprint, cookies_from_browser=args.cookies_from_browser)
+    output_root = Path(args.output_dir)
+    work_dir = output_root / allocate_job_folder_name(
+        output_root,
+        title=args.title,
+        source_url=args.url,
+    )
     job = download_with_ytdlp(
         args.url,
         work_dir=work_dir,
@@ -171,6 +207,7 @@ def cmd_download(args: Namespace) -> None:
         cookies_from_browser=args.cookies_from_browser,
         download_quality=args.quality,
         resource_profile=args.resource_profile,
+        quality_proposal=proposal,
     )
     print(f"Downloaded: {job.raw_video}")
 
@@ -259,6 +296,7 @@ def cmd_process(args: Namespace) -> None:
     source = args.url or args.file
     if not source:
         raise RuntimeError("No source was provided.")
+    proposal = _confirm_cli_quality(source, args.download_quality, args.max_seconds, args.quality_proposal_fingerprint, cookies_from_browser=args.cookies_from_browser) if args.url else None
     run_pipeline(
         PipelineOptions(
             source=source,
@@ -271,6 +309,7 @@ def cmd_process(args: Namespace) -> None:
             require_reuse_allowed=args.require_reuse_allowed,
             cookies_from_browser=args.cookies_from_browser,
             download_quality=args.download_quality,
+            quality_proposal=proposal,
             max_seconds=args.max_seconds,
             subtitle_source=args.subtitle_source,
             prefer_platform_subtitles=not args.no_platform_subtitles,

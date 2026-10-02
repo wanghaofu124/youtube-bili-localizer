@@ -39,7 +39,11 @@ def main(argv: list[str] | None = None) -> int:
             log=log,
         )
     except Exception as exc:
-        result_path.write_text(json.dumps({"status": "failed", "error": str(exc)}, ensure_ascii=False), encoding="utf-8")
+        result_path.write_text(json.dumps({
+            "status": "failed",
+            "error": str(exc),
+            "error_code": getattr(exc, "code", None),
+        }, ensure_ascii=False), encoding="utf-8")
         return 1
     result_path.write_text(json.dumps({"status": "completed"}, ensure_ascii=False), encoding="utf-8")
     return 0

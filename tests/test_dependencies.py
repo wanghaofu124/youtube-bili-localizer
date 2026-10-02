@@ -13,6 +13,7 @@ from yblocalizer.dependencies import (
     dependency_statuses,
     _cached_package_matches,
     clear_dependency_cache,
+    ollama_local_status,
     resolve_whisper_model,
 )
 
@@ -50,6 +51,69 @@ def test_managed_whisper_model_is_used_only_after_validation(tmp_path: Path) -> 
     for name in ("model.bin", "config.json", "tokenizer.json"):
         (model / name).write_bytes(b"ok")
     assert resolve_whisper_model("small", tmp_path) == str(model)
+
+
+def test_dependency_snapshot_detects_new_whisper_model_without_recreating_manager(tmp_path: Path) -> None:
+    manager = DependencyManager(tmp_path)
+    assert next(item for item in manager.snapshot()["dependencies"] if item["id"] == "whisper-large-v3")["available"] is False
+
+    model = tmp_path / "models" / "faster-whisper-large-v3"
+    model.mkdir(parents=True)
+    for name in ("model.bin", "config.json", "tokenizer.json"):
+        (model / name).write_bytes(b"model")
+
+    assert next(item for item in manager.snapshot()["dependencies"] if item["id"] == "whisper-large-v3")["available"] is True
+
+
+def test_ollama_probe_matches_exact_local_model_tags(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_json(path: str, *, timeout: float = 2.0):
+        if path == "/api/version":
+            return {"version": "test"}
+        return {"models": [{"name": "qwen3.5:4b"}, {"name": "qwen3.5:4b-custom"}, {"name": "qwen3.5:9b"}]}
+
+    monkeypatch.setattr("yblocalizer.dependencies.resolve_command", lambda name, tools_root=None: None)
+    monkeypatch.setattr("yblocalizer.dependencies._ollama_json", fake_json)
+    status = ollama_local_status()
+    assert status["runtime_available"] is True
+    assert status["models"] == {
+        "ollama-qwen35-4b": True,
+        "ollama-qwen35-9b": True,
+        "ollama-translategemma-12b": False,
+    }
+
+
+def test_ollama_model_dependency_waits_for_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("yblocalizer.dependencies.resolve_command", lambda name, tools_root=None: None)
+    monkeypatch.setattr("yblocalizer.dependencies.webview2_available", lambda: True)
+    monkeypatch.setattr("yblocalizer.dependencies._playwright_available", lambda: False)
+    monkeypatch.setattr("yblocalizer.dependencies.ollama_local_status", lambda: {
+        "runtime_state": "stopped", "runtime_available": False,
+        "runtime_message": "start Ollama", "models": {
+            "ollama-qwen35-4b": False, "ollama-qwen35-9b": False,
+            "ollama-translategemma-12b": False,
+        },
+    })
+    dependency_rows = dependency_statuses(tmp_path)
+    runtime = next(item for item in dependency_rows if item["id"] == "ollama-runtime")
+    model = next(item for item in dependency_rows if item["id"] == "ollama-qwen35-4b")
+    assert runtime["state"] == "stopped" and not runtime["installable"]
+    assert model["state"] == "blocked" and not model["installable"]
+    assert model["depends_on"] == "ollama-runtime"
+
+
+def test_ollama_model_download_uses_only_registered_tag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    manager = DependencyManager(tmp_path)
+    job = InstallJob("pull", "ollama-qwen35-4b")
+    monkeypatch.setattr("yblocalizer.dependencies.ollama_local_status", lambda: {"runtime_available": True})
+    monkeypatch.setattr("yblocalizer.dependencies.resolve_command", lambda name, tools_root=None: Path("ollama.exe"))
+    commands: list[list[str]] = []
+    monkeypatch.setattr(manager, "_stream_command", lambda current, command, env=None: commands.append(command))
+    manager._install_ollama_model(job, "qwen3.5:4b")
+    assert commands == [["ollama.exe", "pull", "qwen3.5:4b"]]
+    manager._install_ollama_model(InstallJob("pull-gemma", "ollama-translategemma-12b"), "translategemma:12b")
+    assert commands[-1] == ["ollama.exe", "pull", "translategemma:12b"]
+    with pytest.raises(RuntimeError, match="不允许下载"):
+        manager._install_ollama_model(job, "untrusted/model:latest")
 
 
 def test_dependency_install_requires_confirmation(tmp_path: Path) -> None:
