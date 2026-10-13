@@ -5,7 +5,7 @@
 ## Windows 0.2.55 下载（推荐）
 
 - [安装包（YouTubeBiliLocalizer-v0.2.55-setup.exe）](https://github.com/wanghaofu124/youtube-bili-localizer/releases/download/v0.2.55/YouTubeBiliLocalizer-v0.2.55-setup.exe)：普通用户双击安装，推荐首次使用。
-- [便携版（YouTubeBiliLocalizer-v0.2.55-windows-x64.zip）](https://github.com/wanghaofu124/youtube-bili-localizer/releases/download/v0.2.55/YouTubeBiliLocalizer-v0.2.55-windows-x64.zip)：解压后直接运行，不写入安装目录外的程序文件。
+- [便携版（YouTubeBiliLocalizer-v0.2.55-windows-x64.zip）](https://github.com/wanghaofu124/youtube-bili-localizer/releases/download/v0.2.55/YouTubeBiliLocalizer-v0.2.55-windows-x64.zip)：解压后运行文件夹内的 `YouTubeBiliLocalizer.exe`。
 - [发布页与校验文件](https://github.com/wanghaofu124/youtube-bili-localizer/releases/tag/v0.2.55)：Windows x64。桌面窗口需要 WebView2；默认音频流程需要 FFmpeg/ffprobe 和所选 Whisper 模型，依赖中心可按需安装或下载；Ollama、CUDA、OCR、Node.js 和翻译模型按所选流程启用。
 
 0.2.52 起，任务检查器提供按环节的翻译费用小表，任务库显示累计估算金额。包含校对、断句、翻译、复审、精简和手工重译；重试的已知用量计入，未返回用量的请求标为待核对。缓存复用不产生新 API 费用。累计从该版本开始记录，旧任务过去未记录的费用不补算。
