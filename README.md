@@ -2,6 +2,12 @@
 
 面向**已获授权视频**的 Python 本地化工具：将本地文件或授权 URL 转为中文字幕硬字幕视频，并在人工确认前辅助填写 B 站投稿信息。
 
+## Windows 0.2.55 下载（推荐）
+
+- [安装包（YouTubeBiliLocalizer-v0.2.55-setup.exe）](https://github.com/wanghaofu124/youtube-bili-localizer/releases/download/v0.2.55/YouTubeBiliLocalizer-v0.2.55-setup.exe)：普通用户双击安装，推荐首次使用。
+- [便携版（YouTubeBiliLocalizer-v0.2.55-windows-x64.zip）](https://github.com/wanghaofu124/youtube-bili-localizer/releases/download/v0.2.55/YouTubeBiliLocalizer-v0.2.55-windows-x64.zip)：解压后直接运行，不写入安装目录外的程序文件。
+- [发布页与校验文件](https://github.com/wanghaofu124/youtube-bili-localizer/releases/tag/v0.2.55)：Windows x64。桌面窗口需要 WebView2；默认音频流程需要 FFmpeg/ffprobe 和所选 Whisper 模型，依赖中心可按需安装或下载；Ollama、CUDA、OCR、Node.js 和翻译模型按所选流程启用。
+
 0.2.52 起，任务检查器提供按环节的翻译费用小表，任务库显示累计估算金额。包含校对、断句、翻译、复审、精简和手工重译；重试的已知用量计入，未返回用量的请求标为待核对。缓存复用不产生新 API 费用。累计从该版本开始记录，旧任务过去未记录的费用不补算。
 
 官方 DeepSeek 精确模型（`deepseek-flash`、`deepseek-v4-flash`、`deepseek-v4-flash-vision-exp`、`deepseek-v4-pro`）在 `https://api.deepseek.com` 下自动使用 2026-10-11 的人民币价格预设。按请求开始时的缓存输入、普通输入和输出分别估算，不重复计算思考 Token；缓存拆分缺失时显示区间。价格来源为 [DeepSeek 官方定价](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)，2026 节假日依据[国务院通知](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm)。未知年份的工作日峰时采用峰谷区间。第三方网关、未知模型和未返回用量显示待核对，不估算为零。高级设置可填写三项自定义人民币单价，服务、接口 origin、模型必须全部匹配；价格在调用时冻结，改价不追溯重算历史，也不使字幕缓存失效。估算值不代表实际扣费，最终以服务商账单为准。
