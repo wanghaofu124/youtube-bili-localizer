@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -57,7 +58,12 @@ def test_pipeline_happy_path_with_mocked_integrations(monkeypatch: pytest.Monkey
     result = run_pipeline(PipelineOptions(source=str(raw_video), source_kind="file", output_dir=tmp_path / "outputs", title="demo", i_have_rights=True, translator="deepseek"))
     assert result.rendered_video.read_bytes() == b"rendered"
     assert result.translated_srt.read_text(encoding="utf-8").endswith("你好世界\n")
-    assert (result.work_dir / "publish_metadata.json").is_file()
+    metadata_files = list(result.work_dir.glob(".attempt-translate-*/publish_metadata.json"))
+    assert len(metadata_files) == 1
+    assert json.loads(metadata_files[0].read_text(encoding="utf-8")) == {
+        "title": "测试标题",
+        "tags": ["测试"],
+    }
 
 
 def test_translator_still_generates_publish_metadata_when_pipeline_publish_is_off(

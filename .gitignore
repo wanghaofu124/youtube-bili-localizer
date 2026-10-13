@@ -7,6 +7,9 @@ __pycache__/
 .pytest_cache/
 .playwright/
 .acceptance/
+.debug-out/
+.inspect/
+.inspect-latest/
 build/
 dist/
 .release-build/

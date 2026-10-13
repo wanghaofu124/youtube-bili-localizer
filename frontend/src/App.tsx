@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { publishStageButton, sameTaskOption, stageAvailability, workflowPrimaryLabel } from "./workflowState";
 import { retainVisibleVideoLibrarySelection, selectableVideoLibraryIds, videoLibraryCategory, videoLibraryMatches, type VideoLibraryCategory } from "./videoLibrary";
+import { cueNeedsReview, replaceLiteral } from "./subtitleEditor";
 
 type View = "material" | "library" | "process" | "subtitle" | "publish" | "files";
 type WorkflowStageName = "acquire" | "extract" | "translate" | "render" | "publish";
@@ -47,6 +48,76 @@ type Cue = {
   translated: string;
   deleted?: boolean;
   kind?: string;
+  issues?: string[];
+  needs_review?: boolean;
+  candidate_id?: string;
+  confirmed_weak?: boolean;
+  confirmed_source_edit?: boolean;
+  translation_source?: string;
+  source_stale?: boolean;
+};
+type VoiceReview = {
+  status: "unavailable" | "pending" | "running" | "paused" | "completed" | "failed";
+  channel?: "mix" | "left" | "right";
+  baseline_kind?: string;
+  candidates: Array<{ id: string; start: number; end: number; status: string; accepted_words?: number }>;
+  remaining: number;
+  recovered_words?: Array<{ candidate_id?: string; text?: string; weak?: boolean; adoptable?: boolean }>;
+  actual_decode_seconds: number;
+  error?: string | null;
+  windows?: Array<{ id: string; start: number; end: number; status?: string }>;
+  result_candidates?: Array<{ id: string; window_id: string; start: number; end: number; tier: "strong" | "weak" | "diagnostic"; adoptable?: boolean; words?: Array<{ text?: string; start?: number; end?: number }>; status?: string; confirmed_weak?: boolean }>;
+  diagnostics?: Array<Record<string, unknown>>;
+  resource_profile?: "background" | "balanced" | "maximum";
+  cpu_threads?: number;
+};
+type CueBaseMeta = { revision: number; base_fingerprint: string; base_ids: number[] };
+type DraftSnapshot = { cues: Cue[] };
+type TranslationCandidate = { cueId: number; source: string; originalTranslation: string; translation: string; provider: string; model: string };
+type CompactionCandidate = { cue_id: number; original: string; candidate: string; error?: string | null; still_overflowing: boolean };
+const cueIssueLabels: Record<string, string> = {
+  "layout-overflow": "超出画面",
+  "dense-text": "字数偏多",
+  "reading-speed": "阅读偏快",
+  "short-duration": "时长过短",
+  "invalid-time": "时间异常",
+  overlap: "字幕重叠",
+  "empty-source": "原文为空",
+  "empty-translation": "译文为空",
+};
+type LlmCost = {
+  status: "no_requests" | "estimated" | "range" | "partial" | "unknown";
+  min_cny: string;
+  max_cny: string;
+  priced_calls: number;
+  unpriced_calls: number;
+  incomplete_calls: number;
+  usage_unknown_requests: number;
+  request_count_unknown_calls: number;
+  pricing_sources: string[];
+};
+type LlmUsage = {
+  schema_version: number;
+  scope?: string;
+  logical_calls: number;
+  http_requests: number;
+  sdk_retry_requests: number;
+  thinking_fallback_requests: number;
+  failed_calls: number;
+  calls_without_usage: number;
+  duration_ms_total: number;
+  cache_reused_items: number;
+  split_events: number;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  total_tokens: number | null;
+  prompt_cache_hit_tokens: number | null;
+  reasoning_tokens: number | null;
+  cost?: LlmCost;
+  recorded_since?: number;
+  session_count?: number;
+  token_field_calls: Record<string, number>;
+  by_kind: Record<string, LlmUsage>;
 };
 type Job = {
   id: string;
@@ -93,6 +164,8 @@ type Job = {
   content_warnings?: string[];
   quality_proposal?: { width: number | null; height: number | null; baseline_width?: number | null; baseline_height?: number | null; quality: string; requires_consent?: boolean; fingerprint?: string } | null;
   quality_consent?: boolean;
+  llm_usage?: LlmUsage | null;
+  llm_usage_total?: LlmUsage | null;
 };
 type Options = {
   title: string;
@@ -107,6 +180,7 @@ type Options = {
   prefer_platform_subtitles: boolean;
   whisper_model_size: string;
   source_language: string;
+  audio_channel: "mix" | "left" | "right";
   beam_size: number;
   ocr_interval: number;
   ocr_crop_ratio: number;
@@ -119,6 +193,9 @@ type Options = {
   translator: string;
   target_lang: string;
   translate_model: string;
+  deepseek_thinking: "disabled" | "enabled" | "auto";
+  llm_pricing_mode: "auto" | "custom" | "off";
+  llm_custom_pricing: Record<string, string>;
   smart_translation: boolean;
   smart_subtitle_layout: boolean;
   font_name: string;
@@ -183,6 +260,7 @@ type HistoryJob = {
   rendered_exists: boolean;
   created_at: number | null;
   finished_at: number | null;
+  llm_usage_total?: LlmUsage | null;
 };
 type RestorableJob = {
   id: string;
@@ -239,6 +317,7 @@ type Dependency = Diagnostic & {
   state?: "ready" | "missing" | "stopped" | "blocked" | "unavailable";
   action_label?: string | null;
   depends_on?: string | null;
+  installer_available?: boolean;
 };
 type DependencyInstallJob = {
   id: string;
@@ -252,6 +331,10 @@ type DependencyInstallJob = {
   cancel_requested: boolean;
 };
 
+const sourceLanguageOptions = [
+  ["en", "英语（en）"], ["zh", "中文（zh）"], ["ja", "日语（ja）"], ["ko", "韩语（ko）"],
+  ["fr", "法语（fr）"], ["de", "德语（de）"], ["es", "西班牙语（es）"], ["ru", "俄语（ru）"],
+] as const;
 const defaults: Options = {
   title: "",
   require_reuse_allowed: false,
@@ -265,6 +348,7 @@ const defaults: Options = {
   prefer_platform_subtitles: true,
   whisper_model_size: "small",
   source_language: "",
+  audio_channel: "mix",
   beam_size: 5,
   ocr_interval: 0.5,
   ocr_crop_ratio: 0.3,
@@ -277,6 +361,9 @@ const defaults: Options = {
   translator: "deepseek",
   target_lang: "zh-Hans",
   translate_model: "",
+  deepseek_thinking: "disabled",
+  llm_pricing_mode: "auto",
+  llm_custom_pricing: {},
   smart_translation: true,
   smart_subtitle_layout: true,
   font_name: "Microsoft YaHei",
@@ -287,27 +374,67 @@ const defaults: Options = {
   subtitle_effect: "描边",
   output_dir: "outputs/workbench_demo",
 };
-const nav: Array<[View, string, string]> = [
-  ["material", "素材", "链接、本地视频与授权"],
-  ["library", "任务库", "待处理、可继续与成片"],
-  ["process", "处理", "识别、翻译与推理"],
-  ["subtitle", "字幕", "预览、编辑与渲染"],
-  ["publish", "发布", "B 站投稿辅助"],
-  ["files", "文件", "输出与空间管理"],
+type NavIconName = "material" | "library" | "process" | "subtitle" | "publish" | "files" | "save" | "link" | "rerender" | "download" | "voice" | "translate" | "render" | "upload" | "check" | "running" | "error" | "pause" | "ear" | "speed" | "text" | "video" | "subtitle-file" | "audio" | "cover" | "file";
+const nav: Array<[View, string, string, NavIconName]> = [
+  ["material", "素材", "链接、本地视频与授权", "material"],
+  ["library", "任务库", "待处理、可继续与成片", "library"],
+  ["process", "处理", "识别、翻译与推理", "process"],
+  ["subtitle", "字幕", "预览、编辑与渲染", "subtitle"],
+  ["publish", "发布", "B 站与抖音投稿辅助", "publish"],
+  ["files", "文件", "输出与空间管理", "files"],
 ];
+function NavIcon({ name, className = "nav-icon" }: { name: NavIconName; className?: string }) {
+  const paths: Record<NavIconName, ReactNode> = {
+    material: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="m9 4 1.5-2h3L15 4M8 11l3 3 2-2 3 3" /></>,
+    library: <><path d="M4 6.5h6l1.5 2H20v10.5H4z" /><path d="M4 6.5V5a2 2 0 0 1 2-2h4l1.5 2H20a2 2 0 0 1 2 2v1.5" /></>,
+    process: <><path d="M5 5h14M5 12h14M5 19h14" /><circle cx="9" cy="5" r="2" /><circle cx="15" cy="12" r="2" /><circle cx="11" cy="19" r="2" /></>,
+    subtitle: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M7 9h10M7 13h7M7 17h4" /></>,
+    publish: <><path d="M12 16V4M8 8l4-4 4 4" /><path d="M5 13v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5" /></>,
+    files: <><path d="M3 6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" /><path d="M3 9h18" /></>,
+    save: <><path d="M5 3h12l3 3v15H4V3z" /><path d="M8 3v6h7V3M8 21v-7h8v7" /></>,
+    link: <><path d="m9 15 6-6" /><path d="m7 17-1 1a3 3 0 0 1-4-4l3-3a3 3 0 0 1 4 0" /><path d="m17 7 1-1a3 3 0 0 1 4 4l-3 3a3 3 0 0 1-4 0" /></>,
+    rerender: <><path d="M20 11a8 8 0 0 0-14-5L4 8" /><path d="M4 4v4h4M4 13a8 8 0 0 0 14 5l2-2" /><path d="M20 20v-4h-4" /></>,
+    download: <><path d="M12 3v12M7 10l5 5 5-5" /><path d="M4 20h16" /></>,
+    voice: <><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z" /><path d="M19 11a7 7 0 0 1-14 0M12 18v3M8 21h8" /></>,
+    translate: <><path d="M4 5h8M8 3v2M5 5c.5 4 2.5 7 6 9M11 5c-.6 2.4-1.8 4.2-3.4 5.8M14 12h6M17 9l-4 12M15 17h5" /></>,
+    render: <><path d="M4 5h16v14H4z" /><path d="m10 9 5 3-5 3z" /></>,
+    upload: <><path d="M12 16V4M8 8l4-4 4 4" /><path d="M5 13v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5" /></>,
+    check: <path d="m5 12 4 4L19 6" />,
+    running: <><path d="M4 12h3M10 12h4M17 12h3" /><circle cx="8" cy="12" r="1" /><circle cx="16" cy="12" r="1" /></>,
+    error: <><circle cx="12" cy="12" r="9" /><path d="M12 7v6M12 16v1" /></>,
+    pause: <><path d="M8 5v14M16 5v14" /></>,
+    ear: <><path d="M18 13c0 3-3 3-3 6M15 19c0 1-1 2-2 2" /><path d="M7 10a5 5 0 1 1 9 3c-1 1-3 1-3 4" /><path d="M7 10V8a5 5 0 0 1 10-1" /></>,
+    speed: <><path d="M4 16a8 8 0 1 1 16 0" /><path d="m12 12 4-3M6 19h12" /></>,
+    text: <><rect x="4" y="3" width="16" height="18" rx="2" /><path d="M8 8h8M8 12h8M8 16h5" /></>,
+    video: <><rect x="3" y="5" width="14" height="14" rx="2" /><path d="m17 10 4-2v8l-4-2z" /></>,
+    "subtitle-file": <><rect x="4" y="3" width="16" height="18" rx="2" /><path d="M7 10h10M7 14h7" /></>,
+    audio: <><path d="M5 9v6M9 6v12M13 3v18M17 7v10M21 10v4" /></>,
+    cover: <><rect x="3" y="4" width="18" height="16" rx="2" /><circle cx="8" cy="9" r="1" /><path d="m4 17 5-5 3 3 2-2 6 5" /></>,
+    file: <><path d="M6 3h8l4 4v14H6z" /><path d="M14 3v5h5M9 13h6M9 17h6" /></>,
+  };
+  return <svg className={className} aria-hidden="true" focusable="false" viewBox="0 0 24 24">{paths[name]}</svg>;
+}
 const timecode = (seconds: number, precise = false) => {
-  const safe = precise ? Math.round(Math.max(0, seconds) * 10) / 10 : Math.floor(Math.max(0, seconds));
-  const hours = Math.floor(safe / 3600);
-  const minutes = Math.floor((safe % 3600) / 60);
-  const wholeSeconds = Math.floor(safe % 60);
+  const safe = precise
+    ? Math.round(Math.max(0, seconds) * 10) / 10
+    : Math.floor(Math.max(0, seconds));
+  const totalMinutes = Math.floor(safe / 60);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  const rest = safe - totalMinutes * 60;
+  const wholeSeconds = Math.floor(rest);
   const base = hours
     ? `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`
     : String(minutes).padStart(2, "0");
-  return `${base}:${precise ? (safe % 60).toFixed(1).padStart(4, "0") : String(wholeSeconds).padStart(2, "0")}`;
+  return `${base}:${precise ? rest.toFixed(1).padStart(4, "0") : String(wholeSeconds).padStart(2, "0")}`;
 };
 
 const parseTime = (value: string): number | null => {
-  const parts = value.trim().split(":").map((item) => Number(item));
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const rawParts = trimmed.split(":");
+  if (rawParts.some((item) => !item.trim())) return null;
+  const parts = rawParts.map((item) => Number(item));
   if (!parts.length || parts.some((item) => Number.isNaN(item))) return null;
   let seconds = 0;
   if (parts.length === 3) seconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
@@ -316,9 +443,9 @@ const parseTime = (value: string): number | null => {
   return seconds >= 0 && Number.isFinite(seconds) ? seconds : null;
 };
 const formatTime = (seconds: number) => {
-  const value = Math.max(0, seconds);
+  const value = Math.round(Math.max(0, seconds) * 10) / 10;
   const minutes = Math.floor(value / 60);
-  const rest = value % 60;
+  const rest = value - minutes * 60;
   return `${String(minutes).padStart(2, "0")}:${rest.toFixed(1).padStart(4, "0")}`;
 };
 
@@ -450,6 +577,14 @@ const stageStatusLabel: Record<string, string> = {
   pending: "待执行", ready: "可执行", running: "运行中", completed: "已完成",
   failed: "失败", cancelled: "已取消", stale: "需重做", interrupted: "意外中断",
 };
+const fileIconName = (kind: string, name = ""): NavIconName => {
+  const value = `${kind} ${name}`.toLowerCase();
+  if (value.includes("视频") || /\.(mp4|mkv|webm|mov)$/i.test(name)) return "video";
+  if (value.includes("字幕") || /\.(srt|ass|vtt)$/i.test(name)) return "subtitle-file";
+  if (value.includes("音频") || /\.(wav|mp3|m4a|aac)$/i.test(name)) return "audio";
+  if (value.includes("预览") || value.includes("封面") || /\.(png|jpe?g|webp)$/i.test(name)) return "cover";
+  return "file";
+};
 
 function FieldGuide({ summary, detail, badges = [] }: { summary: string; detail: string; badges?: string[] }) {
   return <span className="field-guide"><small>{summary}</small><span className="guide-badges">{badges.map((badge) => <i key={badge}>{badge}</i>)}</span><details><summary>？ 选择建议与影响</summary><p>{detail}</p></details></span>;
@@ -528,10 +663,84 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   return payload;
 }
 
+function DeepseekThinkingChoice({ mode, model, onChange }: { mode: Options["deepseek_thinking"]; model: string; onChange: (mode: Options["deepseek_thinking"]) => void }) {
+  const reasoner = model.toLowerCase().split(/[/:]/).pop() === "deepseek-reasoner";
+  return <label>
+    翻译速度
+    <select value={mode} onChange={(event) => onChange(event.target.value as Options["deepseek_thinking"])}>
+      <option value="disabled">快速（默认）</option>
+      <option value="enabled">保留思考</option>
+      <option value="auto">接口默认</option>
+    </select>
+    <small className="drawer-note">{reasoner ? "deepseek-reasoner 会保留思考。" : "快速模式关闭额外思考；效果有差异时可切回。"} 已完成批次继续复用，只影响新请求。兼容接口不支持时沿用其默认模式。</small>
+  </label>;
+}
+
+function costLabel(usage: LlmUsage | null | undefined): string {
+  const cost = usage?.cost;
+  if (!cost) return "暂无费用记录";
+  if (cost.status === "unknown") return "待核对";
+  const money = (text: string) => {
+    const value = Number(text);
+    return value > 0 && value < 0.0001 ? "<¥0.0001" : `¥${value.toFixed(4).replace(/0+$/, "").replace(/\.$/, "")}`;
+  };
+  const amount = cost.min_cny === cost.max_cny ? money(cost.min_cny) : `${money(cost.min_cny)}–${money(cost.max_cny)}`;
+  return cost.status === "partial" ? `已知 ${amount}，部分待核对` : amount;
+}
+
+function LlmPricingChoice({ options, onChange }: { options: Options; onChange: (key: "llm_pricing_mode" | "llm_custom_pricing", value: Options["llm_pricing_mode"] | Record<string, string>) => void }) {
+  const custom = options.llm_custom_pricing ?? {};
+  const change = (key: string, value: string) => onChange("llm_custom_pricing", { ...custom, [key]: value });
+  return <details className="llm-pricing-settings">
+    <summary>费用估算设置</summary>
+    <p>官方 DS 使用内置人民币单价；其他接口可填写账单单价。仅影响之后的请求。</p>
+    <label>计价方式<select value={options.llm_pricing_mode ?? "auto"} onChange={(event) => onChange("llm_pricing_mode", event.target.value as Options["llm_pricing_mode"])}>
+      <option value="auto">自动识别官方价格</option><option value="custom">填写自定义单价</option><option value="off">只记录用量</option>
+    </select></label>
+    {options.llm_pricing_mode === "custom" && <>
+      <label>服务<select value={custom.provider ?? ""} onChange={(event) => change("provider", event.target.value)}><option value="">请选择</option><option value="deepseek">DeepSeek / 兼容接口</option><option value="openai">OpenAI</option></select></label>
+      <label>接口地址<input value={custom.endpoint_origin ?? ""} placeholder="https://api.deepseek.com" onChange={(event) => change("endpoint_origin", event.target.value)} /></label>
+      <label>计价模型<input value={custom.model ?? ""} placeholder="填写准确模型名（包括默认模型）" maxLength={128} onChange={(event) => change("model", event.target.value)} /></label>
+      {[["cache_hit_input_cny_per_million", "缓存输入"], ["cache_miss_input_cny_per_million", "普通输入"], ["output_cny_per_million", "输出"]].map(([key, label]) => <label key={key}>{label} · 元 / 百万 Token<input type="number" min="0" max="1000000" step="any" value={custom[key] ?? ""} onChange={(event) => change(key, event.target.value)} /></label>)}
+      <small>服务、接口和模型完全匹配才会采用这些价格；不另算思考 Token。</small>
+    </>}
+  </details>;
+}
+
+function LlmUsagePanel({ usage, total }: { usage?: LlmUsage | null; total?: LlmUsage | null }) {
+  const count = (row: LlmUsage) => row.total_tokens == null ? "未返回" : `${row.total_tokens.toLocaleString()}${(row.token_field_calls.total_tokens ?? 0) < row.logical_calls ? "+" : ""}`;
+  const kinds: Record<string, string> = { source_correction: "源文校对", translation: "字幕翻译", review: "译文复审", formatting: "字幕精简", metadata: "标题标签", segmentation: "语义断句", single_translation: "单条重译" };
+  const seconds = Math.round((usage?.duration_ms_total ?? 0) / 1000);
+  const summary = total ?? usage;
+  const unknown = summary?.cost;
+  const row = (label: string, value: LlmUsage, key: string, className = "") => <tr key={key} className={className}><th scope="row">{label}</th><td>{value.http_requests}{value.cost?.request_count_unknown_calls ? "+?" : ""}</td><td>{count(value)}</td><td>{costLabel(value)}</td></tr>;
+  return <section className="llm-usage" aria-label="翻译费用">
+    <b>翻译费用 · 人民币估算</b>
+    <div className="llm-cost-table"><table><thead><tr><th>环节</th><th>请求</th><th>Token</th><th>估算费用</th></tr></thead><tbody>
+      {usage && Object.entries(usage.by_kind).map(([kind, value]) => row(kinds[kind] ?? kind, value, kind))}
+      {usage && row("本轮", usage, "current", "llm-cost-total")}
+      {total && row("任务累计", total, "total", "llm-cost-total")}
+    </tbody></table></div>
+    {!usage && !total && <p>暂无费用记录。</p>}
+    <p>累计包含重试和单条重译；{total?.recorded_since ? `从 ${new Date(total.recorded_since * 1000).toLocaleDateString()} 开始记录。` : "旧任务未记录的费用无法补算。"}</p>
+    {unknown && (unknown.unpriced_calls > 0 || unknown.incomplete_calls > 0 || unknown.usage_unknown_requests > 0 || unknown.request_count_unknown_calls > 0) && <p>价格未匹配 {unknown.unpriced_calls} 次调用 · 用量不完整 {unknown.incomplete_calls} 次 · 另有 {unknown.usage_unknown_requests} 次请求未返回用量。待核对部分未计入金额。</p>}
+    <details><summary>用量与价格说明</summary>
+      <p>本轮重试 / 兼容回退 {usage?.sdk_retry_requests ?? 0} / {usage?.thinking_fallback_requests ?? 0} 次 · 复用 {usage?.cache_reused_items ?? 0} 条已有结果（不增加 API 费用）。</p>
+      <p>本轮调用累计 {Math.floor(seconds / 60)} 分 {seconds % 60} 秒；并行调用的耗时会累加。</p>
+      <p>官方 DS 内置单价更新于 2026-10-11，按请求开始时的缓存和峰谷价估算。未返回缓存拆分时显示费用区间。</p>
+      {unknown?.pricing_sources.includes("custom") && <p>部分调用使用你填写的自定义人民币单价。</p>}
+      <p>用量来自接口返回；估算金额不代表实际扣费，最终以服务商账单为准。</p>
+    </details>
+  </section>;
+}
+
 function App() {
   const fileInput = useRef<HTMLInputElement>(null);
   const publishFileInput = useRef<HTMLInputElement>(null);
   const video = useRef<HTMLVideoElement>(null);
+  const subtitlePlaybackEnd = useRef<number | null>(null);
+  const trimPlaybackEnd = useRef<number | null>(null);
+  const pendingPlayback = useRef<{ start: number; end: number; jobId: string; generation: number } | null>(null);
   const timelinePlayhead = useRef<HTMLDivElement>(null);
   const timelineCurrentTime = useRef<HTMLSpanElement>(null);
   const jobLogCursor = useRef(0);
@@ -561,13 +770,33 @@ function App() {
   jobRef.current = job;
   const selectedJobIdRef = useRef<string | null>(job?.id ?? null);
   const [cues, setCues] = useState<Cue[]>([]);
+  const [cueBaseMeta, setCueBaseMeta] = useState<CueBaseMeta | null>(null);
   const cueOwner = useRef<string | null>(null);
   const cueGeneration = useRef(0);
   const [cuesReady, setCuesReady] = useState(false);
-  const [history, setHistory] = useState<Cue[][]>([]);
-  const [future, setFuture] = useState<Cue[][]>([]);
+  const [voiceReview, setVoiceReview] = useState<VoiceReview | null>(null);
+  const [voiceReviewOpen, setVoiceReviewOpen] = useState(false);
+  const [voiceReviewBusy, setVoiceReviewBusy] = useState(false);
+  const [voiceCandidateText, setVoiceCandidateText] = useState<Record<string, string>>({});
+  const [voiceCandidateConfirmed, setVoiceCandidateConfirmed] = useState<Record<string, boolean>>({});
+  const [voiceTranslationBusy, setVoiceTranslationBusy] = useState<string | null>(null);
+  const [savingCues, setSavingCues] = useState(false);
+  const savingCuesRef = useRef(false);
+  const [history, setHistory] = useState<DraftSnapshot[]>([]);
+  const [future, setFuture] = useState<DraftSnapshot[]>([]);
   const [activeCue, setActiveCue] = useState<number | null>(null);
   const [selectedCue, setSelectedCue] = useState<number | null>(null);
+  const [cueFilter, setCueFilter] = useState<"all" | "review">("all");
+  const [bulkSelectedCueIds, setBulkSelectedCueIds] = useState<number[]>([]);
+  const [replaceField, setReplaceField] = useState<"source" | "translated">("translated");
+  const [replaceScope, setReplaceScope] = useState<"all" | "selected">("all");
+  const [replaceNeedle, setReplaceNeedle] = useState("");
+  const [replaceValue, setReplaceValue] = useState("");
+  const [replaceCaseSensitive, setReplaceCaseSensitive] = useState(false);
+  const [translationCandidate, setTranslationCandidate] = useState<TranslationCandidate | null>(null);
+  const [compactionCandidates, setCompactionCandidates] = useState<CompactionCandidate[]>([]);
+  const [retranslatingCueId, setRetranslatingCueId] = useState<number | null>(null);
+  const [compactingCues, setCompactingCues] = useState(false);
   const [preview, setPreview] = useState<"source" | "rendered">("source");
   const [mediaNonce, setMediaNonce] = useState(0);
   const [mediaDuration, setMediaDuration] = useState<number | null>(null);
@@ -577,6 +806,8 @@ function App() {
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
   const [dependenciesOpen, setDependenciesOpen] = useState(false);
   const [apiKey, setApiKey] = useState("");
+  const [savingSettings, setSavingSettings] = useState(false);
+  const savingSettingsRef = useRef(false);
   const [message, setMessage] = useState("正在连接本地服务…");
   const [metadata, setMetadata] = useState<{
     duration: number | null;
@@ -598,6 +829,9 @@ function App() {
   const [description, setDescription] = useState("");
   const [tags, setTags] = useState("");
   const [extraLine, setExtraLine] = useState("");
+  const [publishPlatform, setPublishPlatform] = useState<"bilibili" | "douyin">(
+    () => localStorage.getItem("ybl-publish-platform") === "douyin" ? "douyin" : "bilibili",
+  );
   const [publishBrowser, setPublishBrowser] = useState("chromium");
   const [closeAfterFill, setCloseAfterFill] = useState(false);
   const [publishInPipeline, setPublishInPipeline] = useState(false);
@@ -622,6 +856,7 @@ function App() {
   const [deleteBusy, setDeleteBusy] = useState(false);
   const [historyDeleteError, setHistoryDeleteError] = useState("");
   const [libraryBatchMode, setLibraryBatchMode] = useState(false);
+  const [expandedCostId, setExpandedCostId] = useState<string | null>(null);
   const [materialDraftToken, setMaterialDraftToken] = useState(0);
   const [selectedPublishVideo, setSelectedPublishVideo] = useState("");
   const [mode, setMode] = useState<"basic" | "advanced">(
@@ -656,7 +891,10 @@ function App() {
   const dependencySignature = useRef("");
   const dependencyAvailability = useRef<Record<string, boolean>>({});
   const autoPrepareEnvironmentKey = useRef("");
+  const ocrLanguageRef = useRef(options.ocr_language || "eng");
   const [dependencyJob, setDependencyJob] = useState<DependencyInstallJob | null>(null);
+  const [ollamaStartBusy, setOllamaStartBusy] = useState(false);
+  const [tesseractInstallerBusy, setTesseractInstallerBusy] = useState(false);
   const [translationReady, setTranslationReady] = useState(true);
   const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number } | null>(null);
   const [cutStart, setCutStart] = useState("");
@@ -687,6 +925,35 @@ function App() {
   const runningRef = useRef(running);
   runningRef.current = running;
   const dirty = history.length > 0;
+  const reviewCueCount = useMemo(() => cues.filter((cue) => cueNeedsReview(cue)).length, [cues]);
+  const visibleCueRows = useMemo(
+    () => cues.map((cue, index) => ({ cue, index })).filter(({ cue }) =>
+      cueFilter === "all" || cueNeedsReview(cue),
+    ),
+    [cues, cueFilter],
+  );
+  const selectedBulkCues = useMemo(
+    () => cues.filter((cue) => bulkSelectedCueIds.includes(cue.id) && !cue.deleted),
+    [cues, bulkSelectedCueIds],
+  );
+  const selectedReviewCues = useMemo(
+    () => selectedBulkCues.filter((cue) => cueNeedsReview(cue)),
+    [selectedBulkCues],
+  );
+  const replacePreviews = useMemo(() => {
+    if (!replaceNeedle) return [];
+    const selectedIds = new Set(bulkSelectedCueIds);
+    return cues.flatMap((cue) => {
+      if (cue.deleted || (replaceScope === "selected" && !selectedIds.has(cue.id))) return [];
+      const before = cue[replaceField];
+      const result = replaceLiteral(before, replaceNeedle, replaceValue, replaceCaseSensitive);
+      return result.count ? [{ cueId: cue.id, before, after: result.value, count: result.count }] : [];
+    });
+  }, [cues, replaceNeedle, replaceValue, replaceField, replaceScope, replaceCaseSensitive, bulkSelectedCueIds]);
+  const taskModelLabel = job
+    ? `${job.options.translator === "ollama" ? "Ollama 本地模型" : job.options.translator === "openai" ? "OpenAI" : job.options.translator === "deepseek" ? "DeepSeek" : "未配置翻译模型"} · ${job.options.translate_model || (["deepseek", "openai"].includes(job.options.translator) ? "服务默认模型" : job.options.translator === "ollama" ? "任务模型" : "无")}`
+    : "当前任务模型";
+  const taskModelIsOnline = job?.options.translator === "deepseek" || job?.options.translator === "openai";
   const publishVideoReady = Boolean(
     nativePublishToken || selectedPublishVideo || job?.result?.rendered_video || job?.artifacts?.rendered_video?.available,
   );
@@ -800,14 +1067,23 @@ function App() {
     setMaterials(
       (await api<{ materials: Material[] }>("/api/materials")).materials,
     );
-  const loadTemplates = async () => {
-    const templates = (await api<{ templates: Template[] }>("/api/templates"))
-      .templates;
-    setTemplates(templates);
-    setTemplateBody(
-      (current) =>
-        current || templates.find((item) => item.name === templateName)?.body || "",
+  const loadTemplates = async (platform: "bilibili" | "douyin" = publishPlatform) => {
+    const response = await api<{ templates: Template[]; platform?: string }>(
+      `/api/templates?platform=${encodeURIComponent(platform)}`,
     );
+    const nextTemplates = response.templates;
+    setTemplates(nextTemplates);
+    const storedName = localStorage.getItem(`ybl-publish-template-${platform}`) || "";
+    const preferred =
+      (storedName && nextTemplates.find((item) => item.name === storedName)?.name)
+      || (platform === "douyin" ? "中文字幕版" : "授权本地化");
+    const resolved =
+      nextTemplates.find((item) => item.name === preferred)?.name
+      || nextTemplates[0]?.name
+      || preferred;
+    setTemplateName(resolved);
+    setTemplateBody(nextTemplates.find((item) => item.name === resolved)?.body ?? "");
+    return nextTemplates;
   };
   const loadSettings = async () => {
     const settings = await api<{
@@ -842,11 +1118,12 @@ function App() {
     setRestorableJobs(response.jobs);
   };
   const loadRestoredJob = async (id: string) => {
-    if (materialDraftToken > 0 && !window.confirm("素材页还有未保存的链接/本地选择。载入任务会覆盖这些内容，确定继续吗？")) {
+    if ((dirty || materialDraftToken > 0) && !window.confirm(dirty ? "字幕还有未保存修改。载入其他任务会清空当前草稿，确定继续吗？" : "素材页还有未保存的链接/本地选择。载入任务会覆盖这些内容，确定继续吗？")) {
       return;
     }
     const generation = ++cueGeneration.current;
     selectedJobIdRef.current = id;
+    pendingPlayback.current = null;
     cueOwner.current = null;
     setCues([]); setHistory([]); setFuture([]); setCuesReady(false);
     try {
@@ -951,7 +1228,7 @@ function App() {
     const response = await api<{
       dependencies: Dependency[];
       active_job: DependencyInstallJob | null;
-    }>(`/api/dependencies${force ? "?refresh=1" : ""}`);
+    }>(`/api/dependencies?ocr_language=${encodeURIComponent(ocrLanguageRef.current)}${force ? "&refresh=1" : ""}`);
     const previousAvailability = dependencyAvailability.current;
     const newlyAvailable = response.dependencies
       .filter((item) => previousAvailability[item.id] === false && item.available)
@@ -986,6 +1263,63 @@ function App() {
       if (current?.id === active.id && current.status === active.status && current.progress === active.progress && current.message === active.message) return current;
       return active;
     });
+    return response.dependencies;
+  };
+  const startOllama = async () => {
+    if (ollamaStartBusy) return;
+    setOllamaStartBusy(true);
+    try {
+      const started = await api<{ state: "ready" | "starting"; message: string }>("/api/dependencies/ollama/start", {
+        method: "POST",
+        body: "{}",
+      });
+      setMessage(started.message);
+      if (started.state === "ready") {
+        await loadDependencies(true);
+        return;
+      }
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        const latest = await loadDependencies(true);
+        const runtime = latest.find((item) => item.id === "ollama-runtime");
+        if (runtime?.state === "ready") {
+          if (!jobRef.current?.checks?.some((check) => check.id === "ollama-runtime" && check.status === "blocking")) {
+            setMessage("Ollama 已连接。 ");
+          }
+          return;
+        }
+        if (runtime?.message.startsWith("Ollama 启动失败")) {
+          setMessage(runtime.message);
+          return;
+        }
+      }
+      setMessage("已启动 Ollama，但服务仍未就绪。请稍后重新检查；若仍未连接，请检查 Ollama 状态。 ");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "无法启动 Ollama。 ");
+    } finally {
+      setOllamaStartBusy(false);
+    }
+  };
+  const startTesseractInstaller = async () => {
+    if (tesseractInstallerBusy) return;
+    setTesseractInstallerBusy(true);
+    try {
+      const response = await api<{ message: string }>("/api/dependencies/tesseract/start", { method: "POST", body: "{}" });
+      setMessage(response.message);
+      for (let attempt = 0; attempt < 24; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 5000));
+        const latest = await loadDependencies(true);
+        if (latest.find((item) => item.id === "tesseract")?.available) {
+          setMessage("已检测到 Tesseract，可以继续使用。 ");
+          return;
+        }
+      }
+      setMessage("安装器已启动，但暂未检测到 Tesseract。完成安装后可再次点击重新检测。 ");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "无法启动 Tesseract 安装器");
+    } finally {
+      setTesseractInstallerBusy(false);
+    }
   };
   const installDependency = async (dependency: Dependency) => {
     const action = dependency.action_label === "下载模型" ? "下载" : "安装";
@@ -994,7 +1328,7 @@ function App() {
     try {
       const response = await api<{ job: DependencyInstallJob }>(`/api/dependencies/${dependency.id}/install`, {
         method: "POST",
-        body: JSON.stringify({ confirmed: true }),
+        body: JSON.stringify({ confirmed: true, ocr_language: options.ocr_language || "eng" }),
       });
       setDependencyJob(response.job);
       setDependenciesOpen(true);
@@ -1155,26 +1489,116 @@ function App() {
   };
   const loadCues = async (id: string, generation = cueGeneration.current): Promise<boolean> => {
     try {
-      const data = await api<{ cues: Cue[]; ready?: boolean; translation_ready?: boolean }>(
+      const data = await api<{ cues: Cue[]; ready?: boolean; translation_ready?: boolean; revision?: number; base_fingerprint?: string; base_ids?: number[] }>(
         `/api/jobs/${id}/cues`,
       );
       if (generation !== cueGeneration.current || selectedJobIdRef.current !== id) return false;
       const ready = data.ready ?? true;
       cueOwner.current = ready ? id : null;
       setCues(data.cues ?? []);
+      if (typeof data.revision === "number" && data.base_fingerprint && Array.isArray(data.base_ids)) setCueBaseMeta({ revision: data.revision, base_fingerprint: data.base_fingerprint, base_ids: data.base_ids });
       setCuesReady(ready);
       setTranslationReady(data.translation_ready ?? true);
       setHistory([]);
       setFuture([]);
+      setBulkSelectedCueIds([]);
+      setTranslationCandidate(null);
+      setVoiceCandidateText({}); setVoiceCandidateConfirmed({});
+      setCompactionCandidates([]);
       return true;
     } catch (error) {
       if (generation !== cueGeneration.current || selectedJobIdRef.current !== id) return false;
       cueOwner.current = null;
-      setCues([]); setHistory([]); setFuture([]); setCuesReady(false);
+      setCues([]); setCueBaseMeta(null); setHistory([]); setFuture([]); setCuesReady(false);
       setMessage(error instanceof Error ? `字幕加载失败：${error.message}` : "字幕加载失败，请重试");
       return false;
     }
   };
+  const loadVoiceReview = async (id: string) => {
+    try {
+      const data = await api<VoiceReview>(`/api/jobs/${id}/voice-review`);
+      if (selectedJobIdRef.current === id) setVoiceReview(data);
+    } catch {
+      if (selectedJobIdRef.current === id) setVoiceReview(null);
+    }
+  };
+  const prepareVoiceReview = async () => {
+    if (!job || dirty || running) {
+      setMessage(dirty ? "请先保存字幕草稿，再准备语音复核。" : "当前任务正在运行，请稍后再试。");
+      return;
+    }
+    setVoiceReviewBusy(true);
+    const requestJobId = job.id;
+    const requestGeneration = cueGeneration.current;
+    try {
+      const data = await api<VoiceReview>(`/api/jobs/${job.id}/voice-review/prepare`, { method: "POST", body: "{}" });
+      if (requestGeneration !== cueGeneration.current || selectedJobIdRef.current !== requestJobId) return;
+      setVoiceReview(data); setVoiceReviewOpen(true);
+    } catch (error) { setMessage(error instanceof Error ? error.message : "准备语音复核失败"); }
+    finally { setVoiceReviewBusy(false); }
+  };
+  const startVoiceReview = async () => {
+    if (!job || dirty || running) { setMessage("请先保存字幕草稿，并等待当前任务完成。"); return; }
+    setVoiceReviewBusy(true);
+    const requestJobId = job.id;
+    const requestGeneration = cueGeneration.current;
+    try {
+      const data = await api<VoiceReview>(`/api/jobs/${job.id}/voice-review/${voiceReview?.status === "paused" ? "resume" : "start"}`, { method: "POST", body: "{}" });
+      if (requestGeneration !== cueGeneration.current || selectedJobIdRef.current !== requestJobId) return;
+      setVoiceReview(data);
+    } catch (error) { setMessage(error instanceof Error ? error.message : "启动语音复核失败"); }
+    finally { setVoiceReviewBusy(false); }
+  };
+  const cancelVoiceReview = async () => {
+    if (!job) return;
+    const requestJobId = job.id;
+    const requestGeneration = cueGeneration.current;
+    try {
+      const data = await api<VoiceReview>(`/api/jobs/${job.id}/voice-review/cancel`, { method: "POST", body: "{}" });
+      if (requestGeneration === cueGeneration.current && selectedJobIdRef.current === requestJobId) setVoiceReview(data);
+    } catch (error) { setMessage(error instanceof Error ? error.message : "暂停语音复核失败"); }
+  };
+  const adoptVoiceCandidate = (candidate: NonNullable<VoiceReview["result_candidates"]>[number]) => {
+    const source = (candidate.words ?? []).map((word) => word.text ?? "").join("").trim();
+    const translated = (voiceCandidateText[candidate.id] ?? "").trim();
+    if (!source) { setMessage("候选没有可用原文。"); return; }
+    const confirmedWeak = candidate.tier === "weak" && voiceCandidateConfirmed[candidate.id] === true;
+    if (candidate.tier === "weak" && !confirmedWeak) { setMessage("弱候选需要先确认已重听。"); return; }
+    if (candidate.tier === "diagnostic") return;
+    if (cues.some((cue) => !cue.deleted && !cue.candidate_id && candidate.start < cue.end && candidate.end > cue.start)) {
+      setMessage("候选与现有字幕时间重叠，请先手动调整时间。"); return;
+    }
+    setHistory((items) => [...items, { cues }]);
+    setFuture([]);
+    setCues((items) => [...items, { id: Math.max(-1, ...items.map((cue) => cue.id)) + 1, start: candidate.start, end: candidate.end, source, translated, needs_review: true, candidate_id: candidate.id, confirmed_weak: confirmedWeak, confirmed_source_edit: false, translation_source: source, source_stale: false }].sort((a, b) => a.start - b.start));
+    setMessage(translated ? "候选已加入本地字幕草稿，保存后才会写入字幕文件。" : "候选已加入草稿，请先填写中文译文后再保存。");
+  };
+  const generateVoiceTranslation = async (candidate: NonNullable<VoiceReview["result_candidates"]>[number]) => {
+    if (!job) return;
+    const source = (candidate.words ?? []).map((word) => word.text ?? "").join("").trim();
+    if (!source) { setMessage("候选没有可翻译的原文。"); return; }
+    const sourceHash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(source));
+    const hash = Array.from(new Uint8Array(sourceHash)).map((value) => value.toString(16).padStart(2, "0")).join("");
+    const paid = ["deepseek", "openai"].includes(options.translator);
+    if (paid && !window.confirm("这次候选翻译可能产生 API 费用，确认继续吗？")) return;
+    const requestJobId = job.id; const requestGeneration = cueGeneration.current;
+    setVoiceTranslationBusy(candidate.id);
+    try {
+      const result = await api<{ source: string; translated: string; source_hash: string }>(`/api/jobs/${requestJobId}/voice-review/candidates/${encodeURIComponent(candidate.id)}/translate`, { method: "POST", body: JSON.stringify({ source_text: source, source_hash: hash, confirmed_paid: paid }) });
+      if (requestGeneration !== cueGeneration.current || selectedJobIdRef.current !== requestJobId || result.source_hash !== hash) return;
+      setVoiceCandidateText((items) => ({ ...items, [candidate.id]: result.translated }));
+      setMessage("候选译文已返回，请核对后再加入草稿。");
+    } catch (error) { setMessage(error instanceof Error ? error.message : "候选翻译失败"); }
+    finally { setVoiceTranslationBusy((current) => current === candidate.id ? null : current); }
+  };
+  useEffect(() => {
+    if (!job?.id) { setVoiceReview(null); return; }
+    void loadVoiceReview(job.id);
+    const timer = window.setInterval(() => {
+      if (selectedJobIdRef.current === job.id) void loadVoiceReview(job.id);
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [job?.id]);
   const toggleFullLogs = async () => {
     if (showFullLogs) {
       setShowFullLogs(false);
@@ -1231,10 +1655,10 @@ function App() {
   };
   const loadPublishStatus = async () => {
     try {
-      const status = await api<{ message: string }>(`/api/publish/status?browser=${publishBrowser}`);
+      const status = await api<{ message: string }>(`/api/publish/status?browser=${publishBrowser}&platform=${publishPlatform}`);
       setProfileMessage(status.message);
     } catch (error) {
-      setProfileMessage(error instanceof Error ? error.message : "无法读取 B 站浏览器状态");
+      setProfileMessage(error instanceof Error ? error.message : "无法读取投稿浏览器状态");
     }
   };
   const loadPublishSession = async () => {
@@ -1278,6 +1702,10 @@ function App() {
     }
   };
   useEffect(() => {
+    ocrLanguageRef.current = options.ocr_language || "eng";
+    void loadDependencies(true).catch(() => undefined);
+  }, [options.ocr_language]);
+  useEffect(() => {
     const onContextMenu = (event: MouseEvent) => {
       const selection = window.getSelection()?.toString().trim();
       if (selection) {
@@ -1313,7 +1741,7 @@ function App() {
   const applyRecommended = () => {
     setDevice("cpu");
     setComputeType("int8");
-    setOptions((current) => ({ ...current, download_quality: "1080p", render_encoder: "auto", resource_profile: "balanced", subtitle_source: "audio", prefer_platform_subtitles: true, whisper_model_size: "small", source_language: "", translator: "deepseek", translate_model: "", target_lang: "zh-Hans", smart_translation: true, smart_subtitle_layout: true, font_name: "Microsoft YaHei", font_size: 24, subtitle_display_mode: "translated", subtitle_color: "白色", subtitle_outline_color: "黑色", subtitle_effect: "描边" }));
+    setOptions((current) => ({ ...current, download_quality: "1080p", render_encoder: "auto", resource_profile: "balanced", subtitle_source: "audio", prefer_platform_subtitles: true, whisper_model_size: "small", source_language: "", audio_channel: "mix", translator: "deepseek", translate_model: "", deepseek_thinking: "disabled", target_lang: "zh-Hans", smart_translation: true, smart_subtitle_layout: true, font_name: "Microsoft YaHei", font_size: 24, subtitle_display_mode: "translated", subtitle_color: "白色", subtitle_outline_color: "黑色", subtitle_effect: "描边" }));
     setIncludeSourceLink(true);
     setMessage("已应用推荐设置：最高 1080p、自动优先 NVIDIA 渲染、CPU int8 转写与中文硬字幕。");
   };
@@ -1874,34 +2302,72 @@ function App() {
     }
   };
   const save = async () => {
+    if (savingCuesRef.current) return;
     if (!job || !dirty || cueOwner.current !== job.id || !cuesReady) {
       if (job && cueOwner.current !== job.id) setMessage("当前任务字幕尚未加载完成，暂不能保存。");
       return;
     }
     for (const cue of cues) {
+      if (cue.candidate_id && !cue.deleted && !cue.translated.trim()) {
+        setMessage(`候选字幕 ${cue.candidate_id} 还没有中文译文，请先填写后再保存。`);
+        return;
+      }
+      if (cue.candidate_id && !cue.deleted && cue.source_stale && cue.confirmed_source_edit !== true) {
+        setMessage(`候选字幕 ${cue.candidate_id} 的原文已修改，请先核对原文、修改中文或重新生成译文。`);
+        return;
+      }
       if (!cue.deleted && cue.start >= cue.end) {
         setMessage(`第 ${cue.id + 1} 条字幕时间无效：开始时间必须小于结束时间。`);
         return;
       }
     }
+    savingCuesRef.current = true;
+    setSavingCues(true);
     try {
+      const saveJobId = job.id;
+      const saveGeneration = cueGeneration.current;
+      const candidateRows = cues.filter((cue) => cue.candidate_id).map((cue) => ({
+        candidate_id: cue.candidate_id,
+        source: cue.source,
+        translated: cue.translated,
+        start: cue.start,
+        end: cue.end,
+        confirmed_weak: cue.confirmed_weak === true,
+        confirmed_source_edit: cue.confirmed_source_edit === true,
+        translation_source: cue.translation_source,
+        source_stale: cue.source_stale === true,
+      }));
+      const baseCues = cues.filter((cue) => !cue.candidate_id);
       const savedJob = await api<Job>(`/api/jobs/${job.id}/cues`, {
         method: "PUT",
         body: JSON.stringify({
-          cues: cues.map((cue) => ({
+          base_revision: cueBaseMeta?.revision,
+          base_fingerprint: cueBaseMeta?.base_fingerprint,
+          base_ids: cueBaseMeta?.base_ids,
+          candidate_rows: candidateRows,
+          cues: baseCues.map((cue) => ({
             start: cue.start,
             end: cue.end,
+            source: cue.source,
             translated: cue.translated,
             deleted: Boolean(cue.deleted),
+            needs_review: Boolean(cue.needs_review),
           })),
         }),
       });
+      if (saveGeneration !== cueGeneration.current || selectedJobIdRef.current !== saveJobId) return;
       setJob(savedJob);
       setHistory([]);
       setFuture([]);
+      setTranslationCandidate(null);
+      setCompactionCandidates([]);
+      await loadCues(saveJobId, saveGeneration);
       setMessage("字幕已保存；渲染检查点已标记为需要重做，可直接点击“重新渲染”。 ");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "保存字幕失败");
+    } finally {
+      savingCuesRef.current = false;
+      setSavingCues(false);
     }
   };
   const rerender = async () => {
@@ -1948,6 +2414,40 @@ function App() {
   };
   const removeCutRange = (index: number) =>
     setCutRanges((ranges) => ranges.filter((_, i) => i !== index));
+  const setTrimPointFromPlayhead = (field: "cutStart" | "cutEnd" | "exportStart" | "exportEnd") => {
+    const currentTime = video.current?.currentTime;
+    if (!Number.isFinite(currentTime)) {
+      setMessage("请先打开视频并播放到需要的位置。");
+      return;
+    }
+    const value = formatTime(currentTime ?? 0);
+    if (field === "cutStart") setCutStart(value);
+    else if (field === "cutEnd") setCutEnd(value);
+    else if (field === "exportStart") setExportStart(value);
+    else setExportEnd(value);
+  };
+  const previewTrimRange = (start: number, end: number) => {
+    const player = video.current;
+    if (!player) {
+      setMessage("当前没有可预览的视频。");
+      return;
+    }
+    // Review timestamps use the current/source video clock, never the rendered
+    // subtitle preview which may have different cuts or offsets.
+    if ((preview !== "source" || player.readyState < 1) && job) {
+      pendingPlayback.current = { start, end, jobId: job.id, generation: cueGeneration.current };
+      setPreview("source");
+      return;
+    }
+    subtitlePlaybackEnd.current = null;
+    trimPlaybackEnd.current = end;
+    player.currentTime = start;
+    void player.play().catch(() => {
+      trimPlaybackEnd.current = null;
+      setMessage("无法播放此区间，请先点击视频播放一次。");
+    });
+    setMessage(`正在预览 ${formatTime(start)} – ${formatTime(end)}。`);
+  };
   const applyTrim = async () => {
     if (!job || running || !cutRanges.length) return;
     if (dirty) {
@@ -2025,12 +2525,180 @@ function App() {
       setMessage(error instanceof Error ? error.message : "重排失败");
     }
   };
-  const updateCue = (id: number, translated: string) => {
-    setHistory((value) => [...value, cues]);
+  const updateCueDraft = (id: number, patch: Partial<Pick<Cue, "source" | "translated" | "needs_review" | "confirmed_source_edit" | "translation_source" | "source_stale">>) => {
+    setHistory((value) => [...value, { cues }]);
     setFuture([]);
     setCues((value) =>
-      value.map((cue) => (cue.id === id ? { ...cue, translated } : cue)),
+      value.map((cue) => (cue.id === id ? {
+        ...cue,
+        ...patch,
+        ...(cue.candidate_id && patch.source !== undefined
+          ? { confirmed_source_edit: false, source_stale: patch.source !== cue.translation_source }
+          : {}),
+        ...(cue.candidate_id && patch.translated !== undefined
+          ? { confirmed_source_edit: true, source_stale: false, translation_source: patch.source ?? cue.source }
+          : {}),
+      } : cue)),
     );
+  };
+  const updateCue = (id: number, translated: string) => updateCueDraft(id, { translated });
+  const toggleCueReview = (cue: Cue) => updateCueDraft(cue.id, { needs_review: !cue.needs_review });
+  const toggleBulkCue = (id: number) => setBulkSelectedCueIds((current) =>
+    current.includes(id) ? current.filter((item) => item !== id) : [...current, id],
+  );
+  const selectReviewCuesForBatch = () => setBulkSelectedCueIds(
+    visibleCueRows.filter(({ cue }) => cueNeedsReview(cue) && !cue.deleted).map(({ cue }) => cue.id),
+  );
+  const moveEditorSelection = (direction: -1 | 1) => {
+    const navigable = visibleCueRows.filter(({ cue }) => !cue.deleted);
+    if (!navigable.length) return;
+    const currentId = selectedCue ?? activeCue;
+    const currentIndex = navigable.findIndex(({ cue }) => cue.id === currentId);
+    const nextIndex = currentIndex < 0
+      ? (direction > 0 ? 0 : navigable.length - 1)
+      : Math.max(0, Math.min(navigable.length - 1, currentIndex + direction));
+    const next = navigable[nextIndex].cue;
+    setActiveCue(next.id);
+    setSelectedCue(next.id);
+    document.querySelector<HTMLElement>(`[data-cue-id="${next.id}"]`)?.scrollIntoView({ block: "nearest" });
+  };
+  const generateCueTranslation = async (cue: Cue) => {
+    if (!job || running || retranslatingCueId !== null || compactingCues) return;
+    const requestJobId = job.id;
+    const requestGeneration = cueGeneration.current;
+    const modelUseNote = taskModelIsOnline
+      ? "这条字幕及相邻上下文会发送到在线服务，可能产生 API 费用。"
+      : "会调用本机模型，不会自动覆盖原译文。";
+    if (!window.confirm(`使用 ${taskModelLabel} 为第 ${cue.id + 1} 条生成重译候选。\n\n${modelUseNote}\n\n继续吗？`)) return;
+    setRetranslatingCueId(cue.id);
+    setTranslationCandidate(null);
+    try {
+      if (cue.candidate_id) {
+        const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(cue.source));
+        const sourceHash = Array.from(new Uint8Array(digest)).map((value) => value.toString(16).padStart(2, "0")).join("");
+        const paid = ["deepseek", "openai"].includes(options.translator);
+        if (paid && !window.confirm("这次候选翻译可能产生 API 费用，确认继续吗？")) return;
+        const result = await api<{ translated: string; source: string; source_hash: string; provider: string; model: string }>(
+          `/api/jobs/${requestJobId}/voice-review/candidates/${encodeURIComponent(cue.candidate_id)}/translate`,
+          { method: "POST", body: JSON.stringify({ source_text: cue.source, source_hash: sourceHash, confirmed_paid: paid }) },
+        );
+        if (requestGeneration !== cueGeneration.current || selectedJobIdRef.current !== requestJobId || result.source_hash !== sourceHash) return;
+        setTranslationCandidate({ cueId: cue.id, source: cue.source, originalTranslation: cue.translated, translation: result.translated, provider: result.provider, model: result.model });
+        return;
+      }
+      const result = await api<{ cue_id: number; translation: string; provider: string; model: string }>(
+        `/api/jobs/${requestJobId}/cues/${cue.id}/retranslate`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            source: cue.source,
+            context: [-1, 1].flatMap((offset) => {
+              const neighbor = cues.find((item) => item.id === cue.id + offset);
+              return neighbor ? [{ cue_id: neighbor.id, source: neighbor.source, translated: neighbor.translated }] : [];
+            }),
+          }),
+        },
+      );
+      if (requestGeneration !== cueGeneration.current || selectedJobIdRef.current !== requestJobId) return;
+      setTranslationCandidate({
+        cueId: cue.id,
+        source: cue.source,
+        originalTranslation: cue.translated,
+        translation: result.translation,
+        provider: result.provider,
+        model: result.model,
+      });
+      setMessage(`第 ${cue.id + 1} 条译文候选已生成；核对后再采用并保存。`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "单条重译失败；原字幕和草稿已保留。");
+    } finally {
+      if (requestGeneration === cueGeneration.current && selectedJobIdRef.current === requestJobId) setRetranslatingCueId(null);
+    }
+  };
+  const applyTranslationCandidate = () => {
+    if (!translationCandidate) return;
+    const current = cues.find((cue) => cue.id === translationCandidate.cueId);
+    if (!current || current.source !== translationCandidate.source || current.translated !== translationCandidate.originalTranslation) {
+      setMessage("原文或译文已变化，请重新生成这条译文候选。");
+      return;
+    }
+    updateCueDraft(current.id, {
+      source: translationCandidate.source,
+      translated: translationCandidate.translation,
+    });
+    setTranslationCandidate(null);
+    setMessage("译文候选已放入草稿；保存字幕后才会写入任务。");
+  };
+  const generateCompactionCandidates = async () => {
+    if (!job || running || compactingCues || retranslatingCueId !== null) return;
+    const cueIds = selectedReviewCues.map((cue) => cue.id);
+    if (!cueIds.length) {
+      setMessage("请先勾选待复核的问题字幕条目。");
+      return;
+    }
+    if (cueIds.length > 50) {
+      setMessage("一次最多为 50 条字幕生成精简建议，请缩小选择范围。");
+      return;
+    }
+    const modelUseNote = taskModelIsOnline
+      ? "选中的字幕文本会发送到在线服务，可能产生 API 费用。"
+      : "会调用本机模型，不会自动替换原译文。";
+    if (!window.confirm(`使用 ${taskModelLabel} 为 ${cueIds.length} 条字幕逐条生成精简候选（最多 ${cueIds.length} 次请求）。\n\n${modelUseNote}\n\n继续吗？`)) return;
+    setCompactingCues(true);
+    setCompactionCandidates([]);
+    try {
+      const result = await api<{ provider: string; model: string; request_count: number; candidates: CompactionCandidate[] }>(
+        `/api/jobs/${job.id}/cues/compact`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            cue_ids: cueIds,
+            cues: selectedReviewCues.map((cue) => ({ cue_id: cue.id, source: cue.source, translated: cue.translated })),
+          }),
+        },
+      );
+      setCompactionCandidates(result.candidates);
+      const failed = result.candidates.filter((item) => item.error).length;
+      setMessage(`${result.provider} · ${result.model} 已处理 ${result.request_count} 条；生成 ${result.candidates.length - failed} 条精简候选，失败条目保留原译文。`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "精简建议生成失败；当前字幕草稿已保留。");
+    } finally {
+      setCompactingCues(false);
+    }
+  };
+  const applyCompactionCandidate = (candidate: CompactionCandidate) => {
+    if (candidate.error || candidate.candidate === candidate.original) return;
+    const current = cues.find((cue) => cue.id === candidate.cue_id);
+    if (!current || current.translated !== candidate.original) {
+      setMessage(`第 ${candidate.cue_id + 1} 条译文已变化，请重新生成精简候选。`);
+      return;
+    }
+    updateCueDraft(current.id, { translated: candidate.candidate });
+    setCompactionCandidates((items) => items.filter((item) => item.cue_id !== candidate.cue_id));
+  };
+  const applyAllCompactionCandidates = () => {
+    const applicable = compactionCandidates.filter((candidate) => {
+      const current = cues.find((cue) => cue.id === candidate.cue_id);
+      return !candidate.error && candidate.candidate !== candidate.original && current?.translated === candidate.original;
+    });
+    if (!applicable.length) return;
+    setHistory((value) => [...value, { cues }]);
+    setFuture([]);
+    const byId = new Map(applicable.map((candidate) => [candidate.cue_id, candidate.candidate]));
+    setCues((current) => current.map((cue) => byId.has(cue.id) ? { ...cue, translated: byId.get(cue.id)! } : cue));
+    setCompactionCandidates((items) => items.filter((item) => !byId.has(item.cue_id)));
+    setMessage(`已采用 ${applicable.length} 条精简译文候选；保存字幕后才会写入任务。`);
+  };
+  const applyLiteralReplacement = () => {
+    if (!replacePreviews.length) return;
+    const previewById = new Map(replacePreviews.map((preview) => [preview.cueId, preview.after]));
+    setHistory((value) => [...value, { cues }]);
+    setFuture([]);
+    setCues((current) => current.map((cue) => previewById.has(cue.id)
+      ? { ...cue, [replaceField]: previewById.get(cue.id)! }
+      : cue,
+    ));
+    setMessage(`已替换 ${replacePreviews.length} 条字幕中的 ${replacePreviews.reduce((sum, item) => sum + item.count, 0)} 处文本；可撤销，保存后写入任务。`);
   };
   const updateCueTime = (id: number, field: "start" | "end", value: string) => {
     const parsed = parseTime(value);
@@ -2038,14 +2706,14 @@ function App() {
       setMessage(`时间格式无效（如 0:05.0 或 1:30）：${value}`);
       return;
     }
-    setHistory((value) => [...value, cues]);
+    setHistory((value) => [...value, { cues }]);
     setFuture([]);
     setCues((current) =>
       current.map((cue) => (cue.id === id ? { ...cue, [field]: parsed } : cue)),
     );
   };
   const toggleCueDeleted = (id: number) => {
-    setHistory((value) => [...value, cues]);
+    setHistory((value) => [...value, { cues }]);
     setFuture([]);
     setCues((current) =>
       current.map((cue) => (cue.id === id ? { ...cue, deleted: !cue.deleted } : cue)),
@@ -2066,50 +2734,114 @@ function App() {
       setMessage(error instanceof Error ? error.message : "自动对齐失败");
     }
   };
-  const applyOffset = () => {    const offset = Number(offsetValue);
+  const shiftAllCues = (offset: number) => {
     if (!job || !cues.length) return;
     if (!Number.isFinite(offset) || offset === 0) {
-      setMessage("请输入有效的偏移秒数（如 0.5 或 -0.5，可为小数）。");
+      setMessage("偏移秒数必须是非零数字。");
       return;
     }
+    const offsetTicks = Math.round(offset * 100);
     const duration = job.material.duration_seconds;
-    setHistory((value) => [...value, cues]);
+    const maxVideoTicks = duration ? Math.max(0, Math.floor(duration * 100)) : Number.POSITIVE_INFINITY;
+    setHistory((value) => [...value, { cues }]);
     setFuture([]);
     setCues((current) =>
-      current.map((cue) => ({
-        ...cue,
-        start: Math.max(0, Math.round((cue.start + offset) * 100) / 100),
-        end: duration
-          ? Math.min(duration, Math.max(0.1, Math.round((cue.end + offset) * 100) / 100))
-          : Math.max(0.1, Math.round((cue.end + offset) * 100) / 100),
-      })),
+      current.map((cue) => {
+        const startTicks = Math.round(cue.start * 100);
+        const originalEndTicks = Math.max(startTicks + 10, Math.round(cue.end * 100));
+        const cueDurationTicks = Math.min(maxVideoTicks, originalEndTicks - startTicks);
+        const latestStartTicks = Number.isFinite(maxVideoTicks)
+          ? Math.max(0, maxVideoTicks - cueDurationTicks)
+          : Number.POSITIVE_INFINITY;
+        const shiftedStartTicks = Math.min(
+          latestStartTicks,
+          Math.max(0, startTicks + offsetTicks),
+        );
+        const shiftedEndTicks = Math.min(maxVideoTicks, shiftedStartTicks + cueDurationTicks);
+        return {
+          ...cue,
+          start: shiftedStartTicks / 100,
+          end: shiftedEndTicks / 100,
+        };
+      }),
     );
-    setOffsetValue("");
-    setMessage(`已将所有字幕整体偏移 ${offset} 秒（保持时长不变）。请检查后点「保存」。`);
+    const direction = offset > 0 ? "延后" : "提前";
+    const seconds = String(Number((Math.abs(offsetTicks) / 100).toFixed(2)));
+    setMessage(`已将全部字幕${direction} ${seconds} 秒，每条时长保持不变；可撤销，点击「保存字幕」后生效。`);
   };
+  const applyOffset = (direction: -1 | 1) => {
+    const amount = Math.abs(Number(offsetValue));
+    if (!Number.isFinite(amount) || amount === 0) {
+      setMessage("请输入大于 0 的秒数，再选择提前或延后。");
+      return;
+    }
+    shiftAllCues(amount * direction);
+    setOffsetValue("");
+  };
+  const shiftByStep = (direction: -1 | 1) => shiftAllCues(0.5 * direction);
   const undo = () => {
     const previous = history.at(-1);
     if (!previous) return;
-    setFuture((value) => [cues, ...value]);
-    setCues(previous);
+    setFuture((value) => [{ cues }, ...value]);
+    setCues(previous.cues);
     setHistory((value) => value.slice(0, -1));
   };
   const redo = () => {
     const next = future[0];
     if (!next) return;
-    setHistory((value) => [...value, cues]);
-    setCues(next);
+    setHistory((value) => [...value, { cues }]);
+    setCues(next.cues);
     setFuture((value) => value.slice(1));
   };
   const seek = (cue: Cue) => {
     setActiveCue(cue.id);
     setSelectedCue(cue.id);
     if (video.current) {
+      trimPlaybackEnd.current = null;
+      subtitlePlaybackEnd.current = cue.end;
       video.current.currentTime = cue.start;
       video.current.play();
     }
   };
+  useEffect(() => {
+    const onSubtitleKeyDown = (event: KeyboardEvent) => {
+      if (view !== "subtitle") return;
+      const target = event.target as HTMLElement | null;
+      const typing = Boolean(target?.isContentEditable || target?.closest("input, textarea, select, [contenteditable='true']"));
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        if (!running) void save();
+        return;
+      }
+      if (typing || running) return;
+      if (event.altKey && event.key === "ArrowUp") {
+        event.preventDefault();
+        moveEditorSelection(-1);
+      } else if (event.altKey && event.key === "ArrowDown") {
+        event.preventDefault();
+        moveEditorSelection(1);
+      } else if (event.code === "Space" && !event.altKey && !event.ctrlKey && !event.metaKey) {
+        event.preventDefault();
+        const player = video.current;
+        if (player && !player.paused) {
+          subtitlePlaybackEnd.current = null;
+          trimPlaybackEnd.current = null;
+          player.pause();
+          return;
+        }
+        const currentId = selectedCue ?? activeCue;
+        const currentCue = cues.find((cue) => cue.id === currentId && !cue.deleted)
+          ?? visibleCueRows.find(({ cue }) => !cue.deleted)?.cue;
+        if (currentCue) seek(currentCue);
+      }
+    };
+    window.addEventListener("keydown", onSubtitleKeyDown);
+    return () => window.removeEventListener("keydown", onSubtitleKeyDown);
+  }, [view, running, selectedCue, activeCue, cues, visibleCueRows, save]);
   const saveSettings = async () => {
+    if (savingSettingsRef.current) return;
+    savingSettingsRef.current = true;
+    setSavingSettings(true);
     try {
       await api("/api/settings", {
         method: "POST",
@@ -2128,6 +2860,9 @@ function App() {
       setMessage("本地设置已保存，密钥未回显。 ");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "保存设置失败");
+    } finally {
+      savingSettingsRef.current = false;
+      setSavingSettings(false);
     }
   };
   const chooseCookiesFile = async () => {
@@ -2153,9 +2888,10 @@ function App() {
         {
           method: "POST",
           body: JSON.stringify({
+            platform: publishPlatform,
             template: templateName,
             source_url: opts?.sourceUrlOverride ?? sourceUrl,
-            include_source_link: includeSourceLink,
+            include_source_link: publishPlatform === "douyin" ? false : includeSourceLink,
             custom_text: templateBody,
             template_body: templateBody,
             extra_lines: extraLine ? [extraLine] : [],
@@ -2164,7 +2900,11 @@ function App() {
       );
       setDescription(response.description);
       if (!opts?.silent) {
-        setMessage("已按当前模板内容生成简介（草稿内容优先于已保存模板）。");
+        setMessage(
+          publishPlatform === "douyin"
+            ? "已按抖音模板生成正文（不含原视频链接）。"
+            : "已按当前模板内容生成简介（草稿内容优先于已保存模板）。",
+        );
       }
       return response.description;
     } catch (error) {
@@ -2236,19 +2976,25 @@ function App() {
     try {
       await api("/api/templates", {
         method: "POST",
-        body: JSON.stringify({ name, body: templateBody || description }),
+        body: JSON.stringify({
+          name,
+          body: templateBody || description,
+          platform: publishPlatform,
+        }),
       });
-      await loadTemplates();
+      await loadTemplates(publishPlatform);
       setTemplateName(name);
+      localStorage.setItem(`ybl-publish-template-${publishPlatform}`, name);
       setTemplateEditorOpen(false);
-      setMessage("模板已保存到本机。 ");
+      setMessage(publishPlatform === "douyin" ? "抖音模板已保存到本机。" : "B 站模板已保存到本机。");
     } catch (error) {
       setMessage(String(error));
     }
   };
   const openTemplateEditor = (name = "") => {
     const current = templates.find((item) => item.name === (name || templateName));
-    setTemplateDraftName(name || (templateName === "授权本地化" ? "" : templateName));
+    const builtinDefault = publishPlatform === "douyin" ? "中文字幕版" : "授权本地化";
+    setTemplateDraftName(name || (templateName === builtinDefault ? "" : templateName));
     if (name || !templateDraftDirty) {
       setTemplateBody(current?.body ?? templateBody);
     }
@@ -2258,11 +3004,15 @@ function App() {
   const deleteTemplate = async () => {
     if (!window.confirm(`删除自定义模板“${templateName}”吗？`)) return;
     try {
-      await api(`/api/templates/${encodeURIComponent(templateName)}`, {
-        method: "DELETE",
-      });
-      await loadTemplates();
-      setTemplateName("授权本地化");
+      await api(
+        `/api/templates/${encodeURIComponent(templateName)}?platform=${encodeURIComponent(publishPlatform)}`,
+        { method: "DELETE" },
+      );
+      const next = await loadTemplates(publishPlatform);
+      const fallback = publishPlatform === "douyin" ? "中文字幕版" : "授权本地化";
+      const resolved = next.find((item) => item.name === fallback)?.name || next[0]?.name || fallback;
+      setTemplateName(resolved);
+      localStorage.setItem(`ybl-publish-template-${publishPlatform}`, resolved);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "删除失败");
     }
@@ -2278,6 +3028,17 @@ function App() {
       void loadPublishSession();
     } catch (error) {
       setMessage(String(error));
+    }
+  };
+  const openDouyinPublisher = async () => {
+    try {
+      const response = await api<{ message: string }>("/api/publish/douyin/open", {
+        method: "POST",
+        body: "{}",
+      });
+      setMessage(response.message);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "打开抖音创作者服务平台失败");
     }
   };
   const publishAssist = async () => {
@@ -2316,6 +3077,7 @@ function App() {
           template_body: templateBody,
           extra_lines: extraLine ? [extraLine] : [],
           close_after_fill: closeAfterFill,
+          platform: "bilibili",
         }),
       });
       setMessage(response.message);
@@ -2324,13 +3086,54 @@ function App() {
       setMessage(error instanceof Error ? error.message : "发布辅助失败");
     }
   };
+  const publishDouyinAssist = async () => {
+    if (!publishVideoReady) {
+      setMessage("请先选择当前任务成片、输出目录中的成片，或任意本地成片，再启动抖音投稿辅助。");
+      return;
+    }
+    if (publishSession.active) {
+      setMessage("已有投稿辅助正在运行，请先关闭当前自动化浏览器。");
+      return;
+    }
+    if (!window.confirm("将把所选成片上传到抖音创作者中心，并尝试填写标题、正文和话题。应用不会点击最终发布；请在抖音页面检查后手动发布。继续吗？")) return;
+    try {
+      let nextDescription = description;
+      if (!nextDescription.trim()) {
+        nextDescription = (await generateDescription({ silent: true })) ?? "";
+      }
+      const response = await api<{ message: string }>("/api/publish/douyin/assist", {
+        method: "POST",
+        body: JSON.stringify({
+          job_id: !nativePublishToken && !selectedPublishVideo && job?.id ? job.id : "",
+          video_id: selectedPublishVideo === "__native__" ? "" : selectedPublishVideo,
+          native_video_token: nativePublishToken,
+          output_dir: options.output_dir,
+          confirmed: true,
+          browser: publishBrowser,
+          title: options.title,
+          description: nextDescription,
+          tags: tags.split(",").map((value) => value.trim()).filter(Boolean),
+          include_source_link: false,
+          template: templateName,
+          template_body: templateBody,
+          extra_lines: extraLine ? [extraLine] : [],
+          platform: "douyin",
+        }),
+      });
+      setMessage(response.message);
+      void loadPublishSession();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "抖音投稿辅助失败");
+    }
+  };
   const closePublishBrowser = async () => {
-    if (!window.confirm("关闭 B 站自动化浏览器会中断上传。确认关闭吗？"))
+    const platformLabel = publishPlatform === "douyin" ? "抖音" : "B 站";
+    if (!window.confirm(`关闭${platformLabel}自动化浏览器会中断上传。确认关闭吗？`))
       return;
     try {
       const response = await api<{ closed: number }>(
         "/api/publish/close-browser",
-        { method: "POST", body: JSON.stringify({ confirmed: true }) },
+        { method: "POST", body: JSON.stringify({ confirmed: true, platform: publishPlatform }) },
       );
       setMessage(`已关闭 ${response.closed} 个后台浏览器进程。`);
     } catch (error) {
@@ -2534,6 +3337,7 @@ function App() {
             aria-busy={metadataState === "loading"}
           >
             {metadataState === "loading" && <ActivityBars />}
+            {metadataState !== "loading" && <NavIcon name="link" className="app-icon" />}
             {metadataState === "loading" ? "正在读取…" : "读取标题与时长"}
           </button>
         </div>
@@ -2721,7 +3525,7 @@ function App() {
     : [];
   const handleCheckAction = (check: PreparationCheck) => {
     const action = check.action ?? "";
-    if (/安装|模型|FFmpeg|Tesseract|依赖中心|Ollama/.test(action)) {
+    if (/安装|下载|模型|FFmpeg|Tesseract|依赖中心|Ollama/.test(action)) {
       const dependency = dependencies.find((item) => item.id === check.id || (check.id === "ffprobe" && item.id === "ffmpeg"));
       setDependenciesOpen(true);
       if (dependency?.installable) void installDependency(dependency);
@@ -2745,7 +3549,7 @@ function App() {
           )}
         </div>
         <div className="workflow-actions">
-          <button onClick={() => void saveWorkflowOptions()} disabled={running || preparingJob}>{schemeDirty ? "保存修改" : "保存方案"}</button>
+          <button onClick={() => void saveWorkflowOptions()} disabled={running || preparingJob}><NavIcon name="save" className="app-icon" />{schemeDirty ? "保存修改" : "保存方案"}</button>
           <button className="primary" onClick={() => void prepareJob()} disabled={running || preparingJob} aria-busy={preparingJob} title={running ? "当前阶段运行中" : undefined}>
             {preparingJob && <ActivityBars />}
             {preparingJob ? "正在检查素材与环境…" : job.checks?.length ? "重新检查准备" : "检查准备"}
@@ -2767,7 +3571,7 @@ function App() {
             aria-disabled={running || !preparationReady || schemeDirty}
             title={schemeDirty ? "先保存修改并重新检查准备" : !preparationReady ? "准备检查全部通过后才能运行" : undefined}
           >
-            一键运行到渲染
+            <NavIcon name="render" className="app-icon" />一键运行到渲染
           </button>
         </div>
       </header>
@@ -2790,9 +3594,13 @@ function App() {
           <div className="check-list">
             {job.checks.map((check) => (
               <article key={check.id} className={`prepare-check ${check.status}`}>
-                <span className="check-state" aria-hidden="true">{check.status === "passed" ? "✓" : check.status === "warning" ? "!" : check.status === "installing" ? "…" : "×"}</span>
+                <span className="check-state" aria-hidden="true"><NavIcon name={check.status === "passed" ? "check" : check.status === "warning" ? "error" : check.status === "installing" ? "running" : "error"} className="app-icon" /></span>
                 <div><b>{check.label}</b><small>{check.purpose}</small><p>{check.message}</p></div>
-                {check.action && check.status !== "passed" && <button onClick={() => handleCheckAction(check)}>{check.action}</button>}
+                {check.id === "ollama-runtime" && ollamaRuntimeDependency?.state === "stopped" ? (
+                  <button disabled={ollamaStartBusy} onClick={() => void startOllama()}>
+                    {ollamaStartBusy ? "启动中…" : "启动 Ollama"}
+                  </button>
+                ) : check.action && check.status !== "passed" ? <button onClick={() => handleCheckAction(check)}>{check.action}</button> : null}
               </article>
             ))}
           </div>
@@ -2855,11 +3663,13 @@ function App() {
           };
           const artifactKey = { acquire: "raw_video", extract: "source_srt", translate: "translated_srt", render: "rendered_video", publish: "" }[id];
           const artifact = artifactKey ? job.artifacts?.[artifactKey] : null;
+          const stageIcon: NavIconName = id === "acquire" ? "download" : id === "extract" ? "voice" : id === "translate" ? "translate" : id === "render" ? "render" : "upload";
+          const statusIcon: NavIconName = state?.status === "completed" ? "check" : state?.status === "running" ? "running" : ["failed", "stale", "interrupted"].includes(state?.status ?? "") ? "error" : state?.status === "cancelled" ? "pause" : stageIcon;
           const elapsed = state?.started_at ? formatElapsed(Math.max(0, (state.finished_at ?? now / 1000) - state.started_at)) : null;
           return (
             <article key={id} className={`stage-card ${state?.status ?? "pending"}`}>
               <div className="stage-index">{index + 1}</div>
-              <div className="stage-copy"><div><b>{label}</b><span className={`stage-status ${state?.status ?? "pending"}`}>{state?.status === "running" && <ActivityBars />}{stageStatusLabel[state?.status ?? "pending"]}</span></div><p>{purpose}</p>{(state?.status === "running" || state?.status === "completed") && <small className="stage-metrics">{state.status === "running" ? `${Math.round(state.progress)}% · ` : ""}{elapsed ?? ""}{artifact?.available && artifact.name ? ` · ${artifact.name}` : ""}</small>}{state?.error && <TaskErrorSummary message={state.error} />}</div>
+              <div className="stage-copy"><div><b><NavIcon name={stageIcon} className="app-icon" />{label}</b><span className={`stage-status ${state?.status ?? "pending"}`}><NavIcon name={statusIcon} className="app-icon" />{state?.status === "running" && <ActivityBars />}{stageStatusLabel[state?.status ?? "pending"]}</span></div><p>{purpose}</p>{(state?.status === "running" || state?.status === "completed") && <small className="stage-metrics">{state.status === "running" ? `${Math.round(state.progress)}% · ` : ""}{elapsed ?? ""}{artifact?.available && artifact.name ? ` · ${artifact.name}` : ""}</small>}{state?.error && <TaskErrorSummary message={state.error} />}</div>
               <div className="stage-action">
                 {state?.status === "completed" && id !== "publish" ? <span className="checkpoint">检查点已保存</span> : null}
                 <button
@@ -2868,7 +3678,7 @@ function App() {
                   aria-disabled={state?.status === "running" ? false : !enabled}
                   title={!enabled && disabledReason ? disabledReason : undefined}
                 >
-                  {buttonLabel}
+                  <NavIcon name={state?.status === "running" ? "pause" : state?.status === "completed" ? (id === "render" ? "rerender" : "check") : stageIcon} className="app-icon" />{buttonLabel}
                 </button>
                 {!["running", "completed"].includes(state?.status ?? "") && !enabled && disabledReason && <small>{disabledReason}</small>}
               </div>
@@ -2893,7 +3703,7 @@ function App() {
                   ? selectedLocalModelDependency.message
                   : "正在检查模型状态…"
             : ollamaRuntimeDependency?.state === "stopped"
-              ? "Ollama 已安装但未运行。请从 Windows 开始菜单启动 Ollama，再重新检测。"
+              ? "Ollama 已安装但未运行。点击“启动 Ollama”后，应用会自动重新检测。"
               : ollamaRuntimeDependency?.state === "unavailable"
                 ? ollamaRuntimeDependency.message
               : ollamaRuntimeDependency?.state === "missing"
@@ -2906,6 +3716,11 @@ function App() {
       <div className="local-translation-actions">
         {ollamaRuntimeDependency?.state === "missing" && ollamaRuntimeDependency.action_url && (
           <a className="secondary small" href={ollamaRuntimeDependency.action_url} target="_blank" rel="noreferrer">下载 Ollama</a>
+        )}
+        {ollamaRuntimeDependency?.state === "stopped" && (
+          <button className="primary small" disabled={ollamaStartBusy} onClick={() => void startOllama()}>
+            {ollamaStartBusy ? "启动中…" : "启动 Ollama"}
+          </button>
         )}
         {ollamaRuntimeDependency?.state === "ready" && !selectedLocalModelDependency?.available && selectedLocalModelDependency?.installable && (
           <button className="primary small" disabled={Boolean(dependencyJob && ["queued", "running", "cancelling"].includes(dependencyJob.status))} onClick={() => void installDependency(selectedLocalModelDependency)}>
@@ -2922,7 +3737,7 @@ function App() {
       <header className="process-header">
         <p className="eyebrow">处理配置</p>
         <h1>字幕、翻译与推理</h1>
-        <p>先选择主要处理方式；模型、精度和 OCR 细节可在高级设置中调整。</p>
+        <p>先选择字幕来源、Whisper 模型和翻译方式；声道、精度与 OCR 细节可在高级设置的分类中展开。</p>
         <button className="process-mode-toggle" onClick={toggleMode}>{mode === "basic" ? "高级设置 ›" : "收起高级设置 ‹"}</button>
       </header>
       {options.translator === "deepseek" && apiKeyConfigured === false && (
@@ -2947,8 +3762,9 @@ function App() {
       ))}
       {localTranslationPanel}
       {mode === "basic" ? (
-        <div className="settings-grid">
-          <label>
+        <div className="settings-grid basic-settings-grid">
+          <section className="settings-section basic-primary-section"><div className="settings-group-heading"><NavIcon name="voice" className="app-icon" /><span><b>字幕提取</b><small>字幕来源与语音识别方式</small></span></div>
+          <label className="settings-span-2">
             字幕来源
             <select
               value={options.subtitle_source}
@@ -2964,6 +3780,26 @@ function App() {
             <FieldGuide summary="自动模式优先读取平台字幕/语音；只有没有可用字幕时才尝试 OCR。" detail="仅音频不会读取画面文字；仅 OCR 不会调用 Whisper，OCR 失败会明确报错。合并模式更慢且需要 Tesseract。" badges={options.subtitle_source === "audio" ? ["推荐"] : options.subtitle_source === "ocr" || options.subtitle_source === "merged" ? ["需要额外安装", "高负载"] : []} />
           </label>
           <label>
+            Whisper 模型
+            <select value={options.whisper_model_size} disabled={options.subtitle_source === "ocr"} onChange={(event) => updateOptions("whisper_model_size", event.target.value)}>
+              {["tiny", "base", "small", "medium", "large-v3"].map((value) => <option key={value}>{value}</option>)}
+            </select>
+            <FieldGuide summary={options.subtitle_source === "ocr" ? "纯 OCR 不使用 Whisper 模型。" : "模型越大通常越准确，也越慢、越占显存和磁盘。"} detail="所选模型必须在准备中心明确安装，转写阶段不会自动联网下载。" badges={options.subtitle_source === "ocr" ? [] : ["需要预先安装"]} />
+          </label>
+          <label>
+            源语言
+            <select value={options.source_language} onChange={(event) => updateOptions("source_language", event.target.value)}>
+              <option value="">自动检测</option>
+              {sourceLanguageOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+            </select>
+          </label>
+           {(job?.material.source_url || (!job && sourceUrl.trim())) && ["auto", "merged"].includes(options.subtitle_source) && <label className="check settings-check">
+             <input type="checkbox" checked={options.prefer_platform_subtitles} onChange={(event) => updateOptions("prefer_platform_subtitles", event.target.checked)} />
+             优先使用 YouTube 字幕（更快；没有时自动转写）
+           </label>}
+          </section>
+          <section className="settings-section basic-primary-section"><div className="settings-group-heading"><NavIcon name="translate" className="app-icon" /><span><b>翻译服务与模型</b><small>在线服务、本地模型与目标语言</small></span></div>
+          <label>
             翻译器
             <select
               value={options.translator}
@@ -2976,17 +3812,50 @@ function App() {
             </select>
             <FieldGuide summary="把源字幕翻译为目标语言。" detail={options.translator === "ollama" ? "Ollama 在本机运行，不需要 API Key，也不会把字幕发送到云端。需先安装 Ollama，再明确下载模型；模型不包含在 EXE 中。" : "DeepSeek/OpenAI 会调用在线 API，可能产生费用；不翻译只适合保留原文或调试提取结果。"} badges={options.translator === "none" ? [] : options.translator === "ollama" ? ["本机运行", "需下载模型"] : ["可能产生费用"]} />
           </label>
-          {options.translator === "ollama" && (
-            <label>
-              本地翻译模型
-              <select value={localModelTag} onChange={(event) => updateOptions("translate_model", event.target.value)}>
-                <option value="qwen3.5:4b">Qwen 3.5 4B · 约 3.4 GB（通用，推荐）</option>
-                <option value="qwen3.5:9b">Qwen 3.5 9B · 约 6.6 GB</option>
-                <option value="translategemma:12b">TranslateGemma 12B · 约 8.1 GB（专用翻译，需复核）</option>
-              </select>
-              <FieldGuide summary="模型文件需要单独下载到本机。" detail={localModelTag === "translategemma:12b" ? "TranslateGemma 专门用于多语言翻译；应用使用专用翻译提示并逐条请求，保留字幕编号。模型不执行源文校对或语义切句；较大的模型文件和运行时内存占用也更高。" : "选择只会更改方案，不会自动下载。下载完成后状态会实时刷新，不需要重启应用。"} badges={["首次下载需要联网", "模型不随 EXE 打包"]} />
-            </label>
-          )}
+           <label>
+             翻译模型
+             {options.translator === "ollama" ? (
+               <select value={localModelTag} onChange={(event) => updateOptions("translate_model", event.target.value)}>
+                 <option value="qwen3.5:4b">Qwen 3.5 4B · 约 3.4 GB（通用，推荐）</option>
+                 <option value="qwen3.5:9b">Qwen 3.5 9B · 约 6.6 GB</option>
+                 <option value="translategemma:12b">TranslateGemma 12B · 约 8.1 GB（专用翻译，需复核）</option>
+               </select>
+             ) : (
+               <input value={options.translate_model} disabled={options.translator === "none"} maxLength={128} placeholder="留空使用服务默认模型" onChange={(event) => updateOptions("translate_model", event.target.value)} />
+             )}
+             {fieldErrors.translate_model && <small className="field-error">{fieldErrors.translate_model}</small>}
+             {options.translator === "ollama" && <FieldGuide summary="模型文件需要单独下载到本机。" detail={localModelTag === "translategemma:12b" ? "TranslateGemma 专门用于多语言翻译；应用使用专用翻译提示并逐条请求，保留字幕编号。模型不执行通用模型语义切句与源文校对；较大的模型文件和运行时内存占用也更高。" : "选择只会更改方案，不会自动下载。下载完成后状态会实时刷新，不需要重启应用。"} badges={["首次下载需要联网", "模型不随 EXE 打包"]} />}
+           </label>
+           <label>
+             目标语言
+             <input value={options.target_lang} disabled={options.translator === "none"} maxLength={32} placeholder="例如 zh-Hans（简体中文）" onChange={(event) => updateOptions("target_lang", event.target.value)} />
+             {fieldErrors.target_lang && <small className="field-error">{fieldErrors.target_lang}</small>}
+           </label>
+          {options.translator === "deepseek" && <DeepseekThinkingChoice mode={options.deepseek_thinking} model={options.translate_model} onChange={(mode) => updateOptions("deepseek_thinking", mode)} />}
+           <label className="check settings-check">
+             <input type="checkbox" checked={options.smart_translation} onChange={(event) => updateOptions("smart_translation", event.target.checked)} />
+             智能上下文翻译
+           </label>
+           <div className="settings-entry-row">
+             <button type="button" className="settings-inline-link" onClick={() => { setMode("advanced"); window.setTimeout(() => { document.getElementById("advanced-translation-settings")?.scrollIntoView({ behavior: "smooth", block: "start" }); }, 0); }}>模型与费用设置 →</button>
+            {(["deepseek", "openai"].includes(options.translator)) && <button type="button" className="settings-link-button" onClick={() => setSettingsOpen(true)}><NavIcon name="link" className="app-icon" />打开接口设置与 API 密钥</button>}
+           </div>
+          </section>
+          <section className="settings-section"><div className="settings-group-heading"><NavIcon name="download" className="app-icon" /><span><b>性能与转写</b><small>资源占用与处理负载</small></span></div>
+           <label>
+             电脑资源占用
+             <select
+               value={options.resource_profile}
+               onChange={(event) => updateOptions("resource_profile", event.target.value as Options["resource_profile"])}
+             >
+               <option value="background">后台（最流畅，处理较慢）</option>
+               <option value="balanced">均衡（推荐）</option>
+               <option value="maximum">极速（可能影响其他软件）</option>
+             </select>
+             <FieldGuide summary="限制下载带宽和 CPU 线程，避免处理视频时整台电脑变卡。" detail="后台模式优先保证其他软件流畅；均衡模式默认保留一部分算力和网络；极速模式会尽量使用全部资源。切换模式不会让已完成阶段失效。" badges={options.resource_profile === "balanced" ? ["推荐"] : options.resource_profile === "maximum" ? ["高负载"] : ["低占用"]} />
+           </label>
+          </section>
+          <section className="settings-section"><div className="settings-group-heading"><NavIcon name="text" className="app-icon" /><span><b>字幕样式</b><small>排版、字体、字号与颜色</small></span></div>
           <label>
             字幕排版
             <select
@@ -3054,8 +3923,14 @@ function App() {
             </select>
             <FieldGuide summary="控制硬字幕的描边与阴影。" detail="改完样式后需重新渲染成片才会生效；已完成的渲染检查点会提示重做。" />
           </label>
-          <label>
-            字幕渲染
+           <label className="check settings-check">
+             <input type="checkbox" checked={options.smart_subtitle_layout} onChange={(event) => updateOptions("smart_subtitle_layout", event.target.checked)} />
+             智能字幕换行排版
+           </label>
+          </section>
+          <section className="settings-section"><div className="settings-group-heading"><NavIcon name="render" className="app-icon" /><span><b>输出与渲染</b><small>渲染编码器与输出目录</small></span></div>
+           <label>
+             字幕渲染
             <select
               value={options.render_encoder}
               onChange={(event) => updateOptions("render_encoder", event.target.value as Options["render_encoder"])}
@@ -3065,22 +3940,13 @@ function App() {
               <option value="cpu">CPU（兼容模式）</option>
             </select>
             <FieldGuide summary="决定最终视频由显卡还是 CPU 编码。" detail="自动模式会优先使用可用的 NVIDIA 编码器；CPU 兼容性最好但较慢。准备检查会在下载前验证。" badges={["推荐：自动"]} />
-          </label>
-          <label>
-            电脑资源占用
-            <select
-              value={options.resource_profile}
-              onChange={(event) => updateOptions("resource_profile", event.target.value as Options["resource_profile"])}
-            >
-              <option value="background">后台（最流畅，处理较慢）</option>
-              <option value="balanced">均衡（推荐）</option>
-              <option value="maximum">极速（可能影响其他软件）</option>
-            </select>
-            <FieldGuide summary="限制下载带宽和 CPU 线程，避免处理视频时整台电脑变卡。" detail="后台模式优先保证其他软件流畅；均衡模式默认保留一部分算力和网络；极速模式会尽量使用全部资源。切换模式不会让已完成阶段失效。" badges={options.resource_profile === "balanced" ? ["推荐"] : options.resource_profile === "maximum" ? ["高负载"] : ["低占用"]} />
-          </label>
+           </label>
+           <div className="settings-group-summary"><span>当前输出目录：<b title={options.output_dir}>{options.output_dir}</b></span><button type="button" className="settings-inline-link" onClick={() => { setMode("advanced"); window.setTimeout(() => { document.getElementById("advanced-output-settings")?.scrollIntoView({ behavior: "smooth", block: "start" }); }, 0); }}>输出目录与编码设置 →</button></div>
+          </section>
         </div>
       ) : (
       <div className="settings-grid">
+        <section className="settings-section"><header className="settings-group-heading"><NavIcon name="voice" className="app-icon" /><span><b>字幕提取</b><small>来源、Whisper、语言与声道</small></span></header><div className="settings-grid settings-fold-body">
         <label>
           字幕来源
           <select
@@ -3119,11 +3985,62 @@ function App() {
             }
           >
             <option value="">自动检测</option>
-            {["en", "zh", "ja", "ko", "fr", "de", "es", "ru"].map((value) => (
-              <option key={value}>{value}</option>
+            {sourceLanguageOptions.map(([value, label]) => (
+              <option key={value} value={value}>{label}</option>
             ))}
           </select>
         </label>
+        <label>
+          语音声道
+          <select
+            value={options.audio_channel}
+            disabled={options.subtitle_source === "ocr"}
+            onChange={(event) => updateOptions("audio_channel", event.target.value as Options["audio_channel"])}
+          >
+            <option value="mix">混合（默认）</option>
+            <option value="left">左声道（仅双声道）</option>
+            <option value="right">右声道（仅双声道）</option>
+          </select>
+          <FieldGuide summary="默认保留混合声道；左右声道只适用于明确的双声道音频。" detail="系统不会根据音量自动判断哪一侧有人声，也不会静默丢弃另一声道。" />
+        </label>
+         {(job?.material.source_url || (!job && sourceUrl.trim())) && ["auto", "merged"].includes(options.subtitle_source) && <label className="check settings-check">
+           <input type="checkbox" checked={options.prefer_platform_subtitles} onChange={(event) => updateOptions("prefer_platform_subtitles", event.target.checked)} />
+           优先使用 YouTube 字幕（更快；没有时自动转写）
+         </label>}
+        <details className="settings-subfold">
+          <summary><span><b>OCR 细节</b><small>画面字幕的采样、语言与识别区域</small></span><i>{options.subtitle_source === "audio" ? "当前未启用" : "展开/收起"}</i></summary>
+          <div className="settings-subfold-body">
+            <p className="settings-subfold-note">{options.subtitle_source === "audio" ? "当前来源为仅音频，OCR 参数暂不参与；切换到自动、合并或仅 OCR 后会继续使用已保存的值。" : "只在来源可能读取画面字幕时生效；参数保留在本机任务设置中。"}</p>
+            <div className="settings-grid settings-subfold-grid">
+              <label>
+                OCR 帧间隔（秒）
+                <select disabled={options.subtitle_source === "audio"} value={options.ocr_interval} onChange={(event) => updateOptions("ocr_interval", Number(event.target.value))}>
+                  <option value={0.25}>0.25（短字幕，最慢）</option><option value={0.5}>0.5（推荐）</option><option value={1}>1（更快）</option><option value={2}>2（更快）</option>
+                </select>
+                <FieldGuide summary="决定多久读取一次画面，默认 0.5 秒可覆盖多数短字幕。" detail="字幕一闪而过时使用 0.25 秒；普通字幕推荐 0.5 秒；1～2 秒会更快，但可能漏掉短字幕。" badges={options.ocr_interval <= 0.25 ? ["高负载"] : options.ocr_interval === 0.5 ? ["推荐"] : ["可能漏短字幕"]} />
+              </label>
+              <label>
+                OCR 语言
+                <select disabled={options.subtitle_source === "audio"} value={options.ocr_language} onChange={(event) => updateOptions("ocr_language", event.target.value)}>
+                  <option value="eng">英文（eng）</option><option value="chi_sim">简体中文（chi_sim）</option><option value="eng+chi_sim">英文 + 简体中文</option><option value="jpn">日文（jpn）</option><option value="kor">韩文（kor）</option>
+                </select>
+                <FieldGuide summary="必须和画面中已有字幕的语言一致。" detail="准备检查会在下载前确认对应 Tesseract 语言包是否安装；缺少语言包时不会开始下载。" badges={["下载前检查"]} />
+              </label>
+              <label>
+                OCR 识别区域
+                <select disabled={options.subtitle_source === "audio"} value={options.ocr_crop_ratio} onChange={(event) => updateOptions("ocr_crop_ratio", Number(event.target.value))}>
+                  <option value={0.2}>仅底部 20%</option><option value={0.3}>底部 30%（推荐）</option><option value={0.5}>下半屏</option><option value={1}>全画面</option>
+                </select>
+              </label>
+              <label>
+                OCR 最小字符数
+                <input disabled={options.subtitle_source === "audio"} type="number" min="1" max="20" value={options.ocr_min_chars} onChange={(event) => updateOptions("ocr_min_chars", Number(event.target.value || 3))} />
+              </label>
+            </div>
+          </div>
+        </details>
+        </div></section>
+        <section className="settings-section"><header className="settings-group-heading" id="advanced-translation-settings"><NavIcon name="translate" className="app-icon" /><span><b>翻译服务与模型</b><small>服务、模型、目标语言与请求计价</small></span></header><div className="settings-grid settings-fold-body">
         <label>
           翻译器
           <select
@@ -3132,7 +4049,7 @@ function App() {
           >
             <option value="deepseek">DeepSeek（在线付费）</option>
             <option value="openai">OpenAI（在线付费）</option>
-              <option value="ollama">Ollama（本机运行，无 API 费用）</option>
+            <option value="ollama">Ollama（本机运行，无 API 费用）</option>
             <option value="none">不翻译</option>
           </select>
         </label>
@@ -3147,6 +4064,7 @@ function App() {
           ) : (
             <input
               value={options.translate_model}
+              disabled={options.translator === "none"}
               maxLength={128}
               placeholder="使用默认模型"
               onChange={(event) => updateOptions("translate_model", event.target.value)}
@@ -3154,31 +4072,25 @@ function App() {
           )}
           {fieldErrors.translate_model && <small className="field-error">{fieldErrors.translate_model}</small>}
         </label>
+        {options.translator === "deepseek" && (
+          <DeepseekThinkingChoice mode={options.deepseek_thinking} model={options.translate_model} onChange={(mode) => updateOptions("deepseek_thinking", mode)} />
+        )}
         <label>
           目标语言
-          <input
-            value={options.target_lang}
-            maxLength={32}
-            onChange={(event) =>
-              updateOptions("target_lang", event.target.value)
-            }
-          />
+          <input value={options.target_lang} disabled={options.translator === "none"} maxLength={32} placeholder="例如 zh-Hans（简体中文）" onChange={(event) => updateOptions("target_lang", event.target.value)} />
           {fieldErrors.target_lang && <small className="field-error">{fieldErrors.target_lang}</small>}
         </label>
-        <label>
-          字幕排版
-          <select
-            value={options.subtitle_display_mode}
-            onChange={(event) =>
-              updateOptions("subtitle_display_mode", event.target.value)
-            }
-          >
-            <option value="translated">中文单语</option>
-            <option value="bilingual-source-first">原文在上 + 中文在下</option>
-            <option value="bilingual-translation-first">中文在上 + 原文在下</option>
-          </select>
-          <FieldGuide summary="选择成品字幕是中文单语，还是中英双语叠放。" detail="双语会同时显示原文和译文；单语只保留翻译结果。改完后需重新渲染才会写进成片。" />
+        <label className="check settings-check">
+          <input type="checkbox" checked={options.smart_translation} onChange={(event) => updateOptions("smart_translation", event.target.checked)} />
+          智能上下文翻译
         </label>
+        {["deepseek", "openai"].includes(options.translator) && <LlmPricingChoice options={options} onChange={(key, value) => {
+          if (key === "llm_pricing_mode") updateOptions(key, value as Options["llm_pricing_mode"]);
+          else updateOptions(key, value as Record<string, string>);
+        }} />}
+        {["deepseek", "openai"].includes(options.translator) && <button type="button" className="settings-link-button" onClick={() => setSettingsOpen(true)}><NavIcon name="link" className="app-icon" />打开接口设置与 API 密钥</button>}
+        </div></section>
+        <section className="settings-section"><header className="settings-group-heading"><NavIcon name="download" className="app-icon" /><span><b>性能与转写</b><small>资源、设备、精度与转写速度</small></span></header><div className="settings-grid settings-fold-body">
         <label>
           推理设备
           <select
@@ -3234,61 +4146,11 @@ function App() {
             <option value={10}>10（更准更慢）</option>
           </select>
         </label>
-        <label>
-          OCR 帧间隔（秒）
-          <select
-            value={options.ocr_interval}
-            onChange={(event) => updateOptions("ocr_interval", Number(event.target.value))}
-          >
-            <option value={0.25}>0.25（短字幕，最慢）</option>
-            <option value={0.5}>0.5（推荐）</option>
-            <option value={1}>1（更快）</option>
-            <option value={2}>2（更快）</option>
-          </select>
-          <FieldGuide summary="决定多久读取一次画面，默认 0.5 秒可覆盖多数短字幕。" detail="字幕一闪而过时使用 0.25 秒；普通字幕推荐 0.5 秒；1～2 秒会更快，但可能漏掉短字幕。" badges={options.ocr_interval <= 0.25 ? ["高负载"] : options.ocr_interval === 0.5 ? ["推荐"] : ["可能漏短字幕"]} />
-        </label>
-        <label>
-          OCR 语言
-          <select
-            value={options.ocr_language}
-            onChange={(event) => updateOptions("ocr_language", event.target.value)}
-          >
-            <option value="eng">英文（eng）</option>
-            <option value="chi_sim">简体中文（chi_sim）</option>
-            <option value="eng+chi_sim">英文 + 简体中文</option>
-            <option value="jpn">日文（jpn）</option>
-            <option value="kor">韩文（kor）</option>
-          </select>
-          <FieldGuide summary="必须和画面中已有字幕的语言一致。" detail="准备检查会在下载前确认对应 Tesseract 语言包是否安装；缺少语言包时不会开始下载。" badges={["下载前检查"]} />
-        </label>
-        <label>
-          OCR 识别区域
-          <select
-            value={options.ocr_crop_ratio}
-            onChange={(event) => updateOptions("ocr_crop_ratio", Number(event.target.value))}
-          >
-            <option value={0.2}>仅底部 20%</option>
-            <option value={0.3}>底部 30%（推荐）</option>
-            <option value={0.5}>下半屏</option>
-            <option value={1}>全画面</option>
-          </select>
-        </label>
-        <label>
-          OCR 最小字符数
-          <input
-            type="number"
-            min="1"
-            max="20"
-            value={options.ocr_min_chars}
-            onChange={(event) => updateOptions("ocr_min_chars", Number(event.target.value || 3))}
-          />
-        </label>
+        </div></section>
+        <section className="settings-section"><header className="settings-group-heading"><NavIcon name="text" className="app-icon" /><span><b>字幕样式</b><small>排版、字体、字号、颜色与位置</small></span></header><div className="settings-grid settings-fold-body">
         <label>
           字幕底部位置
-          <select
-            value={options.subtitle_margin_ratio}
-            onChange={(event) => updateOptions("subtitle_margin_ratio", Number(event.target.value))}
-          >
+          <select value={options.subtitle_margin_ratio} onChange={(event) => updateOptions("subtitle_margin_ratio", Number(event.target.value))}>
             <option value={0.03}>3%（贴近底部）</option>
             <option value={0.055}>5.5%（推荐）</option>
             <option value={0.1}>10%（偏上）</option>
@@ -3359,6 +4221,12 @@ function App() {
             ))}
           </select>
         </label>
+         <label className="check settings-check">
+           <input type="checkbox" checked={options.smart_subtitle_layout} onChange={(event) => updateOptions("smart_subtitle_layout", event.target.checked)} />
+           智能字幕换行排版
+         </label>
+        </div></section>
+        <section className="settings-section" id="advanced-output-settings"><header className="settings-group-heading"><NavIcon name="render" className="app-icon" /><span><b>输出与渲染</b><small>渲染质量、编码器和输出目录</small></span></header><div className="settings-grid settings-fold-body">
         <label>
           渲染质量（CRF）
           <select
@@ -3394,49 +4262,20 @@ function App() {
             </button>
           </div>
         </label>
+        </div></section>
       </div>
       )}
-      <div className="toggle-row">
-        {(job?.material.source_url || (!job && sourceUrl.trim())) && ["auto", "merged"].includes(options.subtitle_source) && <label className="check">
-          <input
-            type="checkbox"
-            checked={options.prefer_platform_subtitles}
-            onChange={(event) =>
-              updateOptions("prefer_platform_subtitles", event.target.checked)
-            }
-          />
-          优先使用 YouTube 字幕（更快；没有时自动转写）
-        </label>}
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={options.smart_translation}
-            onChange={(event) =>
-              updateOptions("smart_translation", event.target.checked)
-            }
-          />
-          智能上下文翻译
-        </label>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={options.smart_subtitle_layout}
-            onChange={(event) =>
-              updateOptions("smart_subtitle_layout", event.target.checked)
-            }
-          />
-          智能字幕换行排版
-        </label>
-        <label className="check">
-          <input type="checkbox" checked={publishInPipeline} onChange={(event) => setPublishInPipeline(event.target.checked)} />
-          渲染后打开 B 站创作中心并辅助上传填表
-        </label>
-      </div>
-      {publishInPipeline && <div className="settings-grid compact publish-pipeline-settings">
-        <label>投稿浏览器<select value={publishBrowser} onChange={(event) => setPublishBrowser(event.target.value)}><option value="chromium">Chromium</option><option value="msedge">Microsoft Edge</option></select></label>
-        <label className="check"><input type="checkbox" checked={includeSourceLink} onChange={(event) => setIncludeSourceLink(event.target.checked)} />简介自动附原视频链接</label>
-        <label className="check"><input type="checkbox" checked={closeAfterFill} onChange={(event) => setCloseAfterFill(event.target.checked)} />填表完成后关闭浏览器（可能中断上传）</label>
-      </div>}
+      <section className="settings-section post-process-section">
+        <header className="settings-group-heading"><NavIcon name="upload" className="app-icon" /><span><b>处理后操作</b><small>渲染完成后打开投稿辅助</small></span></header>
+        <div className="settings-grid settings-fold-body compact publish-pipeline-settings">
+          <label className="check settings-check"><input type="checkbox" checked={publishInPipeline} onChange={(event) => setPublishInPipeline(event.target.checked)} />渲染后打开 B 站创作中心并辅助上传填表</label>
+          {publishInPipeline && <>
+            <label>投稿浏览器<select value={publishBrowser} onChange={(event) => setPublishBrowser(event.target.value)}><option value="chromium">Chromium</option><option value="msedge">Microsoft Edge</option></select></label>
+            <label className="check settings-check"><input type="checkbox" checked={includeSourceLink} onChange={(event) => setIncludeSourceLink(event.target.checked)} />简介自动附原视频链接</label>
+            <label className="check settings-check"><input type="checkbox" checked={closeAfterFill} onChange={(event) => setCloseAfterFill(event.target.checked)} />填表完成后关闭浏览器（可能中断上传）</label>
+          </>}
+        </div>
+      </section>
       {job && cues.length > 0 && (job.status === "completed" || (running && job.progress >= 48)) && (
         <section className="workspace-card result-preview">
           <header>
@@ -3521,15 +4360,37 @@ function App() {
           controls
           preload="metadata"
           onLoadStart={() => {
+            subtitlePlaybackEnd.current = null;
             setMediaDuration(null);
             if (timelinePlayhead.current) timelinePlayhead.current.style.left = "0%";
             if (timelineCurrentTime.current) timelineCurrentTime.current.textContent = "00:00";
           }}
           onLoadedMetadata={(event) => {
+            subtitlePlaybackEnd.current = null;
+            trimPlaybackEnd.current = null;
             const actual = event.currentTarget.duration;
             setMediaDuration(Number.isFinite(actual) && actual > 0 ? actual : null);
+            const pending = pendingPlayback.current;
+            if (pending && job && pending.jobId === job.id && pending.generation === cueGeneration.current) {
+              pendingPlayback.current = null;
+              event.currentTarget.currentTime = pending.start;
+              trimPlaybackEnd.current = pending.end;
+              void event.currentTarget.play().catch(() => setMessage("无法播放此区间，请先点击视频播放一次。"));
+            }
           }}
           onTimeUpdate={(event) => {
+            const boundedEnd = subtitlePlaybackEnd.current;
+            if (boundedEnd !== null && event.currentTarget.currentTime >= boundedEnd) {
+              subtitlePlaybackEnd.current = null;
+              event.currentTarget.pause();
+              event.currentTarget.currentTime = boundedEnd;
+            }
+            const trimEnd = trimPlaybackEnd.current;
+            if (trimEnd !== null && event.currentTarget.currentTime >= trimEnd) {
+              trimPlaybackEnd.current = null;
+              event.currentTarget.pause();
+              event.currentTarget.currentTime = trimEnd;
+            }
             if (timelinePlayhead.current) {
               timelinePlayhead.current.style.left = `${Math.min(100, Math.max(0, (event.currentTarget.currentTime / (event.currentTarget.duration || duration)) * 100))}%`;
             }
@@ -3554,6 +4415,15 @@ function App() {
             <span className="timeline-track-name">字幕轨 <small>{cues.length ? `${cues.length} 段` : ""}</small></span>
             {previewSrc && <span className="timeline-current"><span ref={timelineCurrentTime}>00:00</span> / {timecode(duration)}</span>}
             {previewSrc && <div className="timeline-playhead" ref={timelinePlayhead} aria-hidden="true" />}
+            {previewSrc && duration > 0 && cutRanges.map(([start, end], index) => (
+              <span
+                key={`trim-range-${index}`}
+                className={`trim-range-mark trim-range-mark-${modOp}`}
+                style={{ left: `${Math.max(0, start / duration) * 100}%`, width: `${Math.max(0, Math.min(duration, end) - Math.max(0, start)) / duration * 100}%` }}
+                title={`${modOp === "cut" ? "待删除" : modOp === "keep" ? "待保留" : "待静音"}：${formatTime(start)}–${formatTime(end)}`}
+                aria-label={`已选区间 ${formatTime(start)} 至 ${formatTime(end)}`}
+              />
+            ))}
             {cuePositions.length ? (
               cuePositions.map(({ cue, left, width }) => (
                 <button
@@ -3573,17 +4443,18 @@ function App() {
         </div>
       </section>
       <details className="workspace-card trim-card">
-        <summary className="studio-drawer-summary"><span><b>剪辑工具</b><small>删除 / 保留 / 静音 / 导出 / 重排</small></span><span>展开</span></summary>
-        <p className="studio-drawer-note">修改后字幕时间轴自动对齐并重新压制；修改基于当前任务，可连续操作。</p>
+        <summary className="studio-drawer-summary"><span><b>剪辑视频</b><small>选时间段，再选择删除、保留或静音</small></span><span>展开</span></summary>
+        <p className="studio-drawer-note">播放到片段起止位置，点击“设为开始 / 结束”；添加后可在上方时间轴确认并单独试听。</p>
+        <div className="trim-action-title">1. 选择要做的操作</div>
         <div className="mod-op-row">
           {(
             [
-              ["cut", "删除片段"],
-              ["keep", "截取保留"],
-              ["mute", "片段静音"],
+              ["cut", "删除选中片段", "从成片中移除"],
+              ["keep", "只保留选中片段", "其余部分会移除"],
+              ["mute", "将选中片段静音", "画面保留，声音静音"],
             ] as const
-          ).map(([value, label]) => (
-            <label key={value} className="check">
+          ).map(([value, label, detail]) => (
+            <label key={value} className={`check trim-action ${modOp === value ? "active" : ""}`}>
               <input
                 type="radio"
                 name="mod-op"
@@ -3591,85 +4462,84 @@ function App() {
                 onChange={() => setModOp(value)}
                 disabled={running || !job?.result}
               />
-              {label}
+              <span><b>{label}</b><small>{detail}</small></span>
             </label>
           ))}
         </div>
-        <div className="trim-controls">
-          <input
-            value={cutStart}
-            placeholder="开始（如 0:05.0）"
-            disabled={running || !job?.result}
-            onChange={(event) => setCutStart(event.target.value)}
-          />
-          <span>至</span>
-          <input
-            value={cutEnd}
-            placeholder="结束（如 0:10.0）"
-            disabled={running || !job?.result}
-            onChange={(event) => setCutEnd(event.target.value)}
-          />
-          <button onClick={addCutRange} disabled={running || !job?.result}>
-            添加区间
+        <div className="trim-action-title">2. 选取时间段</div>
+        <div className="trim-controls trim-range-controls">
+          <div className="trim-time-field"><span>开始时间</span>
+            <input
+              value={cutStart}
+              placeholder="例如 00:05.0"
+              aria-label="剪辑开始时间"
+              disabled={running || !job?.result}
+              onChange={(event) => setCutStart(event.target.value)}
+            />
+            <button onClick={() => setTrimPointFromPlayhead("cutStart")} disabled={running || !job?.result} title="使用当前播放位置作为开始时间">设为开始</button>
+          </div>
+          <span className="trim-range-separator">至</span>
+          <div className="trim-time-field"><span>结束时间</span>
+            <input
+              value={cutEnd}
+              placeholder="例如 00:10.0"
+              aria-label="剪辑结束时间"
+              disabled={running || !job?.result}
+              onChange={(event) => setCutEnd(event.target.value)}
+            />
+            <button onClick={() => setTrimPointFromPlayhead("cutEnd")} disabled={running || !job?.result} title="使用当前播放位置作为结束时间">设为结束</button>
+          </div>
+          <button className="trim-add-range" onClick={addCutRange} disabled={running || !job?.result}>
+            添加时间段
           </button>
+        </div>
+        {cutRanges.length > 0 ? (
+          <div className="cut-list">
+            <b className="trim-selection-label">已选 {cutRanges.length} 段</b>
+            {cutRanges.map((range, index) => (
+              <span key={index} className={`cut-chip cut-chip-${modOp}`}>
+                {formatTime(range[0])} – {formatTime(range[1])}
+                <button onClick={() => previewTrimRange(range[0], range[1])} title="试听此时间段">试听</button>
+                <button onClick={() => removeCutRange(index)} title="移除此时间段">移除</button>
+              </span>
+            ))}
+          </div>
+        ) : (
+          <p className="trim-empty-selection">还没有选时间段。可以手动输入，也可以播放视频后用当前播放位置设定。</p>
+        )}
+        <div className="trim-apply-row">
           <button
             className="primary small"
             onClick={() => void applyTrim()}
             disabled={running || !cutRanges.length}
           >
-            {modOp === "cut" ? "删除选中区间" : modOp === "keep" ? "只保留选中区间" : "静音选中区间"}
+            {modOp === "cut" ? "应用：删除这些片段" : modOp === "keep" ? "应用：只保留这些片段" : "应用：静音这些片段"}
           </button>
+          {cutRanges.length > 0 && <button onClick={() => setCutRanges([])} disabled={running}>清空选择</button>}
         </div>
-        {cutRanges.length > 0 && (
-          <div className="cut-list">
-            {cutRanges.map((range, index) => (
-              <span key={index} className="cut-chip">
-                {formatTime(range[0])} – {formatTime(range[1])}
-                <button onClick={() => removeCutRange(index)} title="移除此区间">✕</button>
-              </span>
-            ))}
+        <details className="trim-advanced-tools">
+          <summary>更多剪辑工具：导出片段、调整顺序</summary>
+          <div className="trim-controls export-row">
+            <b>导出一段为新视频</b>
+            <div className="trim-time-field"><span>开始时间</span>
+              <input aria-label="导出片段开始时间" value={exportStart} placeholder="例如 00:10.0" disabled={running || !job?.result} onChange={(event) => setExportStart(event.target.value)} />
+              <button onClick={() => setTrimPointFromPlayhead("exportStart")} disabled={running || !job?.result}>设为开始</button>
+            </div>
+            <div className="trim-time-field"><span>结束时间</span>
+              <input aria-label="导出片段结束时间" value={exportEnd} placeholder="例如 00:20.0" disabled={running || !job?.result} onChange={(event) => setExportEnd(event.target.value)} />
+              <button onClick={() => setTrimPointFromPlayhead("exportEnd")} disabled={running || !job?.result}>设为结束</button>
+            </div>
+            <button onClick={() => void exportSegment()} disabled={running || !job?.result}>导出新文件</button>
           </div>
-        )}
-        <div className="trim-controls export-row">
-          <b>导出片段</b>
-          <input
-            value={exportStart}
-            placeholder="开始（如 0:10.0）"
-            disabled={running || !job?.result}
-            onChange={(event) => setExportStart(event.target.value)}
-          />
-          <span>至</span>
-          <input
-            value={exportEnd}
-            placeholder="结束（如 0:20.0）"
-            disabled={running || !job?.result}
-            onChange={(event) => setExportEnd(event.target.value)}
-          />
-          <button onClick={() => void exportSegment()} disabled={running || !job?.result}>
-            导出为新文件
-          </button>
-        </div>
-        <div className="trim-controls reorder-row">
-          <b>片段重排</b>
-          <input
-            value={reorderPoints}
-            placeholder="分割点，如 0:10,0:20"
-            disabled={running || !job?.result}
-            onChange={(event) => setReorderPoints(event.target.value)}
-          />
-          <input
-            value={reorderOrder}
-            placeholder="新顺序，如 3,1,2"
-            disabled={running || !job?.result}
-            onChange={(event) => setReorderOrder(event.target.value)}
-          />
-          <button onClick={() => void applyReorder()} disabled={running || !job?.result}>
-            应用重排
-          </button>
-        </div>
-        <p className="trim-note">
-          提示：修改会重写当前成片（可连续操作）；导出片段会另存新文件，不影响当前成片。修改前请先「保存」字幕。
-        </p>
+          <div className="trim-controls reorder-row">
+            <b>调整片段顺序</b>
+            <input value={reorderPoints} placeholder="分割点，如 00:10,00:20" disabled={running || !job?.result} onChange={(event) => setReorderPoints(event.target.value)} />
+            <input value={reorderOrder} placeholder="新顺序，如 3,1,2" disabled={running || !job?.result} onChange={(event) => setReorderOrder(event.target.value)} />
+            <button onClick={() => void applyReorder()} disabled={running || !job?.result}>应用新顺序</button>
+            <small>先按分割点切成几段，再按编号填写播放顺序。</small>
+          </div>
+        </details>
+        <p className="trim-note">应用删除、保留或静音后会生成新的成片并同步字幕时间；导出会另存文件。修改前请先保存字幕。</p>
       </details>
       <details className="workspace-card subtitle-config" open>
         <summary className="studio-drawer-summary"><span><b>字幕样式</b><small>与处理页同步；改完后需重新渲染</small></span><span>展开</span></summary>
@@ -3761,6 +4631,57 @@ function App() {
           </label>
         </div>
       </details>
+      <section className="voice-review-card workspace-card">
+        <header className="voice-review-header">
+          <div>
+            <p className="eyebrow">语音复核</p>
+            <h2>检查字幕未覆盖的说话区间</h2>
+            <small>
+              {voiceReview?.status === "unavailable"
+                ? "完成字幕提取后可准备复核队列。"
+                : `剩余 ${voiceReview?.remaining ?? 0} 个区间 · 候选 ${voiceReview?.recovered_words?.length ?? 0} 个词 · 本轮最多 120 秒实际音频`}
+            </small>
+          </div>
+          <button className="secondary small" onClick={() => setVoiceReviewOpen((value) => !value)}>
+            {voiceReviewOpen ? "收起" : "展开"}
+          </button>
+        </header>
+        {voiceReviewOpen && <div className="voice-review-body">
+          <p className="review-rule-note">队列只表示待核查时间段，不代表这些区间一定有人声；恢复结果仍会标记待复核。</p>
+          <div className="voice-review-actions">
+            <button onClick={() => void prepareVoiceReview()} disabled={voiceReviewBusy || dirty || running}>
+              {voiceReviewBusy ? "处理中…" : "准备区间"}
+            </button>
+            <button className="primary small" onClick={() => void startVoiceReview()} disabled={voiceReviewBusy || dirty || running || !voiceReview || voiceReview.status === "completed" || voiceReview.status === "unavailable"}>
+              {voiceReview?.status === "paused" ? "继续下一轮" : "开始复核"}
+            </button>
+            <button onClick={() => void cancelVoiceReview()} disabled={voiceReview?.status !== "running"}>暂停</button>
+            <span className="review-rule-note">声道：{voiceReview?.channel === "left" ? "左" : voiceReview?.channel === "right" ? "右" : "混合"}</span>
+            {voiceReview?.cpu_threads && <span className="review-rule-note">资源：{voiceReview.resource_profile === "background" ? "省资源" : voiceReview.resource_profile === "maximum" ? "性能优先" : "均衡"} · CPU 最多 {voiceReview.cpu_threads} 线程</span>}
+          </div>
+          {voiceReview?.error && <p className="field-error">{voiceReview.error}</p>}
+          <div className="voice-review-list">
+            {(voiceReview?.candidates ?? []).slice(0, 24).map((candidate) => (
+              <div className="voice-review-row" key={candidate.id}>
+                <b>{candidate.id}</b>
+                <span>{formatTime(candidate.start)}–{formatTime(candidate.end)}</span>
+                <span>{candidate.status === "done" ? `已完成${candidate.accepted_words ? ` · ${candidate.accepted_words} 词` : ""}` : candidate.status === "running" ? "处理中" : "待处理"}</span>
+                <button className="small" onClick={() => previewTrimRange(candidate.start, candidate.end)}>重听</button>
+              </div>
+            ))}
+          </div>
+          {(voiceReview?.result_candidates ?? []).filter((candidate) => candidate.status !== "committed").map((candidate) => {
+            const source = (candidate.words ?? []).map((word) => word.text ?? "").join("").trim();
+            return <article className="voice-candidate-row" key={candidate.id}>
+              <div><b>{candidate.tier === "weak" ? "弱候选" : "候选"} · {candidate.id}</b><small>{formatTime(candidate.start)}–{formatTime(candidate.end)} · {source || "无可用原文"}</small></div>
+              <input value={voiceCandidateText[candidate.id] ?? ""} placeholder="填写中文译文" onChange={(event) => setVoiceCandidateText((items) => ({ ...items, [candidate.id]: event.target.value }))} />
+              {candidate.tier === "weak" && <label><input type="checkbox" checked={voiceCandidateConfirmed[candidate.id] === true} onChange={(event) => setVoiceCandidateConfirmed((items) => ({ ...items, [candidate.id]: event.target.checked }))} />我已重听并确认</label>}
+              <button className="small" onClick={() => void generateVoiceTranslation(candidate)} disabled={voiceTranslationBusy === candidate.id}>{voiceTranslationBusy === candidate.id ? "翻译中…" : "生成译文候选"}</button>
+              <button className="small" onClick={() => adoptVoiceCandidate(candidate)} disabled={candidate.tier === "diagnostic"}>加入字幕草稿</button>
+            </article>;
+          })}
+        </div>}
+      </section>
       <section className="subtitle-editor">
         <div className="subtitle-toolbar">
           <div className="subtitle-toolbar-heading">
@@ -3768,60 +4689,135 @@ function App() {
             <h2>字幕段落 <small>{cues.length} 段</small></h2>
           </div>
           <div className="editor-actions">
-            {dirty && <span className="dirty">未保存修改</span>}
+            {dirty && <span className="dirty">未保存：先保存再渲染</span>}
             <button onClick={undo} disabled={!history.length || running}>
-              撤销
+              <NavIcon name="rerender" className="app-icon" />撤销
             </button>
             <button onClick={redo} disabled={!future.length || running}>
-              重做
+              <NavIcon name="rerender" className="app-icon" />重做
             </button>
-            <button onClick={save} disabled={!dirty || running || !job || cueOwner.current !== job.id || !cuesReady}>
-              保存字幕
+            <button onClick={save} disabled={savingCues || !dirty || running || retranslatingCueId !== null || compactingCues || !job || cueOwner.current !== job.id || !cuesReady} aria-busy={savingCues}>
+              <NavIcon name="save" className="app-icon" />保存字幕
             </button>
             <button
               className="primary small"
               onClick={rerender}
-              disabled={!job?.result || running || dirty || job?.edit_state === "legacy-ambiguous"}
-              title={job?.edit_state === "legacy-ambiguous" ? "旧任务的后期版本顺序无法确认；为保护现有成片，已禁用重新渲染" : "使用当前活动视频和字幕重新渲染"}
+              disabled={!job?.result || running || retranslatingCueId !== null || compactingCues || dirty || job?.edit_state === "legacy-ambiguous"}
+              title={job?.edit_state === "legacy-ambiguous" ? "旧任务的后期版本顺序无法确认；为保护现有成片，已禁用重新渲染" : dirty ? "先保存当前字幕修改，再重新渲染" : "使用当前活动视频和字幕重新渲染"}
             >
-              重新渲染
+              <NavIcon name="rerender" className="app-icon" />重新渲染
             </button>
           </div>
           <div className="editor-timing-actions">
-            <span>时间校正</span>
-            <input
-              className="offset-input"
-              value={offsetValue}
-              placeholder="偏移秒（如 0.5 / -0.5）"
-              title="字幕与音频整体不同步时，输入正负秒数一次性平移所有字幕时间"
-              disabled={running || !job?.result}
-              onChange={(event) => setOffsetValue(event.target.value)}
-              onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); applyOffset(); } }}
-            />
-            <button onClick={applyOffset} disabled={running || !job?.result || !cues.length}>
-              整体偏移
-            </button>
-            <button
-              onClick={() => void alignSubtitles()}
-              disabled={running || !job?.result}
-              title="有画面字幕（OCR）时，用帧级时间自动校正音频字幕的整体偏移"
-            >
-              自动对齐
-            </button>
+            <div className="editor-group-label"><NavIcon name="speed" className="app-icon" /><b>时间同步</b><span>调整整份字幕的时间</span></div>
+            <div className="editor-timing-main">
+              <strong>字幕和声音没对齐？</strong>
+              <button onClick={() => shiftByStep(-1)} disabled={running || !job?.result || !cues.length}>
+                <NavIcon name="speed" className="app-icon" />字幕提前 0.5 秒
+              </button>
+              <button onClick={() => shiftByStep(1)} disabled={running || !job?.result || !cues.length}>
+                <NavIcon name="speed" className="app-icon" />字幕延后 0.5 秒
+              </button>
+              <span className="editor-timing-note">字幕太晚就点“提前”，太早就点“延后”。每次移动全部字幕 0.5 秒。</span>
+            </div>
+            <details className="editor-timing-more">
+              <summary>精确调整 / 自动对齐</summary>
+              <div className="editor-timing-details">
+                <div className="editor-timing-exact">
+                  <label htmlFor="subtitle-exact-offset">相差秒数</label>
+                  <input
+                    id="subtitle-exact-offset"
+                    className="offset-input"
+                    inputMode="decimal"
+                    value={offsetValue}
+                    placeholder="例如 1.25"
+                    disabled={running || !job?.result}
+                    onChange={(event) => setOffsetValue(event.target.value)}
+                  />
+                  <button onClick={() => applyOffset(-1)} disabled={running || !job?.result || !cues.length}>
+                    精确提前
+                  </button>
+                  <button onClick={() => applyOffset(1)} disabled={running || !job?.result || !cues.length}>
+                    精确延后
+                  </button>
+                  <span>输入秒数后选择方向。</span>
+                </div>
+                <div className="editor-timing-auto">
+                  <button
+                    onClick={() => void alignSubtitles()}
+                    disabled={running || !job?.result}
+                    title="根据视频画面里清晰可见的字幕，估算并调整整份字幕的时间"
+                  >
+                    按画面字幕自动调整
+                  </button>
+                  <span>仅适用于视频画面本身带有清晰可见字幕的情况。</span>
+                </div>
+              </div>
+            </details>
           </div>
+          <div className="review-toolbar">
+            <div className="editor-group-label"><NavIcon name="ear" className="app-icon" /><b>问题筛选</b></div>
+            <label className="review-filter">
+              字幕
+              <select value={cueFilter} onChange={(event) => setCueFilter(event.target.value as "all" | "review")}>
+                <option value="all">全部字幕（{cues.filter((cue) => !cue.deleted).length}）</option>
+                <option value="review">待复核（{reviewCueCount}）</option>
+              </select>
+            </label>
+            <span className="review-queue-count">{reviewCueCount ? `待复核 ${reviewCueCount} 条` : "目前没有待复核字幕"}</span>
+            {reviewCueCount > 0 && <button onClick={selectReviewCuesForBatch}>选中全部待复核</button>}
+            {selectedBulkCues.length > 0 && (
+              <div className="review-batch-actions">
+                <span>已选 {selectedBulkCues.length} 条</span>
+                {selectedReviewCues.length > 0 && <button
+                  onClick={() => void generateCompactionCandidates()}
+                  disabled={running || compactingCues || retranslatingCueId !== null}
+                  title={`为所选 ${selectedReviewCues.length} 条待复核字幕生成精简候选`}
+                >
+                  {compactingCues ? "正在生成…" : "生成精简建议"}
+                </button>}
+              </div>
+            )}
+            <span className="review-rule-note" title="待复核包括自动检查发现的问题和你手动标记的字幕。">自动发现的问题 + 手动标记</span>
+            {dirty && <span className="review-stale-note">当前问题标签按已保存字幕检查；保存后更新。</span>}
+            <button className="review-shortcut-help" onClick={() => setShortcutHelpOpen(true)}>快捷键说明</button>
+          </div>
+          <details className="subtitle-batch-tools">
+            <summary><NavIcon name="text" className="app-icon" />批量操作 <span>搜索替换、字幕精简与候选处理</span></summary>
+            <div className="replace-controls">
+              <label>文本字段<select value={replaceField} onChange={(event) => setReplaceField(event.target.value as "source" | "translated")}><option value="source">原文</option><option value="translated">中文翻译</option></select></label>
+              <label>应用范围<select value={replaceScope} onChange={(event) => setReplaceScope(event.target.value as "all" | "selected")}><option value="all">全部字幕</option><option value="selected">仅已选字幕（{selectedBulkCues.length}）</option></select></label>
+              <label>查找<input value={replaceNeedle} onChange={(event) => setReplaceNeedle(event.target.value)} placeholder="要查找的文字" /></label>
+              <label>替换为<input value={replaceValue} onChange={(event) => setReplaceValue(event.target.value)} placeholder="替换后的文字" /></label>
+              <label className="replace-case"><input type="checkbox" checked={replaceCaseSensitive} onChange={(event) => setReplaceCaseSensitive(event.target.checked)} />区分大小写</label>
+              <button onClick={applyLiteralReplacement} disabled={!replacePreviews.length || running}>应用替换</button>
+            </div>
+            <div className="replace-preview-head"><b>预览：{replacePreviews.length} 条受影响，{replacePreviews.reduce((sum, item) => sum + item.count, 0)} 处替换</b><small>只替换文本，不改时间和另一语言字段。</small></div>
+            {replacePreviews.length > 0 && <div className="replace-preview-list">{replacePreviews.slice(0, 30).map((preview) => <div key={preview.cueId}><b>#{preview.cueId + 1} · {preview.count} 处</b><span>{preview.before}</span><span aria-hidden="true">→</span><span>{preview.after}</span></div>)}{replacePreviews.length > 30 && <small>另有 {replacePreviews.length - 30} 条命中未展开。</small>}</div>}
+          </details>
+          {compactionCandidates.length > 0 && <section className="model-candidates" aria-label="字幕精简候选">
+            <header><div><b>字幕精简候选</b><small>核对后逐条采用或全部采用；时间轴保持不变。</small></div><button onClick={applyAllCompactionCandidates} disabled={!compactionCandidates.some((candidate) => !candidate.error && candidate.candidate !== candidate.original)}>全部采用</button></header>
+            {compactionCandidates.map((candidate) => <article key={candidate.cue_id} className="model-candidate-row">
+              <b>#{candidate.cue_id + 1}</b>
+              <div><small>原译文</small><p>{candidate.original}</p></div>
+              <div><small>精简候选</small><p>{candidate.error ? `生成失败：${candidate.error}` : candidate.candidate}{candidate.still_overflowing && !candidate.error ? "（仍超出容量，可继续手动修改）" : ""}</p></div>
+              <button onClick={() => applyCompactionCandidate(candidate)} disabled={Boolean(candidate.error) || candidate.candidate === candidate.original}>采用</button>
+            </article>)}
+          </section>}
           <div className="column-labels">
-            <span>#</span>
+            <span>选中 / #</span>
             <span>时间</span>
             <span>原文</span>
             <span>中文翻译</span>
-            <span />
+            <span>操作</span>
           </div>
         </div>
         {cues.length ? (
           <div className="cue-table">
-            {cues.map((cue, index) => (
+            {visibleCueRows.map(({ cue, index }) => (
               <article
                 key={cue.id}
+                data-cue-id={cue.id}
                 className={[
                   "cue-row",
                   activeCue === cue.id ? "current" : "",
@@ -3829,7 +4825,10 @@ function App() {
                   cue.deleted ? "deleted" : "",
                 ].join(" ")}
               >
-                <button className="cue-index" onClick={() => seek(cue)} title={`播放第 ${index + 1} 段字幕`}>{String(index + 1).padStart(2, "0")}</button>
+                <div className="cue-select-index">
+                  <input type="checkbox" aria-label={`选择第 ${index + 1} 段字幕`} checked={bulkSelectedCueIds.includes(cue.id)} onChange={() => toggleBulkCue(cue.id)} disabled={cue.deleted} />
+                  <button className="cue-index" onClick={() => seek(cue)} title={`播放第 ${index + 1} 段字幕`}>{String(index + 1).padStart(2, "0")}</button>
+                </div>
                 <div className="cue-time-edit">
                   <input
                     value={formatTime(cue.start)}
@@ -3850,24 +4849,46 @@ function App() {
                     ▶
                   </button>
                 </div>
-                <p>{cue.source}</p>
-                <textarea
-                  value={cue.translated}
-                  aria-label={`第 ${index + 1} 段中文翻译`}
-                  onFocus={() => { setActiveCue(cue.id); setSelectedCue(cue.id); }}
-                  onChange={(event) => updateCue(cue.id, event.target.value)}
-                  disabled={!job?.result || running || cue.deleted}
-                />
-                <button
-                  className={cue.deleted ? "cue-restore" : "cue-delete"}
-                  onClick={() => toggleCueDeleted(cue.id)}
-                  disabled={running || !job?.result}
-                  title={cue.deleted ? "恢复这条字幕" : "删除这条字幕（此段不再显示字幕）"}
-                >
-                  {cue.deleted ? "恢复" : "删除"}
-                </button>
+                <div className="cue-text-cell">
+                  <textarea
+                    value={cue.source}
+                    aria-label={`第 ${index + 1} 段原文`}
+                    onFocus={() => { setActiveCue(cue.id); setSelectedCue(cue.id); }}
+                    onChange={(event) => updateCueDraft(cue.id, { source: event.target.value })}
+                    disabled={!job?.result || running || cue.deleted}
+                  />
+                  {cue.candidate_id && <label className="candidate-source-confirm"><input type="checkbox" checked={cue.confirmed_source_edit === true} onChange={(event) => updateCueDraft(cue.id, { confirmed_source_edit: event.target.checked, source_stale: event.target.checked ? false : cue.source !== cue.translation_source, ...(event.target.checked ? { translation_source: cue.source } : {}) })} />已核对修改后的原文</label>}
+                  {cue.issues?.length ? <div className="cue-issue-tags">{cue.issues.map((issue) => <span key={issue}><NavIcon name={issue === "reading-speed" || issue === "short-duration" ? "speed" : issue === "layout-overflow" || issue === "dense-text" || issue === "empty-source" || issue === "empty-translation" ? "text" : "error"} className="app-icon" />{cueIssueLabels[issue] ?? issue}</span>)}</div> : null}
+                </div>
+                <div className="cue-text-cell">
+                  <textarea
+                    value={cue.translated}
+                    aria-label={`第 ${index + 1} 段中文翻译`}
+                    onFocus={() => { setActiveCue(cue.id); setSelectedCue(cue.id); }}
+                    onChange={(event) => updateCue(cue.id, event.target.value)}
+                    disabled={!job?.result || running || cue.deleted}
+                  />
+                  {cue.needs_review && <span className="manual-review-tag"><NavIcon name="ear" className="app-icon" />人工待复核</span>}
+                  {translationCandidate?.cueId === cue.id && <div className="single-translation-candidate"><b>{translationCandidate.provider} · {translationCandidate.model} 候选</b><p>{translationCandidate.translation}</p><div><button onClick={applyTranslationCandidate}>采用候选</button><button onClick={() => setTranslationCandidate(null)}>放弃</button></div></div>}
+                </div>
+                <div className="cue-row-actions">
+                  <button className={cue.needs_review ? "review-flag active" : "review-flag"} onClick={() => toggleCueReview(cue)} aria-pressed={Boolean(cue.needs_review)} disabled={running || cue.deleted} title="把这条字幕加入待复核列表"><NavIcon name="ear" className="app-icon" />{cue.needs_review ? "取消标记" : "标记复核"}</button>
+                  <details className="cue-more-actions">
+                    <summary>更多</summary>
+                    <div>
+                      <button onClick={() => void generateCueTranslation(cue)} disabled={running || cue.deleted || retranslatingCueId !== null || compactingCues || !["deepseek", "openai", "ollama"].includes(job?.options.translator ?? "")} title="使用当前任务模型生成单条译文候选">{retranslatingCueId === cue.id ? "生成中…" : "单条重译"}</button>
+                      <button
+                        className={cue.deleted ? "cue-restore" : "cue-delete"}
+                        onClick={() => toggleCueDeleted(cue.id)}
+                        disabled={running || !job?.result}
+                        title={cue.deleted ? "恢复这条字幕" : "删除这条字幕（此段不再显示字幕）"}
+                      >{cue.deleted ? "恢复字幕" : "删除字幕"}</button>
+                    </div>
+                  </details>
+                </div>
               </article>
             ))}
+            {cueFilter === "review" && visibleCueRows.length === 0 && <div className="empty-editor"><b>没有待复核字幕</b><span>自动检查未发现问题，也没有人工标记。</span></div>}
           </div>
         ) : (
           <div className="empty-editor">
@@ -3888,13 +4909,51 @@ function App() {
       ? formatPublishSourceLabel(publishSelectedTask, publishSelectedFile, outputTaskTitles)
       : (job?.options.title || job?.material.name || job?.result?.rendered_video?.split(/[\\/]/).pop() || (publishVideoReady ? "当前任务成片" : "尚未选择成片"));
   const currentTaskPublishLabel = truncateLabel(job?.options.title || job?.material.name || "当前任务成片", 40);
+  const douyinTags = tags
+    .split(",")
+    .map((tag) => tag.trim().replace(/^#+/, ""))
+    .filter(Boolean)
+    .map((tag) => `#${tag}`)
+    .join(" ");
+  const douyinPublishCopy = [
+    options.title.trim() ? `标题：${options.title.trim()}` : "",
+    description.trim() ? `正文：${description.trim()}` : "",
+    douyinTags ? `话题：${douyinTags}` : "",
+  ].filter(Boolean).join("\n\n");
   const publishView = (
     <section className="workspace-card publish-view">
       <header>
-        <p className="eyebrow">B 站发布辅助</p>
+        <p className="eyebrow">发布辅助</p>
         <h1>准备文案，人工确认后投稿</h1>
-        <p>工具只打开页面、选择视频并辅助填写；不会自动点击“立即投稿”。</p>
+        <p>选择投稿平台。应用可上传成片并辅助填写投稿信息，最后由你检查并手动发布。</p>
       </header>
+
+      <div className="publish-platform-choice">
+        <label>投稿平台
+          <select
+            value={publishPlatform}
+            onChange={(event) => {
+              const platform = event.target.value as "bilibili" | "douyin";
+              if (templateDraftDirty && !window.confirm("切换平台会加载该平台的文案模板，未保存的模板草稿可能丢失。确定继续吗？")) {
+                return;
+              }
+              setPublishPlatform(platform);
+              localStorage.setItem("ybl-publish-platform", platform);
+              void loadTemplates(platform).then(() => {
+                setDescription("");
+                setMessage(
+                  platform === "douyin"
+                    ? "已切换到抖音文案模板（默认不含原视频链接）。"
+                    : "已切换到 B 站文案模板（可附原视频链接）。",
+                );
+              });
+            }}
+          >
+            <option value="bilibili">哔哩哔哩（B 站）</option>
+            <option value="douyin">抖音</option>
+          </select>
+        </label>
+      </div>
 
       <section className="publish-section">
         <div className="publish-section-head"><b>01 · 选定成片</b><small>当前任务成片或任意本地视频</small></div>
@@ -3934,15 +4993,23 @@ function App() {
       <section className="publish-section">
         <div className="publish-section-head">
           <b>02 · 投稿文案</b>
-          <small>标题、简介、标签会填入 B 站投稿页，仍需人工确认</small>
+          <small>{publishPlatform === "bilibili" ? "标题、简介、标签会填入 B 站投稿页，仍需人工确认" : "标题、正文和话题会尝试填入抖音投稿页，仍需人工确认"}</small>
         </div>
-        <label className="publish-template-select">文案模板
+        <label className="publish-template-select">
+          {publishPlatform === "douyin" ? "抖音文案模板" : "B 站文案模板"}
           <select value={templateName} onChange={(event) => {
             if (templateDraftDirty && !window.confirm("「模板内容」中有未保存的草稿修改。切换模板会丢失这些修改，确定继续吗？")) return;
-            setTemplateName(event.target.value);
-            setTemplateBody(templates.find((item) => item.name === event.target.value)?.body ?? "");
+            const name = event.target.value;
+            setTemplateName(name);
+            localStorage.setItem(`ybl-publish-template-${publishPlatform}`, name);
+            setTemplateBody(templates.find((item) => item.name === name)?.body ?? "");
           }}>{templates.map((item) => <option key={item.name}>{item.name}</option>)}</select>
         </label>
+        <small className="drawer-note">
+          {publishPlatform === "douyin"
+            ? "抖音与 B 站模板分开保存；抖音默认模板不含原视频链接。"
+            : "B 站模板可附原视频链接；自定义模板仅作用于当前平台。"}
+        </small>
         <div className="inline-actions publish-copy-actions">
             <button onClick={() => void loadPublishCopy({ force: true })} disabled={!publishVideoReady}>载入成片文案</button>
             <button onClick={() => void loadPublishCopy({ generate: true, force: true })} disabled={!publishVideoReady}>重新生成标题标签</button>
@@ -3969,7 +5036,11 @@ function App() {
               value={templateBody}
               maxLength={5000}
               onChange={(event) => setTemplateBody(event.target.value)}
-              placeholder="模板支持 {source} 与 {custom_text}"
+              placeholder={
+                publishPlatform === "douyin"
+                  ? "抖音模板可用 {custom_text}；一般不必写原视频链接"
+                  : "模板支持 {source} 与 {custom_text}"
+              }
             />
           </label>
           </div>
@@ -3998,7 +5069,7 @@ function App() {
           </label>
           <div className="publish-meta-grid">
             <label>
-              标签（逗号分隔）
+              {publishPlatform === "douyin" ? "话题（逗号分隔）" : "标签（逗号分隔）"}
               <input
                 value={tags}
                 onChange={(event) => { setTags(event.target.value); setFieldErrors((current) => ({ ...current, tags: "" })); }}
@@ -4017,56 +5088,95 @@ function App() {
       </section>
 
       <section className="publish-section">
-        <div className="publish-section-head"><b>03 · 连接 B 站并填表</b><small>自动化在人工提交前停止</small></div>
-        <div className="publish-browser-row">
-          <label>投稿浏览器<select value={publishBrowser} onChange={(event) => setPublishBrowser(event.target.value)}><option value="chromium">Chromium</option><option value="msedge">Microsoft Edge</option></select></label>
-          <div className="inline-actions"><button onClick={publishCheck}>登录检查</button><button onClick={() => void loadPublishStatus()}>检查 Profile</button></div>
-        </div>
-        {profileMessage && <p className="publish-status" role="status">{profileMessage}</p>}
-        <div className="publish-warning">
-          <div className="publish-warning-checks">
-            <label className="check">
-              <input type="checkbox" checked={includeSourceLink} onChange={(event) => setIncludeSourceLink(event.target.checked)} />
-              简介自动附原视频链接
-            </label>
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={closeAfterFill}
-                onChange={(event) => setCloseAfterFill(event.target.checked)}
-              />
-              填表完成后关闭自动化浏览器（上传可能中断）
-            </label>
-          </div>
-          <span>投稿前请检查分区、创作声明、封面、简介、标签与平台提示。</span>
-        </div>
-        {(publishSession.active || publishSession.status !== "idle") && (
-          <div className={`publish-session ${publishSession.status}`}>
-            <div className="publish-session-head">
-              <b>
-                {publishSession.status === "waiting_review"
-                  ? "已到人工提交前"
-                  : publishSession.status === "failed"
-                    ? "辅助失败"
-                    : publishSession.status === "finished"
-                      ? "辅助已结束"
-                      : "B 站投稿辅助进行中"}
-              </b>
-              <span>{publishSession.active ? "运行中" : "已停止"}</span>
+        {publishPlatform === "bilibili" ? (
+          <>
+            <div className="publish-section-head"><b>03 · 连接 B 站并填表</b><small>自动化在人工提交前停止</small></div>
+            <div className="publish-browser-row">
+              <label>投稿浏览器<select value={publishBrowser} onChange={(event) => setPublishBrowser(event.target.value)}><option value="chromium">Chromium</option><option value="msedge">Microsoft Edge</option></select></label>
+              <div className="inline-actions"><button onClick={publishCheck}>登录检查</button><button onClick={() => void loadPublishStatus()}>检查 Profile</button></div>
             </div>
-            {publishSession.error ? (
-              <p className="error">{publishSession.error}</p>
-            ) : (
-              <p className="publish-session-message">{publishSession.message}</p>
-            )}
-            {publishSession.logs.length > 0 && (
-              <div className="publish-session-logs">
-                {publishSession.logs.slice(-12).map((line, index) => (
-                  <p key={`${line}-${index}`}>{line}</p>
-                ))}
+            {profileMessage && <p className="publish-status" role="status">{profileMessage}</p>}
+            <div className="publish-warning">
+              <div className="publish-warning-checks">
+                <label className="check">
+                  <input type="checkbox" checked={includeSourceLink} onChange={(event) => setIncludeSourceLink(event.target.checked)} />
+                  简介自动附原视频链接
+                </label>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={closeAfterFill}
+                    onChange={(event) => setCloseAfterFill(event.target.checked)}
+                  />
+                  填表完成后关闭自动化浏览器（上传可能中断）
+                </label>
+              </div>
+              <span>投稿前请检查分区、创作声明、封面、简介、标签与平台提示。</span>
+            </div>
+            {(publishSession.active || publishSession.status !== "idle") && (
+              <div className={`publish-session ${publishSession.status}`}>
+                <div className="publish-session-head">
+                  <b>
+                    {publishSession.status === "waiting_review"
+                      ? "已到人工提交前"
+                      : publishSession.status === "failed"
+                        ? "辅助失败"
+                        : publishSession.status === "finished"
+                          ? "辅助已结束"
+                          : "B 站投稿辅助进行中"}
+                  </b>
+                  <span>{publishSession.active ? "运行中" : "已停止"}</span>
+                </div>
+                {publishSession.error ? (
+                  <p className="error">{publishSession.error}</p>
+                ) : (
+                  <p className="publish-session-message">{publishSession.message}</p>
+                )}
+                {publishSession.logs.length > 0 && (
+                  <div className="publish-session-logs">
+                    {publishSession.logs.slice(-12).map((line, index) => (
+                      <p key={`${line}-${index}`}>{line}</p>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
-          </div>
+          </>
+        ) : (
+          <>
+            <div className="publish-section-head"><b>03 · 抖音上传与填表</b><small>使用独立登录资料；应用停在发布前</small></div>
+            <div className="publish-browser-row">
+              <label>投稿浏览器<select value={publishBrowser} onChange={(event) => setPublishBrowser(event.target.value)}><option value="chromium">Chromium</option><option value="msedge">Microsoft Edge</option></select></label>
+              <div className="inline-actions"><button onClick={() => void loadPublishStatus()}>检查抖音 Profile</button><button onClick={() => void openDouyinPublisher()}>手动打开创作者中心</button></div>
+            </div>
+            {profileMessage && <p className="publish-status" role="status">{profileMessage}</p>}
+            <div className="publish-douyin-actions">
+              <CopyButton text={douyinPublishCopy} label="复制抖音文案（标题、正文、话题）" />
+              <p>首次使用时请在打开的专用浏览器中登录。应用会上传所选成片并尝试填写标题、正文和话题，然后等待你检查封面、可见范围、声明及话题；不会自动点击发布。</p>
+            </div>
+            {(publishSession.active || publishSession.status !== "idle") && (
+              <div className={`publish-session ${publishSession.status}`}>
+                <div className="publish-session-head">
+                  <b>
+                    {publishSession.status === "waiting_review"
+                      ? "已到人工发布前"
+                      : publishSession.status === "failed"
+                        ? "辅助失败"
+                        : publishSession.status === "finished"
+                          ? "辅助已结束"
+                          : "抖音投稿辅助进行中"}
+                  </b>
+                  <span>{publishSession.active ? "运行中" : "已停止"}</span>
+                </div>
+                {publishSession.error ? <p className="error">{publishSession.error}</p> : <p className="publish-session-message">{publishSession.message}</p>}
+                {publishSession.logs.length > 0 && (
+                  <div className="publish-session-logs">
+                    {publishSession.logs.slice(-12).map((line, index) => <p key={`${line}-${index}`}>{line}</p>)}
+                  </div>
+                )}
+              </div>
+            )}
+          </>
         )}
       </section>
 
@@ -4074,20 +5184,36 @@ function App() {
         <div className="publish-submit-hint">
           {!publishVideoReady && <span>请先选择一份可投稿的成片。</span>}
         </div>
-        <button className="danger" onClick={closePublishBrowser}>
-          关闭后台 B 站浏览器
-        </button>
-        <button className="primary" onClick={publishAssist} disabled={!publishVideoReady} title={!publishVideoReady ? "请先选择成片" : "打开 B 站投稿辅助"}>
-          打开 B 站投稿页面并填充 →
-        </button>
+        {publishPlatform === "bilibili" ? (
+          <>
+            <button className="danger" onClick={closePublishBrowser}>
+              关闭后台 B 站浏览器
+            </button>
+            <button className="primary" onClick={publishAssist} disabled={!publishVideoReady} title={!publishVideoReady ? "请先选择成片" : "打开 B 站投稿辅助"}>
+              打开 B 站投稿页面并填充 →
+            </button>
+          </>
+        ) : (
+          <>
+            <button className="danger" onClick={closePublishBrowser}>关闭抖音辅助浏览器</button>
+            <button className="primary" onClick={() => void publishDouyinAssist()} disabled={!publishVideoReady || publishSession.active} title={!publishVideoReady ? "请先选择成片" : "上传成片并辅助填写，停在最终发布前"}>
+              上传成片并辅助填写 →
+            </button>
+          </>
+        )}
       </footer>
       {templateEditorOpen && <div className="modal-backdrop" role="presentation">
         <section className="template-modal" role="dialog" aria-modal="true" aria-label="编辑文案模板">
-          <header><div><p className="eyebrow">文案模板</p><h2>新建或编辑模板</h2></div><button onClick={() => setTemplateEditorOpen(false)} aria-label="关闭模板编辑器">×</button></header>
+          <header><div><p className="eyebrow">{publishPlatform === "douyin" ? "抖音文案模板" : "B 站文案模板"}</p><h2>新建或编辑模板</h2></div><button onClick={() => setTemplateEditorOpen(false)} aria-label="关闭模板编辑器">×</button></header>
           <label>模板名称<input value={templateDraftName} placeholder="例如：授权转载说明" onChange={(event) => setTemplateDraftName(event.target.value)} /></label>
           <label>模板内容<textarea value={templateBody} onChange={(event) => setTemplateBody(event.target.value)} /></label>
-          <div className="inline-actions"><button onClick={() => insertTemplateVariable("{source}")}>{"{source}"}</button><button onClick={() => insertTemplateVariable("{custom_text}")}>{"{custom_text}"}</button></div>
-          <div className="template-preview"><b>预览效果</b><p>{(templateBody || "填写模板内容后自动预览").replaceAll("{source}", sourceUrl || "https://example.com/video").replaceAll("{custom_text}", "自定义内容")}</p></div>
+          <div className="inline-actions">
+            {publishPlatform === "bilibili" && (
+              <button onClick={() => insertTemplateVariable("{source}")}>{"{source}"}</button>
+            )}
+            <button onClick={() => insertTemplateVariable("{custom_text}")}>{"{custom_text}"}</button>
+          </div>
+          <div className="template-preview"><b>预览效果</b><p>{(templateBody || "填写模板内容后自动预览").replaceAll("{source}", publishPlatform === "douyin" ? "" : (sourceUrl || "https://example.com/video")).replaceAll("{custom_text}", "自定义内容")}</p></div>
           <footer><button onClick={() => setTemplateEditorOpen(false)}>取消</button><button className="primary" onClick={saveTemplate}>保存模板</button></footer>
         </section>
       </div>}
@@ -4100,6 +5226,7 @@ function App() {
           <p className="eyebrow">视频任务库</p>
           <h1>任务库</h1>
           <p>汇总待处理、处理中、可继续和已完成任务。同一时间只运行一个耗资源阶段。</p>
+          <p className="library-cost-legend"><NavIcon name="text" className="app-icon" />金额为累计估算；0.2.52 之前的费用未记录。</p>
         </div>
         <div className="library-header-actions">
           <button onClick={() => void Promise.all([loadJobHistory(), loadRestorableJobs()])}>刷新</button>
@@ -4213,7 +5340,7 @@ function App() {
                   {missingOutput && <span className="missing-output-tag">无输出目录</span>}
                 </div>
                 <div className="video-library-meta">
-                  <span className={`library-status ${category}`}>{statusText}</span>
+                  <span className={`library-status ${category}`}><NavIcon name={category === "completed" ? "check" : category === "active" ? "running" : category === "attention" ? "error" : "pause"} className="app-icon" />{statusText}</span>
                   <span>{item.stage || "等待配置"}</span>
                   <span>{item.created_at ? new Date(item.created_at * 1000).toLocaleString() : "时间未知"}</span>
                 </div>
@@ -4221,6 +5348,17 @@ function App() {
                   <div className="library-progress" aria-label={`处理进度 ${item.progress}%`}><i style={{ width: `${item.progress}%` }} /></div>
                 )}
                 {item.error && <TaskErrorSummary message={item.error} />}
+              </div>
+              <div className="library-cost-column" aria-label="翻译费用">
+                <span className="library-cost-label">翻译费用</span>
+                <strong>{item.llm_usage_total?.cost ? costLabel(item.llm_usage_total) : "未记录"}</strong>
+                <small>{item.llm_usage_total ? `累计估算 · ${item.llm_usage_total.http_requests} 次请求` : "旧任务未统计"}</small>
+                <button className="library-cost-detail" onClick={() => setExpandedCostId((current) => current === item.id ? null : item.id)}>{item.llm_usage_total ? "查看费用" : "为什么未记录"}</button>
+                {expandedCostId === item.id && (
+                  <div className="library-cost-breakdown">
+                    {item.llm_usage_total ? Object.entries(item.llm_usage_total.by_kind ?? {}).map(([kind, value]) => <span key={kind}><b>{({ source_correction: "源文校对", translation: "字幕翻译", review: "译文复审", formatting: "字幕精简", metadata: "标题标签", segmentation: "语义断句", single_translation: "单条重译" } as Record<string, string>)[kind] ?? kind}</b><em>{costLabel(value)}</em></span>) : <span>0.2.52 之前的任务没有费用用量记录，无法补算。</span>}
+                  </div>
+                )}
               </div>
               <div className="video-library-actions">
                 {resumable || category === "active" || !missingOutput ? (
@@ -4332,7 +5470,7 @@ function App() {
             {jobHistory.map((item) => (
               <article key={item.id} className="history-row">
                 <span className={`history-status ${item.status}`}>
-                  {item.status === "completed" ? "完成" : item.status === "failed" ? "失败" : item.status === "cancelled" ? "已取消" : item.status}
+                  <NavIcon name={item.status === "completed" ? "check" : item.status === "failed" ? "error" : item.status === "cancelled" ? "pause" : "running"} className="app-icon" />{item.status === "completed" ? "完成" : item.status === "failed" ? "失败" : item.status === "cancelled" ? "已取消" : item.status}
                 </span>
                 <b title={item.title}>{item.title}</b>
                 <small>{item.created_at ? new Date(item.created_at * 1000).toLocaleString() : "—"}</small>
@@ -4377,7 +5515,7 @@ function App() {
           {viewedTask ? viewedTask.files.map((file) => (
             <article key={file.id} className="file-row">
               <label className="delete-check" title={selectedOutputPaths.includes(viewedTask.id) ? "已选择整个任务，无需重复选择内部文件" : "勾选后点上方“删除选中项”"}><input type="checkbox" disabled={selectedOutputPaths.includes(viewedTask.id) || (selectedOutputPaths.length >= 200 && !selectedOutputPaths.includes(file.id))} checked={selectedOutputPaths.includes(file.id) || selectedOutputPaths.includes(viewedTask.id)} onChange={(event) => setSelectedOutputPaths((values) => event.target.checked ? [...values, file.id] : values.filter((value) => value !== file.id))} /><small>删除</small></label>
-              <span>{file.kind}</span>
+              <span className="file-kind"><NavIcon name={fileIconName(file.kind, file.name)} className="app-icon" />{file.kind}</span>
               <b>{file.name}</b>
               <small>{file.size_label}</small>
               <button onClick={() => void openOutputPath(file.id)}>打开</button>
@@ -4418,7 +5556,7 @@ function App() {
             设置
           </button>
           <button className="text-button" onClick={() => setInspectorOpen((value) => !value)}>
-            检查器
+            任务详情
           </button>
           <details className="top-more">
             <summary>更多</summary>
@@ -4478,16 +5616,20 @@ function App() {
       >
         <nav className="side-nav" aria-label="工作区导航">
           <p className="eyebrow">工作区</p>
-          {nav.map(([id, label, hint]) => (
+          {nav.map(([id, label, hint, icon]) => (
             <button
               key={id}
               className={view === id ? "active" : ""}
               onClick={() => setView(id)}
             >
-              <b>{label}</b>
+              <b className="nav-label"><NavIcon name={icon} /><span>{label}</span></b>
               <small>{hint}</small>
             </button>
           ))}
+          <button className="inspector-nav-button" onClick={() => setInspectorOpen(true)} disabled={!job} aria-label={job ? "打开详情与费用" : "请先载入任务"}>
+            <b className="nav-label"><NavIcon name="check" /><span>详情与费用</span></b>
+            <small>{job ? "进度、费用与日志" : "请先载入任务"}</small>
+          </button>
           <div className="nav-status">
             <span>授权确认</span>
             <b>{authorized ? "已确认" : "待确认"}</b>
@@ -4505,16 +5647,18 @@ function App() {
           <aside className="inspector">
             <div className="inspector-head">
               <div>
-                <p className="eyebrow">任务检查器</p>
+                <p className="eyebrow">任务详情</p>
                 <h2>{job?.stage ?? "等待任务"}</h2>
               </div>
               <button
                 onClick={() => setInspectorOpen(false)}
-                aria-label="收起检查器"
+                aria-label="收起任务详情"
               >
                 ×
               </button>
             </div>
+            <p className="inspector-subtitle">进度 · 费用 · 日志</p>
+            <div className="inspector-body">
             {job && (
               <>
                 <div className="progress-area">
@@ -4534,13 +5678,16 @@ function App() {
                   <div className="inspector-stages">
                     {workflowStageMeta.map(([id, label]) => (
                       <div key={id} className={job.stages?.[id]?.status ?? "pending"}>
-                        <span>{job.stages?.[id]?.status === "completed" ? "✓" : job.current_stage === id ? "●" : "○"}</span>
+                        <span aria-hidden="true"><NavIcon name={job.stages?.[id]?.status === "completed" ? "check" : job.stages?.[id]?.status === "running" || job.current_stage === id ? "running" : ["failed", "stale", "interrupted"].includes(job.stages?.[id]?.status ?? "") ? "error" : "pause"} className="app-icon" /></span>
                         <b>{label}</b>
                         <small>{stageStatusLabel[job.stages?.[id]?.status ?? "pending"]}</small>
                       </div>
                     ))}
                   </div>
                 )}
+                {(job.llm_usage || job.llm_usage_total || ["deepseek", "openai"].includes(job.options.translator)) && <LlmUsagePanel usage={job.llm_usage} total={job.llm_usage_total} />}
+                <details className="job-options-details">
+                  <summary>本次任务设置</summary>
                 <dl className="job-options">
                   <div>
                     <dt>转写</dt>
@@ -4589,6 +5736,7 @@ function App() {
                     </dd>
                   </div>
                 </dl>
+                </details>
                 <section className="compact-log">
                   <div className="log-head"><p className="eyebrow">{showFullLogs ? "完整日志" : "最近日志"}</p><div className="log-actions"><CopyButton text={buildDebugText()} label="复制调试信息" /><button onClick={() => void toggleFullLogs()}>{showFullLogs ? "收起" : `查看完整日志${job.log_total ? `（${job.log_total} 行）` : ""}`}</button></div></div>
                   {showFullLogs && fullLogsTruncated && <p>日志较长，仅显示最近 5000 行。</p>}
@@ -4637,21 +5785,24 @@ function App() {
                 )}
               </>
             )}
+            </div>
           </aside>
         )}
       </section>
       {settingsOpen && (
-        <div className="settings-drawer" role="dialog" aria-modal="true">
+        <div className="settings-backdrop" role="presentation" onClick={() => setSettingsOpen(false)}>
+        <div className="settings-drawer" role="dialog" aria-modal="true" aria-label="接口与下载设置" onClick={(event) => event.stopPropagation()}>
           <div className="drawer-head">
             <div>
-              <p className="eyebrow">本地设置</p>
-              <h2>密钥与浏览器权限</h2>
+               <p className="eyebrow">本地设置</p>
+               <h2>翻译服务与下载访问</h2>
             </div>
-            <button onClick={() => setSettingsOpen(false)}>×</button>
+            <button onClick={() => setSettingsOpen(false)} aria-label="关闭接口与下载设置">×</button>
           </div>
-          <p>密钥只会写入本机 `.env`，不会通过接口重新读取或显示。</p>
+           <p className="settings-intro">按翻译服务和下载访问分组。密钥只会写入本机 `.env`，不会通过接口重新读取或显示。</p>
+           <div className="settings-section-label"><NavIcon name="translate" className="app-icon" /><b>翻译服务</b><span>在线 API / 本地模型</span></div>
           <label>
-            当前翻译器
+             翻译服务（在线 / 本地）
           <select
             value={options.translator}
             onChange={(event) => changeTranslator(event.target.value)}
@@ -4663,8 +5814,8 @@ function App() {
           </label>
           {options.translator === "ollama" ? (
             <p className="drawer-note">Ollama 不需要 API Key。模型状态会在依赖中心动态检测。</p>
-          ) : <label>
-            API Key
+           ) : <label>
+             在线服务 API Key
             <input
               type="password"
               value={apiKey}
@@ -4672,6 +5823,7 @@ function App() {
               onChange={(event) => setApiKey(event.target.value)}
             />
           </label>}
+           <div className="settings-section-label"><NavIcon name="download" className="app-icon" /><b>下载访问</b><span>Cookies、验证和代理</span></div>
           <label>
             YouTube Cookies 来源
             <select
@@ -4749,9 +5901,10 @@ function App() {
               同一地址用于元数据、视频、封面和浏览器验证；只保存在本机设置，不会写入任务历史或日志。
             </small>
           </label>
-          <button className="primary" onClick={saveSettings}>
-            保存本地设置并应用本次访问参数
-          </button>
+          <div className="settings-drawer-footer"><button className="primary" onClick={saveSettings} disabled={savingSettings} aria-busy={savingSettings}>
+            {savingSettings ? "正在保存本地设置…" : "保存本地设置并应用本次访问参数"}
+          </button></div>
+        </div>
         </div>
       )}
       {pendingDelete && (
@@ -4839,13 +5992,19 @@ function App() {
                       )}
                     </div>
                     <div className="dependency-actions">
-                      {dependency.available ? <span>可用</span> : dependency.installable ? (
+                      {dependency.available ? <span>可用</span> : dependency.id === "tesseract" && dependency.installer_available ? (
+                        <button className="primary small" disabled={tesseractInstallerBusy} onClick={() => void startTesseractInstaller()}>{tesseractInstallerBusy ? "等待安装完成…" : "启动安装器"}</button>
+                      ) : dependency.installable ? (
                         <button className="primary small" disabled={Boolean(dependencyJob && ["queued", "running", "cancelling"].includes(dependencyJob.status))} onClick={() => void installDependency(dependency)}>
                           {active ? dependencyJob?.status === "cancelling" ? "取消中" : dependency.action_label === "下载模型" ? "下载中" : "安装中" : dependencyJob?.dependency_id === dependency.id && ["failed", "cancelled"].includes(dependencyJob.status) ? "重试" : dependency.action_label ?? "安装"}
                         </button>
                       ) : dependency.action_url ? (
                         <a href={dependency.action_url} target="_blank" rel="noreferrer">{dependency.action_label ?? "安装说明"}</a>
-                      ) : <span>{dependency.state === "stopped" ? "请启动 Ollama" : dependency.state === "unavailable" ? "请重新检测" : dependency.depends_on ? "等待运行环境" : "需手动安装"}</span>}
+                      ) : dependency.id === "ollama-runtime" && dependency.state === "stopped" ? (
+                        <button className="primary small" disabled={ollamaStartBusy} onClick={() => void startOllama()}>
+                          {ollamaStartBusy ? "启动中…" : "启动 Ollama"}
+                        </button>
+                      ) : <span>{dependency.state === "unavailable" ? "请重新检测" : dependency.depends_on ? "等待运行环境" : "需手动安装"}</span>}
                     </div>
                   </article>
                 );
@@ -4879,7 +6038,7 @@ function App() {
             </section>
             <section className="help-section">
               <b>快捷键</b>
-              <dl className="shortcut-list"><div><dt>Ctrl + O</dt><dd>选择本地视频（先确认授权）</dd></div><div><dt>Ctrl + L</dt><dd>回到素材区并聚焦视频链接</dd></div><div><dt>Ctrl + R</dt><dd>执行顶部主操作（检查准备 / 继续下一阶段）</dd></div><div><dt>Esc</dt><dd>只中断当前运行阶段，保留已完成检查点</dd></div></dl>
+              <dl className="shortcut-list"><div><dt>Ctrl + O</dt><dd>选择本地视频（先确认授权）</dd></div><div><dt>Ctrl + L</dt><dd>回到素材区并聚焦视频链接</dd></div><div><dt>Ctrl + R</dt><dd>执行顶部主操作（检查准备 / 继续下一阶段）</dd></div><div><dt>Alt + ↑ / ↓</dt><dd>字幕页切换上一条 / 下一条（输入框内不触发）</dd></div><div><dt>空格</dt><dd>字幕页播放或暂停当前字幕（输入框内不触发）</dd></div><div><dt>Ctrl + S</dt><dd>保存字幕草稿</dd></div><div><dt>Esc</dt><dd>只中断当前运行阶段，保留已完成检查点</dd></div></dl>
             </section>
             <footer><button className="primary" onClick={() => setShortcutHelpOpen(false)}>知道了</button></footer>
           </section>

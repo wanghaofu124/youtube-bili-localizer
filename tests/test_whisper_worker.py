@@ -2,14 +2,24 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from yblocalizer.models import Segment, save_segments
 from yblocalizer.runtime import CancellationRequested
 from yblocalizer.subtitle import write_srt
-from yblocalizer.transcribe import WhisperCudaOutOfMemory, _run_whisper_worker, _transcribe_audio_isolated
+from yblocalizer.transcribe import WhisperCudaOutOfMemory, _run_whisper_worker, _transcribe_audio_isolated, _write_asr_evidence
 from yblocalizer.whisper_worker import main as whisper_worker_main
+
+
+def test_asr_evidence_sanitizes_nonfinite_probability(tmp_path: Path) -> None:
+    path = tmp_path / "asr-evidence.json"
+    _write_asr_evidence(path, SimpleNamespace(language="es", language_probability=float("nan")), model_size="small", requested_language=None, suspect_intervals=[{"start": 1.0, "end": 2.0}])
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["detected_language"] == "es"
+    assert data["language_probability"] is None
+    assert data["suspect_intervals"]
 
 
 def test_worker_failure_preserves_existing_results(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

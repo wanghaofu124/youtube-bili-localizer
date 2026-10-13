@@ -2,6 +2,12 @@
 
 面向**已获授权视频**的 Python 本地化工具：将本地文件或授权 URL 转为中文字幕硬字幕视频，并在人工确认前辅助填写 B 站投稿信息。
 
+0.2.52 起，任务检查器提供按环节的翻译费用小表，任务库显示累计估算金额。包含校对、断句、翻译、复审、精简和手工重译；重试的已知用量计入，未返回用量的请求标为待核对。缓存复用不产生新 API 费用。累计从该版本开始记录，旧任务过去未记录的费用不补算。
+
+官方 DeepSeek 精确模型（`deepseek-flash`、`deepseek-v4-flash`、`deepseek-v4-flash-vision-exp`、`deepseek-v4-pro`）在 `https://api.deepseek.com` 下自动使用 2026-10-11 的人民币价格预设。按请求开始时的缓存输入、普通输入和输出分别估算，不重复计算思考 Token；缓存拆分缺失时显示区间。价格来源为 [DeepSeek 官方定价](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)，2026 节假日依据[国务院通知](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm)。未知年份的工作日峰时采用峰谷区间。第三方网关、未知模型和未返回用量显示待核对，不估算为零。高级设置可填写三项自定义人民币单价，服务、接口 origin、模型必须全部匹配；价格在调用时冻结，改价不追溯重算历史，也不使字幕缓存失效。估算值不代表实际扣费，最终以服务商账单为准。
+
+任务检查器保留请求、重试、Token 和缓存复用明细。每次处理在任务目录的 `.attempt-llm-*` 中保存 `llm_usage.jsonl` 与原子写入的 `llm_usage.json`；任务累计保存于 `llm_usage_index.json`，按 session 身份与 revision 替换聚合，重复回调不重复计费。重开任务只读取一次索引，页面轮询使用内存；不保存请求正文、译文或凭据。统计失败不会中断翻译，也不会使旧字幕重新翻译。DeepSeek 快速模式从 0.2.51 起默认启用。
+
 > 仅处理你拥有版权、已取得明确授权或许可证允许下载、改编与转载的素材。本项目不绕过登录、验证码、风控或版权限制；B 站流程不会自动点击“立即投稿”。
 
 ## 演示与能力
@@ -109,7 +115,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
 公开交付应使用固定的 Python 3.12 构建环境：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1 -Clean -Version 0.2.6 -PythonExe C:\Python312\python.exe
+powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1 -Clean -Version 0.2.55 -PythonExe C:\Python312\python.exe
 ```
 
 `requirements-build.lock` 固定 Windows onedir 构建依赖。若已安装 Inno Setup 6，可继续执行 `scripts\build_installer.ps1` 生成带卸载项和快捷方式的普通用户安装程序；脚本会从 Inno 官方仓库获取固定提交的简体中文语言文件，并校验 SHA-256。公开 Release 应提供代码签名证书，并给两个脚本传入 `-SigningThumbprint` 与 `-RequireSignature`；本地测试包可以保持未签名，但不应冒充正式签名版本。

@@ -213,9 +213,9 @@ def redistribute_sentence_translations(
         if not zh:
             # Keep English timing even if translation is empty.
             for slot in slots:
-                output.append(Segment(slot.start, slot.end, slot.text, ""))
+                output.append(Segment(slot.start, slot.end, slot.text, "", translated.needs_review))
             continue
-        mapped = _map_translation_to_slots(zh, slots, timing_words=unit.timing_words)
+        mapped = _map_translation_to_slots(zh, slots, timing_words=unit.timing_words, needs_review=translated.needs_review)
         output.extend(mapped)
     merged = _coalesce_incomplete_zh_cues(output)
     merged = _reflow_dense_segments(merged, units)
@@ -249,7 +249,7 @@ def redistribute_dense_translations_to_existing_slots(
         ):
             output.append(segment)
             continue
-        mapped = _map_translation_to_slots(translated, slots)
+        mapped = _map_translation_to_slots(translated, slots, needs_review=segment.needs_review)
         if len(mapped) < 2 or "".join(item.translated_text or "" for item in mapped) != translated:
             output.append(segment)
             continue
@@ -296,7 +296,7 @@ def normalize_dense_translation_cues(segments: list[Segment]) -> list[Segment]:
             if end <= cursor:
                 children = []
                 break
-            children.append(Segment(cursor, end, source_part, part))
+            children.append(Segment(cursor, end, source_part, part, segment.needs_review))
             cursor = end
 
         if len(children) != len(parts) or "".join(item.translated_text or "" for item in children) != text:
@@ -410,7 +410,7 @@ def _coalesce_incomplete_zh_cues(segments: list[Segment]) -> list[Segment]:
     if len(segments) <= 1:
         return segments
     output = [
-        Segment(item.start, item.end, item.text, item.translated_text)
+        Segment(item.start, item.end, item.text, item.translated_text, item.needs_review)
         for item in segments
     ]
     merges: list[dict[str, object]] = []
@@ -427,6 +427,7 @@ def _coalesce_incomplete_zh_cues(segments: list[Segment]) -> list[Segment]:
                 max(current.end, following.end),
                 _join_slot_texts([current, following]),
                 f"{left}{right}",
+                current.needs_review or following.needs_review,
             )
             output.pop(index + 1)
             continue
@@ -468,6 +469,7 @@ def _map_translation_to_slots(
     slots: list[Segment],
     *,
     timing_words: list[TimedWord] | None = None,
+    needs_review: bool = False,
 ) -> list[Segment]:
     """Attach ZH to slots without cutting inside Chinese words.
 
@@ -476,7 +478,7 @@ def _map_translation_to_slots(
     """
     slot_in = len(slots)
     if slot_in == 1:
-        result = [Segment(slots[0].start, slots[0].end, slots[0].text, zh)]
+        result = [Segment(slots[0].start, slots[0].end, slots[0].text, zh, needs_review)]
     else:
         parts = _partition_by_clauses(zh, slot_in, slots=slots)
         mode = "punct" if parts is not None else "merge_sentence"
@@ -486,7 +488,7 @@ def _map_translation_to_slots(
                     slots[0].start,
                     slots[-1].end,
                     _join_slot_texts(slots),
-                    zh,
+                    zh, needs_review,
                 )
             ]
         else:
@@ -494,7 +496,7 @@ def _map_translation_to_slots(
             if len(parts) != len(mapped_slots):
                 mapped_slots = _merge_slots_to_count(mapped_slots, len(parts))
             result = [
-                Segment(slot.start, slot.end, slot.text, part)
+                Segment(slot.start, slot.end, slot.text, part, needs_review)
                 for slot, part in zip(mapped_slots, parts)
                 if part.strip()
             ]
@@ -507,7 +509,10 @@ def _map_translation_to_slots(
     ):
         adaptive = _split_dense_translation(zh, timing_words)
         if adaptive:
-            result = adaptive
+            result = [
+                Segment(item.start, item.end, item.text, item.translated_text, needs_review)
+                for item in adaptive
+            ]
             mode = "speech_density"
     return result
 
@@ -544,7 +549,13 @@ def _reflow_dense_segments(
             output.append(segment)
             continue
         split = _split_dense_translation(translated, candidates)
-        output.extend(split or [segment])
+        if split:
+            output.extend(
+                Segment(item.start, item.end, item.text, item.translated_text, segment.needs_review)
+                for item in split
+            )
+        else:
+            output.append(segment)
     return output
 
 
@@ -765,13 +776,18 @@ def subtitle_density_overflow_indices(segments: list[Segment]) -> list[int]:
 
 def subtitle_high_reading_speed_count(segments: list[Segment]) -> int:
     """Count captions whose spoken timing exceeds a conservative hard reading rate."""
-    return sum(
-        1
-        for segment in segments
+    return len(subtitle_high_reading_speed_indices(segments))
+
+
+def subtitle_high_reading_speed_indices(segments: list[Segment]) -> list[int]:
+    """Return zero-based captions above the conservative Chinese reading rate."""
+    return [
+        index
+        for index, segment in enumerate(segments)
         if _has_cjk(segment.translated_text or "")
         and segment.end > segment.start
         and _display_units(segment.translated_text or "") / (segment.end - segment.start) > 12.0
-    )
+    ]
 
 
 def _partition_by_clauses(

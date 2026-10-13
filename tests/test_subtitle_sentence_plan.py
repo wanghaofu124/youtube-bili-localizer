@@ -6,7 +6,11 @@ from yblocalizer.subtitle_sentence_plan import (
     normalize_dense_translation_cues,
     redistribute_sentence_translations,
 )
-from yblocalizer.subtitle_speech_pack import TimedWord, pack_cues_from_words
+from yblocalizer.subtitle_speech_pack import (
+    TimedWord,
+    pack_cues_from_words,
+    pack_cues_from_words_detailed,
+)
 import re
 
 
@@ -364,16 +368,16 @@ def test_pack_does_not_keep_phrases_across_scene_cuts() -> None:
         TimedWord(12.0, 12.2, " he"),
         TimedWord(12.2, 12.5, " goes"),
     ]
-    cues = pack_cues_from_words(words)
-    assert [cue.text for cue in cues] == [
-        "it's the last one all", "right guys there", "he goes",
-    ]
+    packed = pack_cues_from_words_detailed(words)
+    cues = packed.cues
+    assert [cue.text for cue in cues] == ["it's the last one", "right guys there", "he goes"]
+    assert [fragment.text for fragment in packed.detached_fragments] == ["all"]
     assert cues[0].end < cues[1].start
     assert cues[1].end < cues[2].start
 
 
 def test_long_pause_all_right_merges_into_following_slot() -> None:
-    """Stretched ``all right`` must not become its own redistribute target."""
+    """A clipped ``all`` is audited instead of becoming an orphan subtitle."""
     words = [
         TimedWord(597.86, 598.22, "all"),
         TimedWord(606.02, 606.14, " right"),
@@ -391,11 +395,12 @@ def test_long_pause_all_right_merges_into_following_slot() -> None:
         TimedWord(615.75, 615.97, " watching"),
         TimedWord(617.13, 617.63, " peace"),
     ]
-    plan = build_sentence_plan(words)
-    assert plan
-    lead_texts = [unit.display_slots[0].text.strip().lower() for unit in plan]
-    assert not any(text in {"all right", "all right."} for text in lead_texts)
-    assert any("all right guys" in unit.source.text.lower() for unit in plan)
+    packed = pack_cues_from_words_detailed(words)
+    assert packed.cues
+    assert packed.detached_fragments[0].text.lower() == "all"
+    assert packed.detached_fragments[0].start == 597.86
+    assert any(cue.text.lower().startswith("right guys") for cue in packed.cues)
+    assert not any(cue.text.lower().startswith("all right") for cue in packed.cues)
 
 
 def test_oh_yeah_stays_one_unit_across_editing_pause() -> None:

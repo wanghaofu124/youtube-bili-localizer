@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable
 import json
 import re
+import unicodedata
 
 from .models import Segment
 
@@ -263,6 +264,12 @@ def words_path_for_segments(segments_json: Path) -> Path:
     return segments_json.with_name(f"{segments_json.stem}.words.json")
 
 
+def raw_words_path_for_segments(segments_json: Path) -> Path:
+    """Return the optional pre-normalization word-clock sidecar path."""
+    path = words_path_for_segments(segments_json)
+    return path.with_name(f"{path.stem}.raw{path.suffix}")
+
+
 def save_words(path: Path, words: list[TimedWord]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -309,17 +316,31 @@ def timed_words_from_whisper_item(item: object) -> list[TimedWord]:
     return words
 
 
-def normalize_word_stream(words: list[TimedWord]) -> list[TimedWord]:
+def _word_identity(text: str) -> str:
+    """Stable duplicate key that preserves non-Latin letters and digits."""
+    normalized = unicodedata.normalize("NFKC", text or "").casefold()
+    return "".join(character for character in normalized if character.isalnum())
+
+
+def normalize_word_stream(
+    words: list[TimedWord], *, stats: dict[str, int] | None = None,
+) -> list[TimedWord]:
     """Sort, drop exact duplicates, and keep a stable left-to-right clock."""
     ordered = sorted(words, key=lambda item: (item.start, item.end, item.word.lower()))
     output: list[TimedWord] = []
     for word in ordered:
         if output:
             previous = output[-1]
-            same_text = _clean_token(previous.word) == _clean_token(word.word)
+            previous_key = _word_identity(previous.word)
+            word_key = _word_identity(word.word)
+            same_text = bool(previous_key) and previous_key == word_key
             overlap = word.start < previous.end - 0.02
             near_dup = same_text and abs(word.start - previous.start) <= 0.12
+            if stats is not None and not previous_key and not word_key and (overlap or abs(word.start - previous.start) <= 0.12):
+                stats["empty_identity_pairs"] = stats.get("empty_identity_pairs", 0) + 1
             if near_dup or (same_text and overlap):
+                if stats is not None:
+                    stats["duplicate_drops"] = stats.get("duplicate_drops", 0) + 1
                 if word.end > previous.end:
                     output[-1] = TimedWord(previous.start, word.end, previous.word)
                 continue
@@ -441,6 +462,10 @@ def _clipped_tail_word_count(group: list[TimedWord], following: TimedWord, gap: 
     if not group or _is_sentence_end(group[-1].word):
         return 0
     tail = group[-1].word
+    # "Did it" is a complete spoken reply; the general incomplete-tail list
+    # keeps "it" attached while packing but must not remove it at a scene cut.
+    if len(group) >= 2 and _clean_token(group[-2].word) == "did" and _clean_token(tail) == "it":
+        return 0
     if len(group) >= 2 and (
         _clean_token(group[-2].word) in {"weve", "youve", "theyve", "ive"}
         and _clean_token(tail) in {"got", "been", "had"}
@@ -690,7 +715,7 @@ def group_speech_translation_units(
     def append_group(items: list[Segment]) -> None:
         text = re.sub(r"\s+([,.;:!?])", r"\1", " ".join(item.text.strip() for item in items)).strip()
         if text:
-            units.append(Segment(items[0].start, items[-1].end, text))
+            units.append(Segment(items[0].start, items[-1].end, text, None, any(item.needs_review for item in items)))
 
     for cue in cues:
         if not group:
@@ -741,6 +766,8 @@ def _best_translation_unit_cut(cues: list[Segment], *, allow_unsafe: bool) -> in
         left, right = cues[index - 1], cues[index]
         left_word = left.text.split()[-1] if left.text.split() else ""
         right_word = right.text.split()[0] if right.text.split() else ""
+        if _is_spanish_quantity_boundary(left_word, right_word):
+            continue
         gap = max(0.0, right.start - left.end)
         unsafe = (
             _is_incomplete_tail(left_word)
@@ -775,7 +802,11 @@ def _best_translation_unit_cut(cues: list[Segment], *, allow_unsafe: bool) -> in
 
 def is_phrase_glued(left: str, right: str) -> bool:
     """True when left+right form a spoken collocation that must stay together."""
+    if _is_spanish_quantity_boundary(left, right):
+        return True
     previous, following = _clean_token(left), _clean_token(right)
+    # Spanish quantities and prepositional number phrases must stay intact
+    # when a speech-timed unit is split (for example, "mil de ...").
     if following == "ever" and not _is_sentence_end(left):
         return True
     if previous.endswith("ing") and following in {
@@ -806,6 +837,22 @@ def is_phrase_glued(left: str, right: str) -> bool:
     if "-" in left.strip() and following and following not in _NON_HEAD_WORDS and not _is_sentence_end(left):
         return True
     return following in _PHRASE_CONTINUATIONS.get(previous, frozenset())
+
+
+def _is_spanish_quantity_boundary(left: str, right: str) -> bool:
+    number_words = {
+        "cien", "ciento", "doscientos", "trescientos", "cuatrocientos",
+        "quinientos", "seiscientos", "setecientos", "ochocientos", "novecientos",
+        "mil", "millón", "millones", "billon", "billón", "billones",
+    }
+    left_token = re.sub(r"^[\W_]+|[\W_]+$", "", left.casefold())
+    right_token = re.sub(r"^[\W_]+|[\W_]+$", "", right.casefold())
+    left_is_number = left_token in number_words or bool(re.fullmatch(r"\d+(?:[.,]\d+)?", left_token))
+    right_is_number = right_token in number_words or bool(re.fullmatch(r"\d+(?:[.,]\d+)?", right_token))
+    return (
+        left_is_number and right_token in {"de", "del"}
+        or left_token in {"de", "del"} and right_is_number
+    )
 
 
 def _compact_len(group: list[TimedWord]) -> int:

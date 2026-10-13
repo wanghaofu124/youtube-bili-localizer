@@ -11,6 +11,7 @@ class Segment:
     end: float
     text: str
     translated_text: str | None = None
+    needs_review: bool = False
 
     @property
     def final_text(self) -> str:

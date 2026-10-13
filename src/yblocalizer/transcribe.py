@@ -3,17 +3,24 @@ from __future__ import annotations
 import os
 import re
 import json
-import ctypes
+import math
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import wave
 from pathlib import Path
 from typing import Callable
 
 from .cancellation import check_cancelled as legacy_check_cancelled
-from .dependencies import require_whisper_model, resolve_command
+from .dependencies import (
+    cuda_runtime_status,
+    nvidia_cuda_dll_directories,
+    prepend_nvidia_cuda_dll_paths,
+    require_whisper_model,
+    resolve_command,
+)
 from .models import Segment, save_segments
 from .performance import cpu_thread_limit, normalize_resource_profile
 from .subtitle import write_srt
@@ -21,6 +28,7 @@ from .subtitle_speech_pack import (
     TimedWord,
     normalize_word_stream,
     pack_cues_from_words,
+    raw_words_path_for_segments,
     save_words,
     timed_words_from_whisper_item,
     words_path_for_segments,
@@ -59,15 +67,16 @@ def transcribe_audio(
     log: LogFn | None = None,
     cancel_check: Callable[[], None] | None = None,
     resource_profile: str = "balanced",
+    evidence_path: Path | None = None,
 ) -> list[Segment]:
     if (getattr(sys, "frozen", False) or os.environ.get("YBLOCALIZER_FORCE_WHISPER_WORKER") == "1") and os.environ.get("YBLOCALIZER_WHISPER_WORKER") != "1":
         return _transcribe_audio_isolated(
             audio_path, segments_json, srt_path, model_size, language, device,
-            compute_type, initial_prompt, beam_size, log, cancel_check, resource_profile,
+            compute_type, initial_prompt, beam_size, log, cancel_check, resource_profile, evidence_path,
         )
     return _transcribe_audio_in_process(
         audio_path, segments_json, srt_path, model_size, language, device,
-        compute_type, initial_prompt, beam_size, log, cancel_check, resource_profile,
+        compute_type, initial_prompt, beam_size, log, cancel_check, resource_profile, evidence_path,
     )
 
 
@@ -84,11 +93,12 @@ def _transcribe_audio_in_process(
     log: LogFn | None = None,
     cancel_check: Callable[[], None] | None = None,
     resource_profile: str = "balanced",
+    evidence_path: Path | None = None,
 ) -> list[Segment]:
     check = cancel_check or legacy_check_cancelled
     check()
     if device.strip().lower() in {"cuda", "auto"}:
-        _prepend_nvidia_cuda_dll_paths()
+        prepend_nvidia_cuda_dll_paths()
     try:
         from faster_whisper import WhisperModel
     except ImportError as exc:
@@ -120,8 +130,9 @@ def _transcribe_audio_in_process(
                 "condition_on_previous_text": False,
                 "word_timestamps": True,
             }
+            info = None
             try:
-                whisper_segments, _info = model.transcribe(
+                whisper_segments, info = model.transcribe(
                     str(audio_path),
                     # The previous 120 ms pad clipped quiet leading words at
                     # speech onsets (verified at 07:17 in the current video).
@@ -129,7 +140,7 @@ def _transcribe_audio_in_process(
                     **transcribe_kwargs,
                 )
             except TypeError:
-                whisper_segments, _info = model.transcribe(str(audio_path), **transcribe_kwargs)
+                whisper_segments, info = model.transcribe(str(audio_path), **transcribe_kwargs)
             # Flatten every Whisper chunk into one word clock, then cut by speech
             # pauses. Per-chunk packing leaves mid-phrase breaks at VAD boundaries
             # (e.g. "handed me" | "this box") that no later merge reliably fixes.
@@ -137,21 +148,58 @@ def _transcribe_audio_in_process(
             for item in whisper_segments:
                 check()
                 whisper_items.append(item)
-            all_words = _timed_words_with_fallback(whisper_items)
-            if all_words:
-                all_words = normalize_word_stream(all_words)
+            raw_words = _timed_words_with_fallback(whisper_items)
+            raw_words_path = raw_words_path_for_segments(segments_json)
+            save_words(raw_words_path, raw_words)
+            normalization_stats: dict[str, int] = {}
+            if raw_words:
+                normalized_words = normalize_word_stream(raw_words, stats=normalization_stats)
+                recovery_audit: dict[str, object] = {}
+                detected_language = str(getattr(info, "language", "") or "").strip() or None
                 all_words = _recover_vad_speech_gaps(
-                    audio_path, model, all_words, transcribe_kwargs, check, logger,
+                    audio_path, model, normalized_words, transcribe_kwargs, check, logger,
+                    normalization_stats=normalization_stats,
+                    retry_language=language or detected_language,
+                    recovery_audit=recovery_audit,
                 )
                 save_words(words_path_for_segments(segments_json), all_words)
                 segments = pack_cues_from_words(all_words)
                 logger(f"按说话时间切分：{len(all_words)} 词 → {len(segments)} 条字幕。")
             else:
+                normalized_words = []
+                all_words = []
+                recovery_audit = {}
                 segments = []
                 for item in whisper_items:
                     segments.extend(_segments_from_whisper(item))
                 words_path_for_segments(segments_json).unlink(missing_ok=True)
             segments = _coalesce_micro_segments(segments)
+            suspect_intervals: list[dict[str, object]] = [
+                {"start": float(getattr(item, "start", 0.0)), "end": float(getattr(item, "end", 0.0)),
+                 "avg_logprob": float(getattr(item, "avg_logprob", 0.0)),
+                 "no_speech_prob": float(getattr(item, "no_speech_prob", 0.0))}
+                for item in whisper_items
+                if (float(getattr(item, "avg_logprob", 0.0)) < -1.0
+                    or float(getattr(item, "no_speech_prob", 0.0)) > 0.6)
+                and float(getattr(item, "end", 0.0)) > float(getattr(item, "start", 0.0))
+            ]
+            suspect_intervals.extend(list(recovery_audit.get("review_intervals", [])))
+            audio_duration = _audio_duration_seconds(audio_path)
+            audit = {
+                "audio_duration_seconds": audio_duration,
+                "raw": _word_clock_audit(raw_words, audio_duration=audio_duration),
+                "normalized": _word_clock_audit(normalized_words, audio_duration=audio_duration),
+                "recovered": _word_clock_audit(all_words, audio_duration=audio_duration),
+                "packed": _word_clock_audit(segments, audio_duration=audio_duration),
+            }
+            _log_word_clock_audit(logger, audit)
+            _write_asr_evidence(
+                evidence_path, info, model_size=model_size, requested_language=language,
+                suspect_intervals=suspect_intervals,
+                transcription_audit=audit,
+                normalization_stats=normalization_stats,
+                recovery_audit=recovery_audit,
+            )
             break
         except Exception as exc:
             last_error = exc
@@ -199,6 +247,28 @@ def _uncovered_speech_gaps(
     return gaps
 
 
+def _recovery_windows(
+    candidates: list[tuple[float, float]], *, max_core_seconds: float = 30.0,
+) -> list[tuple[float, float, int]]:
+    """Split long candidates and interleave them so one gap cannot consume all budget."""
+    queues: list[tuple[int, list[tuple[float, float]]]] = []
+    for candidate_index, (start, end) in enumerate(candidates):
+        windows: list[tuple[float, float]] = []
+        cursor = start
+        while cursor < end:
+            window_end = min(end, cursor + max_core_seconds)
+            windows.append((cursor, window_end))
+            cursor = window_end
+        queues.append((candidate_index, windows))
+    result: list[tuple[float, float, int]] = []
+    while any(windows for _, windows in queues):
+        for candidate_index, windows in queues:
+            if windows:
+                start, end = windows.pop(0)
+                result.append((start, end, candidate_index))
+    return result
+
+
 def _recover_vad_speech_gaps(
     audio_path: Path,
     model: object,
@@ -206,6 +276,9 @@ def _recover_vad_speech_gaps(
     transcribe_kwargs: dict[str, object],
     check: Callable[[], None],
     logger: LogFn,
+    normalization_stats: dict[str, int] | None = None,
+    retry_language: str | None = None,
+    recovery_audit: dict[str, object] | None = None,
 ) -> list[TimedWord]:
     """Recheck only sustained uncovered speech; never invent word timings."""
     from faster_whisper.audio import decode_audio
@@ -215,62 +288,134 @@ def _recover_vad_speech_gaps(
     audio = decode_audio(str(audio_path), sampling_rate=16000)
     speech = get_speech_timestamps(
         audio,
-        VadOptions(min_silence_duration_ms=400, speech_pad_ms=400),
+        VadOptions(threshold=0.35, min_silence_duration_ms=400, speech_pad_ms=400),
         sampling_rate=16000,
     )
     intervals = [(entry["start"] / 16000, entry["end"] / 16000) for entry in speech]
     candidates = _uncovered_speech_gaps(intervals, words)
+    windows = _recovery_windows(candidates)
+    audit = recovery_audit if recovery_audit is not None else {}
+    audit.update({
+        "vad_threshold": 0.35,
+        "candidate_count": len(candidates),
+        "candidate_total_seconds": round(sum(end - start for start, end in candidates), 3),
+        "window_count": len(windows),
+        "window_total_seconds": round(sum(end - start for start, end, _ in windows), 3),
+        "selected_windows": 0,
+        "deferred_windows": 0,
+        "actual_decode_seconds": 0.0,
+        "deferred_decode_seconds": 0.0,
+        "no_segments": 0,
+        "rejected_logprob": 0,
+        "rejected_no_speech": 0,
+        "inserted_words": 0,
+        "review_intervals": [],
+        "review_intervals_total": 0,
+        "review_intervals_truncated": False,
+        "deferred_intervals": [],
+        "deferred_intervals_total": 0,
+        "deferred_intervals_truncated": False,
+    })
     if not candidates:
         logger("人声漏检复核：未发现持续有人声却没有词级字幕的区间。")
         return words
-    if len(candidates) > 24 or sum(end - start for start, end in candidates) > 120:
-        raise RuntimeError(
-            f"人声漏检复核发现 {len(candidates)} 处大范围空白；"
-            "为避免把背景声音误转成字幕，已停止并要求人工检查源音频。"
-        )
-    logger(f"人声漏检复核：检查 {len(candidates)} 个有语音证据的空白区间。")
+    logger(
+        f"人声漏检复核：发现 {len(candidates)} 个待复核区间，"
+        f"拆分为 {len(windows)} 个窗口；使用敏感复核阈值 0.35（不是本片实测最优值）。"
+    )
     recovered: list[TimedWord] = []
-    for gap_start, gap_end in candidates:
+    max_windows = 24
+    max_decode_seconds = 120.0
+    occupied_words = list(words)
+    for core_start, core_end, candidate_index in windows:
         check()
-        crop_start = max(0.0, gap_start - 2.0)
-        crop_end = min(len(audio) / 16000, gap_end + 2.0)
+        crop_start = max(0.0, core_start - 2.0)
+        crop_end = min(len(audio) / 16000, core_end + 2.0)
+        crop_duration = max(0.0, crop_end - crop_start)
+        if audit["selected_windows"] >= max_windows or audit["actual_decode_seconds"] + crop_duration > max_decode_seconds:
+            audit["deferred_windows"] += 1
+            audit["deferred_intervals_total"] += 1
+            audit["deferred_decode_seconds"] += crop_duration
+            if len(audit["deferred_intervals"]) < 64:
+                audit["deferred_intervals"].append({
+                    "start": round(core_start, 3), "end": round(core_end, 3),
+                    "candidate_index": candidate_index,
+                })
+            continue
+        audit["selected_windows"] += 1
+        audit["actual_decode_seconds"] += crop_duration
         crop = audio[int(crop_start * 16000):int(crop_end * 16000)]
         retry_kwargs = dict(transcribe_kwargs)
-        retry_kwargs["vad_filter"] = True
-        segments, _ = model.transcribe(
-            crop,
-            vad_parameters={"min_silence_duration_ms": 400, "speech_pad_ms": 400},
-            **retry_kwargs,
-        )
+        retry_kwargs["language"] = retry_language
+        retry_kwargs["vad_filter"] = False
+        segments, _ = model.transcribe(crop, **retry_kwargs)
+        segment_count = 0
         checked: list[TimedWord] = []
+        accepted_batches: list[tuple[list[TimedWord], float, float]] = []
         for segment in segments:
             check()
-            if float(getattr(segment, "avg_logprob", -1.0)) < -0.7:
+            segment_count += 1
+            avg_logprob = float(getattr(segment, "avg_logprob", -1.0))
+            no_speech_prob = float(getattr(segment, "no_speech_prob", 1.0))
+            if avg_logprob < -0.7:
+                audit["rejected_logprob"] += 1
                 continue
-            if float(getattr(segment, "no_speech_prob", 1.0)) > 0.3:
+            if no_speech_prob > 0.3:
+                audit["rejected_no_speech"] += 1
                 continue
-            checked.extend(
+            shifted = [
                 TimedWord(crop_start + word.start, crop_start + word.end, word.word)
                 for word in _timed_words_with_fallback([segment])
-            )
-        if not any(gap_start <= (word.start + word.end) / 2 <= gap_end for word in checked):
-            continue
-        added = 0
+            ]
+            checked.extend(shifted)
+            accepted_batches.append((shifted, avg_logprob, no_speech_prob))
+        if segment_count == 0:
+            audit["no_segments"] += 1
+        inserted: list[TimedWord] = []
         for word in checked:
             midpoint = (word.start + word.end) / 2
-            if not gap_start - 1.5 <= midpoint <= gap_end + 1.5:
+            if not (
+                core_start - 0.5 <= midpoint <= core_end + 0.5
+                and word.start >= core_start - 0.5
+                and word.end <= core_end + 0.5
+            ):
                 continue
-            if any(word.start < old.end - 0.08 and word.end > old.start + 0.08 for old in words):
+            if any(word.start < old.end - 0.08 and word.end > old.start + 0.08 for old in occupied_words):
                 continue
             recovered.append(word)
-            added += 1
-        if added:
-            logger(f"复核区间 {gap_start:.1f}–{gap_end:.1f}s：补入 {added} 个候选词。")
+            inserted.append(word)
+        if inserted:
+            occupied_words.extend(inserted)
+            audit["inserted_words"] += len(inserted)
+            for batch, avg_logprob, no_speech_prob in accepted_batches:
+                batch_inserted = [word for word in batch if word in inserted]
+                if not batch_inserted:
+                    continue
+                audit["review_intervals_total"] += 1
+                if len(audit["review_intervals"]) < 64:
+                    audit["review_intervals"].append({
+                        "start": round(min(word.start for word in batch_inserted), 3),
+                        "end": round(max(word.end for word in batch_inserted), 3),
+                        "avg_logprob": avg_logprob,
+                        "no_speech_prob": no_speech_prob,
+                        "recovery_review": True,
+                        "reason": "recovery_inserted",
+                    })
+            logger(f"复核区间 {core_start:.1f}–{core_end:.1f}s：补入 {len(inserted)} 个候选词。")
+    audit["deferred_intervals_truncated"] = audit["deferred_intervals_total"] > len(audit["deferred_intervals"])
+    audit["review_intervals_truncated"] = audit["review_intervals_total"] > len(audit["review_intervals"])
+    audit["actual_decode_seconds"] = round(audit["actual_decode_seconds"], 3)
+    audit["deferred_decode_seconds"] = round(audit["deferred_decode_seconds"], 3)
+    if audit["deferred_windows"]:
+        logger(
+            f"人声漏检复核：预算内检查 {audit['selected_windows']} 个窗口，"
+            f"延后 {audit['deferred_windows']} 个窗口；原词流保留，延后区间待复核。"
+        )
     if not recovered:
         logger("人声漏检复核：没有足够可靠的新词；原有转写保持不变。")
         return words
     logger(f"人声漏检复核：共补入 {len(recovered)} 个有真实时间戳的词。")
-    return normalize_word_stream(words + recovered)
+    return normalize_word_stream(words + recovered, stats=normalization_stats)
 
 
 def _transcribe_audio_isolated(
@@ -286,6 +431,7 @@ def _transcribe_audio_isolated(
     log: LogFn | None,
     cancel_check: Callable[[], None] | None,
     resource_profile: str,
+    evidence_path: Path | None = None,
 ) -> list[Segment]:
     logger = log or (lambda _message: None)
     check = cancel_check or legacy_check_cancelled
@@ -300,10 +446,12 @@ def _transcribe_audio_isolated(
             if index:
                 logger("Whisper 子进程异常退出，主程序仍在运行；正在改用 CPU / int8 重试。")
             try:
-                items, temporary_json, temporary_srt = _run_whisper_worker(
+                worker_result = _run_whisper_worker(
                     control_dir, audio_path, model_size, language, attempt_device,
                     attempt_compute, initial_prompt, beam_size, logger, check, resource_profile,
                 )
+                items, temporary_json, temporary_srt = worker_result[:3]
+                temporary_evidence = worker_result[3] if len(worker_result) > 3 else control_dir / "missing-evidence.json"
             except WhisperCudaOutOfMemory as exc:
                 if device.strip().lower() == "cuda":
                     raise
@@ -317,6 +465,12 @@ def _transcribe_audio_isolated(
             temporary_words = words_path_for_segments(temporary_json)
             if temporary_words.is_file():
                 temporary_words.replace(words_path_for_segments(segments_json))
+            temporary_raw_words = raw_words_path_for_segments(temporary_json)
+            if temporary_raw_words.is_file():
+                temporary_raw_words.replace(raw_words_path_for_segments(segments_json))
+            if evidence_path and temporary_evidence.is_file():
+                evidence_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary_evidence.replace(evidence_path)
             return items
         raise last_error or RuntimeError("Whisper 子进程未能启动。")
     finally:
@@ -335,13 +489,14 @@ def _run_whisper_worker(
     logger: LogFn,
     check: Callable[[], None],
     resource_profile: str,
-) -> tuple[list[Segment], Path, Path]:
+) -> tuple[list[Segment], Path, Path, Path]:
     request_path = control_dir / f"request-{device}.json"
     result_path = control_dir / f"result-{device}.json"
     events_path = control_dir / f"events-{device}.jsonl"
     diagnostic_path = control_dir / f"diagnostic-{device}.log"
     temporary_json = control_dir / f"segments-{device}.json"
     temporary_srt = control_dir / f"subtitles-{device}.srt"
+    temporary_evidence = control_dir / f"evidence-{device}.json"
     request_path.write_text(json.dumps({
         "audio_path": str(audio_path),
         "segments_json": str(temporary_json),
@@ -355,6 +510,7 @@ def _run_whisper_worker(
         "initial_prompt": initial_prompt,
         "beam_size": beam_size,
         "resource_profile": resource_profile,
+        "evidence_path": str(temporary_evidence),
     }, ensure_ascii=False), encoding="utf-8")
     if getattr(sys, "frozen", False):
         command = [sys.executable, "--whisper-worker", str(request_path)]
@@ -401,7 +557,148 @@ def _run_whisper_worker(
             raise WhisperCudaOutOfMemory(str(result.get("error") or "Whisper CUDA 显存不足。"))
         raise RuntimeError(f"Whisper 转写失败：{result.get('error') or '未知错误'}")
     from .models import load_segments
-    return load_segments(temporary_json), temporary_json, temporary_srt
+    return load_segments(temporary_json), temporary_json, temporary_srt, temporary_evidence
+
+
+def _write_asr_evidence(
+    path: Path | None,
+    info: object,
+    *,
+    model_size: str,
+    requested_language: str | None,
+    suspect_intervals: list[dict[str, object]] | None = None,
+    transcription_audit: dict[str, object] | None = None,
+    normalization_stats: dict[str, int] | None = None,
+    recovery_audit: dict[str, object] | None = None,
+) -> None:
+    if not path:
+        return
+    language = str(getattr(info, "language", "") or "").strip() or None
+    probability_raw = getattr(info, "language_probability", None)
+    try:
+        probability = float(probability_raw) if probability_raw is not None else None
+    except (TypeError, ValueError):
+        probability = None
+    if probability is not None and not math.isfinite(probability):
+        probability = None
+    evidence = {
+        "version": 1,
+        "model": model_size,
+        "requested_language": requested_language or None,
+        "detected_language": language,
+        "language_probability": probability,
+        "suspect_intervals": suspect_intervals or [],
+        "transcription_audit": transcription_audit or {},
+        "normalization_stats": normalization_stats or {},
+        "recovery_audit": recovery_audit or {},
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _audio_duration_seconds(path: Path) -> float | None:
+    try:
+        with wave.open(str(path), "rb") as handle:
+            rate = handle.getframerate()
+            return handle.getnframes() / rate if rate else None
+    except (OSError, EOFError, wave.Error):
+        return None
+
+
+def _word_clock_audit(items: list[object], *, audio_duration: float | None = None) -> dict[str, object]:
+    intervals = sorted(
+        (float(getattr(item, "start", 0.0)), float(getattr(item, "end", 0.0)))
+        for item in items
+        if float(getattr(item, "end", 0.0)) > float(getattr(item, "start", 0.0))
+    )
+    coverage = 0.0
+    gaps_ge_10_count = 0
+    gaps_ge_10_seconds = 0.0
+    gap_intervals: list[dict[str, float]] = []
+    cursor: float | None = None
+    if not intervals and audio_duration is not None and audio_duration >= 10.0:
+        gaps_ge_10_count = 1
+        gaps_ge_10_seconds = audio_duration
+        gap_intervals.append({
+            "start": 0.0,
+            "end": round(audio_duration, 3),
+            "duration": round(audio_duration, 3),
+        })
+    if intervals and audio_duration is not None and intervals[0][0] >= 10.0:
+        gap = intervals[0][0]
+        gaps_ge_10_count += 1
+        gaps_ge_10_seconds += gap
+        gap_intervals.append({"start": 0.0, "end": round(intervals[0][0], 3), "duration": round(gap, 3)})
+    for start, end in intervals:
+        if cursor is None:
+            cursor = end
+            continue
+        if start > cursor:
+            gap = start - cursor
+            if gap >= 10.0:
+                gaps_ge_10_count += 1
+                gaps_ge_10_seconds += gap
+                if len(gap_intervals) < 64:
+                    gap_intervals.append({
+                        "start": round(cursor, 3),
+                        "end": round(start, 3),
+                        "duration": round(gap, 3),
+                    })
+        if end > cursor:
+            coverage += max(0.0, end - max(start, cursor)) if start < cursor else end - start
+            cursor = end
+    if cursor is not None and audio_duration is not None and audio_duration - cursor >= 10.0:
+        gap = audio_duration - cursor
+        gaps_ge_10_count += 1
+        gaps_ge_10_seconds += gap
+        if len(gap_intervals) < 64:
+            gap_intervals.append({
+                "start": round(cursor, 3),
+                "end": round(audio_duration, 3),
+                "duration": round(gap, 3),
+            })
+    if intervals and len(intervals) == 1:
+        coverage = intervals[0][1] - intervals[0][0]
+    elif intervals:
+        # Recompute union length without depending on the gap loop above.
+        coverage = 0.0
+        union_start, union_end = intervals[0]
+        for start, end in intervals[1:]:
+            if start > union_end:
+                coverage += union_end - union_start
+                union_start, union_end = start, end
+            else:
+                union_end = max(union_end, end)
+        coverage += union_end - union_start
+    return {
+        "count": len(items),
+        "union_coverage_seconds": round(max(0.0, coverage), 3),
+        "gaps_ge_10_seconds": {
+            "count": gaps_ge_10_count,
+            "total_seconds": round(gaps_ge_10_seconds, 3),
+            "intervals": gap_intervals,
+            "truncated": gaps_ge_10_count > len(gap_intervals),
+        },
+    }
+
+
+def _log_word_clock_audit(logger: LogFn, audit: dict[str, object]) -> None:
+    for stage in ("raw", "normalized", "recovered", "packed"):
+        entry = audit[stage]
+        gaps = entry["gaps_ge_10_seconds"]
+        logger(
+            f"ASR时间覆盖审计[{stage}]：{entry['count']}项，合并覆盖 "
+            f"{entry['union_coverage_seconds']:.3f}s；≥10秒未覆盖/待复核区间 "
+            f"{gaps['count']}段/{gaps['total_seconds']:.3f}s。"
+        )
+        if stage == "recovered" and gaps["intervals"]:
+            points = ", ".join(
+                f"{item['start']:.3f}–{item['end']:.3f}s"
+                for item in gaps["intervals"][:8]
+            )
+            logger(f"ASR时间覆盖审计[recovered]：仍未覆盖/待复核起止点：{points}。")
 
 
 def _forward_worker_events(path: Path, offset: int, logger: LogFn) -> int:
@@ -591,126 +888,5 @@ def _dedupe_attempts(attempts: list[tuple[str, str, str]]) -> list[tuple[str, st
     return output
 
 
-def _nvidia_cuda_dll_directories() -> list[Path]:
-    roots: list[Path] = []
-    explicit_directories: list[Path] = []
-    try:
-        import nvidia
-    except ImportError:
-        pass
-    else:
-        roots.extend(Path(item) for item in getattr(nvidia, "__path__", ()))
-        module_file = getattr(nvidia, "__file__", None)
-        if module_file:
-            roots.append(Path(module_file).parent)
-
-    configured = os.environ.get("YBLOCALIZER_CUDA_DLL_DIR", "").strip()
-    if configured:
-        explicit_directories.append(Path(configured))
-
-    # The onedir application intentionally does not bundle ~1.7 GB of optional
-    # NVIDIA libraries. Reuse an existing Python CUDA runtime when present so a
-    # developer or power user does not have to copy DLLs into the application.
-    if os.name == "nt":
-        try:
-            import winreg
-
-            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
-                for access in (winreg.KEY_READ, winreg.KEY_READ | winreg.KEY_WOW64_32KEY, winreg.KEY_READ | winreg.KEY_WOW64_64KEY):
-                    try:
-                        with winreg.OpenKey(hive, r"Software\Python\PythonCore", 0, access) as python_core:
-                            index = 0
-                            while True:
-                                try:
-                                    version = winreg.EnumKey(python_core, index)
-                                except OSError:
-                                    break
-                                index += 1
-                                try:
-                                    with winreg.OpenKey(python_core, version + r"\InstallPath", 0, access) as install_key:
-                                        install_root = Path(str(winreg.QueryValue(install_key, None)))
-                                except OSError:
-                                    continue
-                                roots.append(install_root / "Lib" / "site-packages" / "nvidia")
-                    except OSError:
-                        continue
-
-        except ImportError:
-            pass
-
-        toolkit = Path(os.environ.get("ProgramFiles", "")) / "NVIDIA GPU Computing Toolkit" / "CUDA"
-        if toolkit.is_dir():
-            roots.extend(path for path in toolkit.glob("v*/bin") if path.is_dir())
-
-    candidates: list[Path] = list(explicit_directories)
-    for root in roots:
-        if root.name.lower() == "bin":
-            candidates.append(root)
-        else:
-            candidates.extend([
-                root / "cuda_runtime" / "bin",
-                root / "cublas" / "bin",
-                root / "cudnn" / "bin",
-            ])
-    return list(dict.fromkeys(path for path in candidates if path.is_dir()))
-
-
-def _prepend_nvidia_cuda_dll_paths() -> None:
-    candidates = _nvidia_cuda_dll_directories()
-    existing = os.environ.get("PATH", "")
-    parts = [str(path) for path in candidates]
-    if not parts:
-        return
-    current_lower = {item.lower() for item in existing.split(os.pathsep) if item}
-    missing = [item for item in parts if item.lower() not in current_lower]
-    if missing:
-        os.environ["PATH"] = os.pathsep.join(missing + [existing])
-
-
-def cuda_runtime_status() -> dict[str, object]:
-    """Verify the CUDA libraries that faster-whisper actually loads.
-
-    ``nvidia-smi`` only proves that a display driver sees the GPU.  It does not
-    prove that cuBLAS/cuDNN are installed, which previously let preparation pass
-    and then fail several minutes later in transcription.
-    """
-    if resolve_command("nvidia-smi") is None:
-        return {
-            "available": False,
-            "missing": ["NVIDIA driver"],
-            "message": "未检测到 NVIDIA 显卡驱动（nvidia-smi）。",
-        }
-
-    _prepend_nvidia_cuda_dll_paths()
-    if os.name == "nt":
-        required = (
-            "cublas64_12.dll", "cublasLt64_12.dll",
-            "cudnn64_9.dll", "cudnn_ops64_9.dll",
-        )
-        loader = ctypes.WinDLL
-    else:
-        required = ("libcublas.so.12", "libcudnn.so.9")
-        loader = ctypes.CDLL
-
-    search_dirs = _nvidia_cuda_dll_directories()
-    missing: list[str] = []
-    for name in required:
-        resolved = shutil.which(name)
-        if not resolved:
-            resolved = next((str(path / name) for path in search_dirs if (path / name).is_file()), None)
-        try:
-            loader(resolved or name)
-        except (OSError, TypeError):
-            missing.append(name)
-
-    if missing:
-        return {
-            "available": False,
-            "missing": missing,
-            "message": "显卡驱动可用，但缺少或无法加载 CUDA 转写运行库：" + "、".join(missing) + "。",
-        }
-    return {
-        "available": True,
-        "missing": [],
-        "message": "NVIDIA 驱动、cuBLAS 和 cuDNN 均可加载。",
-    }
+_nvidia_cuda_dll_directories = nvidia_cuda_dll_directories
+_prepend_nvidia_cuda_dll_paths = prepend_nvidia_cuda_dll_paths

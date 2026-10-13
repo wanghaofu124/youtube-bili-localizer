@@ -189,6 +189,22 @@ def record_job(
             connection.close()
 
 
+def update_usage_artifacts(job_id: str, fields: dict[str, Any]) -> None:
+    """Merge accounting only; never overwrite concurrent stage or subtitle state."""
+    with _lock:
+        connection = _connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT artifacts FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row:
+                artifacts = json.loads(row[0] or "{}")
+                artifacts.update(fields)
+                connection.execute("UPDATE jobs SET artifacts=? WHERE id=?", (json.dumps(artifacts, ensure_ascii=False), job_id))
+            connection.commit()
+        finally:
+            connection.close()
+
+
 def list_jobs(limit: int | None = 50) -> list[dict[str, Any]]:
     """Return persisted jobs, newest first.
 

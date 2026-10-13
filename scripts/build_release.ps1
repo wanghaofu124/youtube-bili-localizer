@@ -1,6 +1,6 @@
 param(
     [switch]$Clean,
-    [string]$Version = "0.2.41",
+    [string]$Version = "0.2.55",
     [string]$AppName = "YouTubeBiliLocalizer",
     [string]$PythonExe = "",
     [string]$SigningThumbprint = "",
@@ -76,7 +76,9 @@ if (-not (Test-Path -LiteralPath $BuildPython)) {
 }
 & $BuildPython -m pip install "pip==26.2.1"
 & $BuildPython -m pip install -r (Join-Path $ProjectRoot "requirements-build.lock")
-& $BuildPython -m pip install --no-deps -e $ProjectRoot
+# Build requirements already exist in the pinned release venv; avoid fetching
+# a second, unpinned build environment for the editable project metadata.
+& $BuildPython -m pip install --no-deps --no-build-isolation -e $ProjectRoot
 if ($LASTEXITCODE -ne 0) { throw "isolated build dependency installation failed" }
 
 $Excluded = @(

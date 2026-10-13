@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from yblocalizer.download import DownloadResolutionMismatch, _quality_proposal, _raise_with_youtube_hint, download_with_ytdlp
+from yblocalizer.download import (
+    DownloadProposalMismatch,
+    DownloadResolutionMismatch,
+    _quality_proposal,
+    _raise_with_youtube_hint,
+    download_with_ytdlp,
+)
 from yblocalizer.runtime import CancellationRequested, PipelineContext
 from yblocalizer.translate import _OllamaProcessClient
+from yblocalizer import ollama_worker
 from yblocalizer.workflow import WorkflowArtifacts, _acquire_cache_dir, run_acquire, run_render
 from yblocalizer.workflow import atomic_write_manifest
 from yblocalizer.models import Segment, save_segments
@@ -105,8 +114,13 @@ def test_quality_fingerprint_uses_resolution_not_ephemeral_format_ids(tmp_path: 
 
 
 def test_missing_proposed_resolution_is_rejected_after_download(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    constructed = False
+
     class FakeYDL:
-        def __init__(self, options): self.options = options
+        def __init__(self, options):
+            nonlocal constructed
+            constructed = True
+            self.options = options
         def __enter__(self): return self
         def __exit__(self, *_a): return False
         def extract_info(self, _url, download):
@@ -114,8 +128,9 @@ def test_missing_proposed_resolution_is_rejected_after_download(monkeypatch: pyt
             return {"id": "demo", "title": "demo", "width": 1280, "height": 720}
     monkeypatch.setitem(__import__("sys").modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYDL))
     monkeypatch.setattr("yblocalizer.download._probe_video_dimensions", lambda _path: (1280, 720))
-    with pytest.raises(Exception, match="方案"):
+    with pytest.raises(DownloadProposalMismatch, match="画质记录不完整"):
         download_with_ytdlp("https://example.test/v", tmp_path, quality_proposal={"video_format_id": ""})
+    assert constructed is False
 
 
 def test_proposal_resolution_is_checked_when_ytdlp_selected_dims_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -199,6 +214,46 @@ def test_ollama_worker_cancel_terminates_child(monkeypatch: pytest.MonkeyPatch) 
     with pytest.raises(CancellationRequested):
         _OllamaProcessClient(cancel).create(model="qwen3.5:4b", messages=[{"role": "user", "content": "x"}], temperature=0.1)
     assert calls[0] >= 1 and process.returncode == -9
+
+
+def test_ollama_worker_pipe_preserves_unicode_across_windows_code_pages(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = "¡Hola, niño!"
+    output = "你好，世界"
+    captured: dict[str, str] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        def communicate(self, payload: str, **_kwargs):
+            captured["payload"] = payload
+            return json.dumps({"status": "completed", "content": output}, ensure_ascii=True), ""
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr("yblocalizer.translate.subprocess.Popen", lambda *_args, **_kwargs: FakeProcess())
+    response = _OllamaProcessClient(lambda: None).create(model="translategemma:12b", messages=[{"role": "user", "content": source}])
+    assert captured["payload"].isascii()
+    assert json.loads(captured["payload"])["kwargs"]["messages"][0]["content"] == source
+    assert response.choices[0].message.content == output
+
+    raw_output = io.BytesIO()
+    encoded_output = io.TextIOWrapper(raw_output, encoding="gbk", write_through=True)
+    monkeypatch.setattr(
+        ollama_worker, "sys", SimpleNamespace(stdin=io.StringIO(captured["payload"]), stdout=encoded_output)
+    )
+    monkeypatch.setitem(sys.modules, "httpx", SimpleNamespace(Client=lambda **_kwargs: object(), Timeout=lambda *_args, **_kwargs: object()))
+
+    class FakeOpenAI:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=lambda **_kwargs: SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=output))]
+            )))
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+    assert ollama_worker.main() == 0
+    assert raw_output.getvalue().isascii()
+    assert json.loads(raw_output.getvalue().decode("utf-8"))["content"] == output
 
 
 def _render_options() -> SimpleNamespace:

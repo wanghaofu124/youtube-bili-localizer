@@ -27,7 +27,11 @@ import threading
 import time
 import traceback
 import uuid
+import wave
+import webbrowser
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from .llm_usage import LlmUsageTracker, usage_session, update_usage_index
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -57,7 +61,7 @@ from .dependencies import (
     resolve_command,
 )
 from .models import Segment, load_segments, save_segments
-from .ocr_subtitle import available_ocr_languages
+from .ocr_subtitle import available_ocr_languages, ocr_language_ready
 from .pipeline import (
     CancellationError,
     PipelineOptions,
@@ -84,11 +88,25 @@ from .workbench_config import (
 from .runtime import CancellationRequested, CancellationToken, PipelineContext, PipelineEvent, STAGE_LABELS
 from .job_service import transition_job
 from .publish_bili import assist_publish, open_upload_page
-from .publish_text import build_bilibili_description, delete_custom_template, get_all_templates, save_custom_template
-from .translate import generate_publish_metadata, save_publish_metadata
-from .render import burn_subtitles
+from .publish_douyin import assist_publish as assist_douyin_publish
+from .publish_text import (
+    build_publish_description,
+    delete_custom_template,
+    get_all_templates,
+    normalize_publish_platform,
+    save_custom_template,
+)
+from .translate import compact_overflowing_subtitles, generate_publish_metadata, save_publish_metadata, translate_single_cue
+from .render import burn_subtitles, subtitle_line_capacity
+from .subtitle import translated_layout_issues
+from .subtitle_sentence_plan import (
+    MIN_ESTIMATED_SLOT_DURATION_SEC,
+    subtitle_density_overflow_indices,
+    subtitle_high_reading_speed_indices,
+)
 from .render import render_encoder_status
-from .performance import ffmpeg_thread_args
+from .media import audio_stream_channels, extract_audio
+from .performance import ReviewResourceBusy, cpu_thread_limit, ffmpeg_thread_args, lower_process_priority, normalize_resource_profile, review_cuda_memory
 from .storage import delete_paths, format_bytes, resolve_task_title, scan_outputs
 from .subtitle import write_srt
 from .transcribe import WhisperCudaOutOfMemory, cuda_runtime_status
@@ -110,6 +128,7 @@ from .workflow import (
     validate_srt,
     validate_stage,
 )
+from .asr_review import _atomic_json, _file_fingerprint, _path_signature, next_round, prepare_session, read_session, reset_interrupted_round, resolve_review_language, session_path, start_round, subtitle_commit_path, update_session
 
 LOGGER = logging.getLogger("yblocalizer.workbench")
 JOB_ID_PATTERN = r"(?=[^/]{1,128}(?:/|$))[\w-]+(?:\.[\w-]+)*"
@@ -149,6 +168,7 @@ DEMO_VIDEO = ASSET_ROOT / "demo" / "authorized-demo-10s.mp4"
 OUTPUT_ROOT = USER_DATA_ROOT / "outputs" / "workbench_demo"
 UPLOAD_ROOT = USER_DATA_ROOT / "outputs" / "workbench_uploads"
 MEDIA_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+DOUYIN_UPLOAD_URL = "https://creator.douyin.com/creator-micro/content/upload"
 
 
 def _read_publish_metadata(path: Path | None) -> dict[str, Any]:
@@ -632,6 +652,9 @@ class DemoJob:
     checks: list[dict[str, Any]] = field(default_factory=list)
     artifacts: WorkflowArtifacts = field(default_factory=WorkflowArtifacts)
     checkpoint_validation: str = "pending"
+    llm_usage: dict[str, Any] | None = None
+    llm_usage_index: dict[str, Any] | None = field(default=None, repr=False)
+    llm_run_token: str | None = field(default=None, repr=False)
     cancellation: CancellationToken = field(default_factory=CancellationToken, repr=False)
 
     def add_log(self, message: str) -> None:
@@ -658,6 +681,27 @@ class DemoJob:
         except OSError:
             LOGGER.warning("Could not append per-job log for %s", self.id)
 
+    def refresh_llm_usage(self) -> None:
+        """Read the persisted attempt pointer once when restoring a job."""
+        index_path = self.artifacts.path("llm_usage_index_path")
+        if index_path:
+            try:
+                index = json.loads(index_path.read_text(encoding="utf-8"))
+                if isinstance(index, dict) and index.get("schema_version") == 1 and isinstance(index.get("sessions"), dict):
+                    self.llm_usage_index = index
+                    self.artifacts.llm_usage_total = copy.deepcopy(index.get("total"))
+            except (OSError, ValueError, TypeError):
+                LOGGER.warning("Could not restore cumulative LLM usage for %s", self.id)
+        path = self.artifacts.path("llm_usage_path")
+        if not path:
+            return
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(value, dict) and value.get("schema_version") == 1:
+                self.llm_usage = value
+        except (OSError, ValueError, TypeError):
+            return
+
     def snapshot(self, *, log_after: int | None = None, log_limit: int = 200) -> dict[str, Any]:
         material = self.material.snapshot()
         if self.duration_override is not None:
@@ -676,6 +720,24 @@ class DemoJob:
             if self.stages.get(stage, {}).get("status") == "failed"
             and self.stages.get(stage, {}).get("recovery")
         ), None)
+        asr_summary: dict[str, Any] = {}
+        if self.artifacts.asr_evidence:
+            try:
+                evidence = json.loads(Path(self.artifacts.asr_evidence).read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                evidence = {}
+            if isinstance(evidence, dict):
+                asr_summary = {
+                    "detected_language": evidence.get("detected_language"),
+                    "language_probability": (
+                        evidence.get("language_probability")
+                        if isinstance(evidence.get("language_probability"), (int, float))
+                        and math.isfinite(float(evidence.get("language_probability")))
+                        and 0.0 <= float(evidence.get("language_probability")) <= 1.0
+                        else None
+                    ),
+                }
+        usage_summary = copy.deepcopy(self.llm_usage)
         return {
             "id": self.id, "status": self.status, "stage": self.stage, "progress": self.progress,
             "logs": public_logs, "log_cursor": self.log_sequence, "log_total": self.log_sequence,
@@ -698,6 +760,7 @@ class DemoJob:
                 "mode": self.artifacts.subtitle_extraction_mode,
                 "ocr_status": self.artifacts.ocr_status,
                 "message": self.artifacts.ocr_message,
+                **asr_summary,
             },
             "content_warnings": list(self.artifacts.content_warnings or []),
             "artifact_revision": self.artifacts.revision,
@@ -706,6 +769,8 @@ class DemoJob:
             "publish_copy": _read_publish_metadata(self.artifacts.path("publish_metadata")),
             "quality_proposal": self.options.get("quality_proposal"),
             "quality_consent": bool(self.options.get("quality_consent")),
+            "llm_usage": usage_summary,
+            "llm_usage_total": copy.deepcopy(self.artifacts.llm_usage_total),
         }
 
 
@@ -750,8 +815,11 @@ class WorkbenchJobs:
             "demo": Material("demo", DEMO_VIDEO, "authorized-demo-10s.mp4", demo_duration or 10, demo_width or 1280, demo_height or 720, True, True)
         }
         self._running_id: str | None = None
+        self._subtitle_model_action_id: str | None = None
         self._preparing_ids: set[str] = set()
         self._worker: threading.Thread | None = None
+        self._voice_review_worker: threading.Thread | None = None
+        self._voice_review_process: subprocess.Popen[str] | None = None
         # IDs removed from history remain tombstoned for this process.  This
         # prevents a late worker persist from resurrecting a just-deleted row.
         self._deleted_history_ids: set[str] = set()
@@ -805,6 +873,7 @@ class WorkbenchJobs:
                 # intact in storage, but require an explicit prepare call.
                 checks=[], artifacts=artifacts,
             )
+            job.refresh_llm_usage()
             if job.work_dir and any((artifacts.source_srt, artifacts.translated_srt, artifacts.rendered_video)):
                 job.result = {
                     "output_dir": public_path(job.work_dir) or "",
@@ -820,6 +889,38 @@ class WorkbenchJobs:
                 except OSError:
                     pass
             self._jobs[job.id] = job
+            if job.work_dir:
+                session = read_session(job.work_dir)
+                # A published subtitle commit is authoritative even if the
+                # process stopped between DB persistence and the final review
+                # session checkpoint.  Reconcile only the same immutable ASR
+                # session; never write candidates from an unrelated session.
+                commit_file = artifacts.path("subtitle_commit")
+                if commit_file and commit_file.is_file() and session:
+                    try:
+                        receipt = json.loads(commit_file.read_text(encoding="utf-8"))
+                        translated_file = artifacts.path("translated_segments")
+                        receipt_ok = (
+                            isinstance(receipt, dict)
+                            and str(receipt.get("jobId")) == job.id
+                            and int(receipt.get("toRevision")) == int(artifacts.revision)
+                            and translated_file is not None and translated_file.is_file()
+                            and hmac.compare_digest(str(receipt.get("newFingerprint") or ""), hashlib.sha256(translated_file.read_bytes()).hexdigest())
+                            and str(receipt.get("sessionFingerprint") or "") == str(session.get("session_fingerprint") or "")
+                        )
+                        if receipt_ok and int(session.get("subtitle_revision") or 0) < int(receipt["toRevision"]):
+                            committed_ids = {str(item.get("candidateId")) for item in receipt.get("committed", []) if isinstance(item, dict)}
+                            for item in session.get("result_candidates", []):
+                                if str(item.get("id")) in committed_ids: item["status"] = "committed"
+                            update_session(job.work_dir, candidates=session.get("candidates", []), result_candidates=session.get("result_candidates", []), subtitle_revision=int(receipt["toRevision"]), subtitle_fingerprint=str(receipt.get("newFingerprint")))
+                            session = read_session(job.work_dir) or session
+                    except (OSError, TypeError, ValueError, KeyError):
+                        pass
+                if session and (session.get("status") == "running" or any(item.get("status") == "running" for item in session.get("candidates", []) if isinstance(item, dict))):
+                    try:
+                        reset_interrupted_round(job.work_dir, status="pending", error="上次进程已结束，当前复核窗口可继续。")
+                    except OSError:
+                        LOGGER.warning("Could not reconcile stale ASR review session for %s", job.id)
 
     def materials(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -912,12 +1013,61 @@ class WorkbenchJobs:
                         "auto_run": job.auto_run,
                         "stages": job.stages,
                         "checks": job.checks,
+                        "llm_usage": job.llm_usage,
                         "artifacts": job.artifacts.to_dict(),
                         "options": options_for_storage(job.options),
                         "updated_at": time.time(),
                         })
                     except Exception as exc:
                         LOGGER.warning("Could not mirror manifest for %s: %s", job.id, exc)
+
+    def _reconcile_subtitle_commit(self, job: DemoJob) -> dict[str, Any] | None:
+        """Advance only a matching review session after a published save."""
+        if not job.work_dir:
+            return None
+        session = read_session(job.work_dir)
+        receipt_path = job.artifacts.path("subtitle_commit")
+        if not session or not receipt_path or not receipt_path.is_file():
+            return session
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            translated = job.artifacts.path("translated_segments")
+            valid = (
+                isinstance(receipt, dict) and str(receipt.get("jobId")) == job.id
+                and int(receipt.get("toRevision")) == int(job.artifacts.revision)
+                and translated is not None and translated.is_file()
+                and hmac.compare_digest(str(receipt.get("newFingerprint") or ""), hashlib.sha256(translated.read_bytes()).hexdigest())
+                and str(receipt.get("sessionFingerprint") or "") == str(session.get("session_fingerprint") or "")
+            )
+            if not valid:
+                return session
+            if int(session.get("subtitle_revision") or 0) < int(receipt["toRevision"]):
+                committed = {str(item.get("candidateId")) for item in receipt.get("committed", []) if isinstance(item, dict)}
+                for item in session.get("result_candidates", []):
+                    if str(item.get("id")) in committed: item["status"] = "committed"
+                update_session(job.work_dir, result_candidates=session.get("result_candidates", []), subtitle_revision=int(receipt["toRevision"]), subtitle_fingerprint=str(receipt.get("newFingerprint")))
+                return read_session(job.work_dir) or session
+        except (OSError, TypeError, ValueError, KeyError):
+            return session
+        return session
+
+    def _review_media_is_current(self, job: DemoJob, session: dict[str, Any]) -> bool:
+        expected = session.get("source_video_signature")
+        current = _path_signature(job.artifacts.path("raw_video") or job.raw_video)
+        return bool(expected and current and hmac.compare_digest(str(expected), str(current)))
+
+    @staticmethod
+    def _valid_review_wav(path: Path) -> bool:
+        try:
+            with wave.open(str(path), "rb") as handle:
+                return (
+                    handle.getnchannels() == 1
+                    and handle.getframerate() == 16000
+                    and handle.getsampwidth() == 2
+                    and handle.getnframes() > 0
+                )
+        except (OSError, EOFError, wave.Error):
+            return False
 
     def publish_session(self) -> PublishSession:
         with self._lock:
@@ -1033,7 +1183,7 @@ class WorkbenchJobs:
             for job_id in ids:
                 row = records[job_id]
                 live = self._jobs.get(job_id)
-                if row.get("status") in {"queued", "running", "preparing", "cancelling"} or (live and live.status in {"queued", "running", "preparing", "cancelling"}) or self._running_id == job_id:
+                if row.get("status") in {"queued", "running", "preparing", "cancelling"} or (live and live.status in {"queued", "running", "preparing", "cancelling"}) or self._running_id == job_id or self._subtitle_model_action_id == job_id:
                     active.append(job_id)
             if active:
                 raise RuntimeError("运行中的任务不能删除，请先取消并等待当前阶段结束。")
@@ -1140,6 +1290,8 @@ class WorkbenchJobs:
                     active_dirs.append(job.work_dir.expanduser().resolve())
             if self._running_id and self._running_id in self._jobs and self._jobs[self._running_id].work_dir:
                 active_dirs.append(self._jobs[self._running_id].work_dir.expanduser().resolve())
+            if self._subtitle_model_action_id and self._subtitle_model_action_id in self._jobs and self._jobs[self._subtitle_model_action_id].work_dir:
+                active_dirs.append(self._jobs[self._subtitle_model_action_id].work_dir.expanduser().resolve())
         return any(target == active or active in target.parents for target in targets for active in active_dirs)
 
     def delete_history(self, job_ids: list[str], mode: str, fingerprint: str | None = None, *, allow_many: bool = False) -> dict[str, Any]:
@@ -1270,10 +1422,11 @@ class WorkbenchJobs:
             beam_size=options["beam_size"], ocr_interval=options["ocr_interval"],
             ocr_crop_ratio=options["ocr_crop_ratio"], ocr_min_chars=options["ocr_min_chars"],
             ocr_language=options["ocr_language"],
+            audio_channel=options.get("audio_channel", "mix"),
             subtitle_margin_ratio=options["subtitle_margin_ratio"], render_crf=options["render_crf"],
             render_encoder=options["render_encoder"], device=job.device, compute_type=job.compute_type,
             translator=options["translator"], target_lang=options["target_lang"],
-            translate_model=options["translate_model"], smart_translation=options["smart_translation"],
+            translate_model=options["translate_model"], deepseek_thinking=options.get("deepseek_thinking", "disabled"), smart_translation=options["smart_translation"],
             smart_subtitle_layout=options["smart_subtitle_layout"], font_name=options["font_name"],
             font_size=options["font_size"], subtitle_display_mode=options["subtitle_display_mode"],
             subtitle_color=options["subtitle_color"], subtitle_outline_color=options["subtitle_outline_color"],
@@ -1287,9 +1440,12 @@ class WorkbenchJobs:
 
     @staticmethod
     def _config_fingerprint(job: DemoJob) -> str:
+        task_options = _public_options(job.options)
+        task_options.pop("llm_pricing_mode", None)
+        task_options.pop("llm_custom_pricing", None)
         payload = {
             "source": job.artifacts.source, "device": job.device, "compute_type": job.compute_type,
-            "options": _public_options(job.options),
+            "options": task_options,
         }
         return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
 
@@ -1419,7 +1575,7 @@ class WorkbenchJobs:
             job = self._jobs.get(job_id)
             if not job:
                 raise RuntimeError("Task not found.")
-            if self._running_id == job_id or job.status in {"running", "cancelling", "preparing"} or job_id in self._preparing_ids:
+            if self._running_id == job_id or self._subtitle_model_action_id == job_id or job.status in {"running", "cancelling", "preparing"} or job_id in self._preparing_ids:
                 raise RuntimeError("当前阶段或准备检查仍在运行，不能同时执行准备检查。")
             job.cancellation.reset()
             self._preparing_ids.add(job_id)
@@ -1535,11 +1691,12 @@ class WorkbenchJobs:
                 language = job.options["ocr_language"]
                 installed = available_ocr_languages(str(tesseract))
                 missing = [item for item in language.split("+") if item not in installed]
+                ready, _ = ocr_language_ready(language, str(tesseract))
                 add(
                     "ocr-language", "OCR 语言包", "决定 Tesseract 识别哪种画面字幕",
-                    "passed" if not missing else "blocking",
-                    f"已选择 {language}，语言数据完整。" if not missing else f"缺少语言包：{', '.join(missing)}。当前已安装：{', '.join(sorted(installed)) or '未知'}。",
-                    "更改 OCR 语言" if missing else None,
+                    "passed" if ready else "blocking",
+                    f"已选择 {language}，语言数据完整。" if ready else f"缺少语言包：{', '.join(missing) or language}。当前已安装：{', '.join(sorted(installed)) or '未知'}。",
+                    "下载语言包" if not ready else None,
                 )
         if "translate" in required_stages:
             provider = job.options["translator"]
@@ -1556,7 +1713,7 @@ class WorkbenchJobs:
             add(
                 "cuda", "CUDA 转写运行库", "使用显卡加速 Whisper 转写",
                 "passed" if cuda_ready else "blocking", str(cuda["message"]),
-                "改用 CPU" if not cuda_ready else None,
+                "打开依赖中心" if not cuda_ready else None,
             )
         if "render" in required_stages:
             encoder = job.options["render_encoder"]
@@ -1744,7 +1901,7 @@ class WorkbenchJobs:
         if not self._checks_ready(job):
             raise RuntimeError("请先完成“开始前准备”检查并解决阻断项。")
         with self._lock:
-            if self._running_id or job.status in {"running", "cancelling", "preparing"} or job.id in self._preparing_ids:
+            if self._running_id or self._subtitle_model_action_id or job.status in {"running", "cancelling", "preparing"} or job.id in self._preparing_ids:
                 raise RuntimeError("已有耗资源阶段在运行，请等待或先取消。")
         # Re-check artifacts at the point of execution.  A file can disappear
         # or become corrupt after prepare (including while the app was closed).
@@ -1779,11 +1936,65 @@ class WorkbenchJobs:
         self._require_quality_consent(job, [job.next_stage] if job.next_stage else None)
         return self.run_stage(job_id, job.next_stage)
 
+    @contextmanager
+    def _llm_usage_session(self, job: DemoJob, label: str, run_token: str | None = None):
+        token = run_token or uuid.uuid4().hex
+        with self._lock:
+            if run_token is None:
+                job.llm_run_token = token
+            directory = (job.work_dir or job.output_root / job.id) / f".attempt-llm-{label}-{token[:12]}"
+            index_path = directory.parent / "llm_usage_index.json"
+            if job.llm_usage_index is None:
+                job.llm_usage_index = {"schema_version": 1, "revision": 0, "recorded_since": time.time(), "sessions": {}}
+                if job.artifacts.llm_usage_total:
+                    # Retain a saved subtotal if its index became unavailable.
+                    job.llm_usage_index["baseline"] = copy.deepcopy(job.artifacts.llm_usage_total)
+            pricing_options = {key: copy.deepcopy(job.options.get(key)) for key in ("llm_pricing_mode", "llm_custom_pricing")}
+
+        def update(summary: dict[str, Any]) -> None:
+            with self._lock:
+                if job.id in self._deleted_history_ids:
+                    return
+                if not update_usage_index(job.llm_usage_index, token, directory / "llm_usage.json", summary):
+                    return
+                job.artifacts.llm_usage_index_path = str(index_path)
+                job.artifacts.llm_usage_total = copy.deepcopy(job.llm_usage_index["total"])
+                if job.llm_run_token == token:
+                    job.llm_usage = summary
+                    job.artifacts.llm_usage_path = str(directory / "llm_usage.json")
+                try:
+                    atomic_write_manifest(index_path, job.llm_usage_index)
+                    # Merge just accounting fields, without rewriting stage/log manifests.
+                    job_db.update_usage_artifacts(job.id, {
+                        "llm_usage_path": job.artifacts.llm_usage_path,
+                        "llm_usage_index_path": job.artifacts.llm_usage_index_path,
+                        "llm_usage_total": job.artifacts.llm_usage_total,
+                    })
+                except Exception:
+                    LOGGER.warning("Could not persist cumulative LLM usage for %s", job.id)
+
+        with self._lock:
+            if job.llm_run_token == token:
+                job.llm_usage = None
+        tracker = LlmUsageTracker(directory, update, scope=label, pricing_options=pricing_options)
+        tracker.flush()
+        try:
+            with usage_session(tracker):
+                yield tracker
+        finally:
+            tracker.flush()
+            with self._lock:
+                if job.llm_run_token == token:
+                    try:
+                        self._persist(job)
+                    except Exception:
+                        LOGGER.warning("Could not persist LLM usage pointer for job %s", job.id)
+
     def _start_stage_sequence(self, job: DemoJob, stages: list[str], *, auto_run: bool) -> DemoJob:
         self._require_quality_consent(job, stages)
         previous_state: dict[str, Any] | None = None
         with self._lock:
-            if self._running_id or job.status in {"preparing", "cancelling"} or job.id in self._preparing_ids:
+            if self._running_id or self._subtitle_model_action_id or job.status in {"preparing", "cancelling"} or job.id in self._preparing_ids:
                 raise RuntimeError("准备检查或耗资源阶段正在运行，请等待或先取消。")
             previous_state = {
                 "status": job.status, "stage": job.stage, "error": job.error,
@@ -1791,6 +2002,7 @@ class WorkbenchJobs:
                 "finished_at": job.finished_at, "next_stage": job.next_stage,
                 "auto_run": job.auto_run, "progress": job.progress,
                 "stages": copy.deepcopy(job.stages),
+                "llm_run_token": job.llm_run_token,
             }
             # Re-running a stage must invalidate it and everything after, otherwise
             # translate/render can remain "completed" and be skipped after extract.
@@ -1802,6 +2014,8 @@ class WorkbenchJobs:
             job.status, job.stage, job.error = "running", WORKFLOW_STAGE_LABELS[stages[0]], None
             job.started_at, job.finished_at = time.time(), None
             self._running_id = job.id
+            job.llm_run_token = uuid.uuid4().hex
+            run_token = job.llm_run_token
         try:
             self._persist(job)
         except Exception:
@@ -1817,16 +2031,19 @@ class WorkbenchJobs:
                     job.auto_run = previous_state["auto_run"]
                     job.progress = previous_state["progress"]
                     job.stages = previous_state["stages"]
+                    job.llm_run_token = previous_state["llm_run_token"]
                 if self._running_id == job.id:
                     self._running_id = None
             raise
-        worker = threading.Thread(target=self._run_stage_sequence, args=(job, stages), daemon=True, name=f"workflow-{job.id}")
+        worker = threading.Thread(target=self._run_stage_sequence, args=(job, stages, run_token), daemon=True, name=f"workflow-{job.id}")
         with self._lock:
             self._worker = worker
         worker.start()
         return job
 
-    def _run_stage_sequence(self, job: DemoJob, stages: list[str]) -> None:
+    def _run_stage_sequence(self, job: DemoJob, stages: list[str], run_token: str) -> None:
+        usage_context = self._llm_usage_session(job, "workflow", run_token)
+        usage_context.__enter__()
         def log(message: str) -> None:
             with self._lock:
                 job.add_log(message)
@@ -1870,6 +2087,9 @@ class WorkbenchJobs:
                 previous_next_stage = job.next_stage
                 previous_stage_row = copy.deepcopy(job.stages[stage])
                 with self._lock:
+                    candidate_artifacts.llm_usage_path = job.artifacts.llm_usage_path
+                    candidate_artifacts.llm_usage_index_path = job.artifacts.llm_usage_index_path
+                    candidate_artifacts.llm_usage_total = copy.deepcopy(job.artifacts.llm_usage_total)
                     job.artifacts = candidate_artifacts
                 with self._lock:
                     row = job.stages[stage]
@@ -1964,6 +2184,7 @@ class WorkbenchJobs:
             LOGGER.error("Workflow worker terminated unexpectedly for job %s", job.id, exc_info=(type(exc), exc, exc.__traceback__))
             raise
         finally:
+            usage_context.__exit__(*sys.exc_info())
             with self._lock:
                 if self._running_id == job.id:
                     self._running_id = None
@@ -2048,15 +2269,24 @@ class WorkbenchJobs:
         translated_items = load_segments(translated_path) if translated_path.is_file() else []
         if not source_items and not translated_items:
             raise ValueError("还没有字幕，无法生成投稿标题和标签。")
-        metadata = generate_publish_metadata(
-            source_title=str(job.options.get("title") or job.artifacts.title or job.material.name),
-            source_description=job.artifacts.description,
-            source_segments=source_items,
-            translated_segments=translated_items or source_items,
-            provider=str(job.options.get("translator") or "none"),
-            target_lang=str(job.options.get("target_lang") or "zh-Hans"),
-            model=job.options.get("translate_model"),
-        )
+        with self._lock:
+            if self._running_id or self._subtitle_model_action_id or job.status in {"queued", "running", "preparing", "cancelling"}:
+                raise ValueError("当前有处理或模型请求运行，请完成后再生成标题。")
+            self._subtitle_model_action_id = job.id
+        try:
+            with self._llm_usage_session(job, "metadata"):
+                metadata = generate_publish_metadata(
+                    source_title=str(job.options.get("title") or job.artifacts.title or job.material.name),
+                    source_description=job.artifacts.description,
+                    source_segments=source_items,
+                    translated_segments=translated_items or source_items,
+                    provider=str(job.options.get("translator") or "none"),
+                    target_lang=str(job.options.get("target_lang") or "zh-Hans"),
+                    model=job.options.get("translate_model"),
+                    deepseek_thinking=str(job.options.get("deepseek_thinking") or "disabled"),
+                )
+        finally:
+            self._end_subtitle_model_action(job.id)
         metadata_path = save_publish_metadata(work_dir / "publish_metadata.json", metadata)
         job.artifacts.publish_metadata = str(metadata_path)
         self._persist(job)
@@ -2066,6 +2296,24 @@ class WorkbenchJobs:
         with self._lock:
             video = self._native_publish_files.get(token)
         return video if video and video.exists() else None
+
+    @staticmethod
+    def _cue_layout_limits(job: DemoJob) -> tuple[int, float]:
+        line_width, display_limit = 18, 36.5
+        video = job.raw_video or job.artifacts.path("raw_video")
+        if video and video.is_file():
+            try:
+                measured = subtitle_line_capacity(
+                    video,
+                    font_size=int(job.options.get("font_size", 24)),
+                    outline=int(job.options.get("subtitle_outline", 3)),
+                    shadow=int(job.options.get("subtitle_shadow", 1)),
+                )
+            except Exception:
+                measured = None
+            if measured is not None:
+                line_width, display_limit = measured, measured + 0.5
+        return line_width, display_limit
 
     def cues(self, job_id: str) -> dict[str, Any]:
         job = self.get(job_id)
@@ -2112,6 +2360,27 @@ class WorkbenchJobs:
                     (ocr_texts if name.startswith("segments.ocr") else audio_texts).add(segment.text.strip())
         output: list[dict[str, Any]] = []
         platform_mode = job.artifacts.subtitle_extraction_mode.startswith("platform")
+        layout_indexes: set[int] = set()
+        dense_indexes: set[int] = set()
+        fast_indexes: set[int] = set()
+        if translated_ready:
+            line_width, display_limit = self._cue_layout_limits(job)
+            try:
+                layout_indexes = {
+                    cue_number - 1
+                    for cue_number, _start, _text in translated_layout_issues(
+                        translated,
+                        smart_layout=bool(job.options.get("smart_subtitle_layout", True)),
+                        max_chars_per_line=line_width,
+                        max_display_units_per_line=display_limit,
+                        display_mode=str(job.options.get("subtitle_display_mode") or "translated"),
+                    )
+                }
+            except Exception:
+                layout_indexes = set()
+            dense_indexes = set(subtitle_density_overflow_indices(translated))
+            fast_indexes = set(subtitle_high_reading_speed_indices(translated))
+        duration = job.duration_override or job.material.duration_seconds
         for index, item in enumerate(translated):
             raw_source = item.text
             stripped = raw_source.strip()
@@ -2121,97 +2390,860 @@ class WorkbenchJobs:
                 kind = "audio"
             else:
                 kind = "platform" if platform_mode else "merged"
+            issues: list[str] = []
+            if index in layout_indexes:
+                issues.append("layout-overflow")
+            if index in dense_indexes:
+                issues.append("dense-text")
+            if index in fast_indexes:
+                issues.append("reading-speed")
+            if item.end - item.start < MIN_ESTIMATED_SLOT_DURATION_SEC:
+                issues.append("short-duration")
+            if (
+                not math.isfinite(item.start)
+                or not math.isfinite(item.end)
+                or item.start < 0
+                or item.end <= item.start
+                or (duration is not None and item.end > duration + 0.05)
+            ):
+                issues.append("invalid-time")
+            if index + 1 < len(translated) and item.end > translated[index + 1].start + 0.02:
+                issues.append("overlap")
+            if not stripped:
+                issues.append("empty-source")
+            if translated_ready and not (item.translated_text or "").strip():
+                issues.append("empty-translation")
             output.append({
                 "id": index, "start": item.start, "end": item.end,
                 "source": raw_source,
                 "translated": item.translated_text or item.text,
                 "kind": kind,
+                "issues": issues,
+                "needs_review": bool(item.needs_review),
             })
-        return {"cues": output, "ready": True, "translation_ready": translated_ready}
+        fingerprint_path = translated_pointer or source_pointer
+        fingerprint = hashlib.sha256(fingerprint_path.read_bytes()).hexdigest() if fingerprint_path and fingerprint_path.is_file() else None
+        return {
+            "cues": output, "ready": True, "translation_ready": translated_ready,
+            "revision": int(job.artifacts.revision),
+            "base_fingerprint": fingerprint,
+            "base_ids": [item["id"] for item in output],
+        }
 
-    def save_cues(self, job_id: str, cues: list[dict[str, Any]]) -> DemoJob:
-        """Save subtitle edits: text, timing and deletions.
-
-        ``cues`` is a full list aligned with the current segments; each item:
-        ``{start, end, translated, deleted}``.
-        """
+    def save_cues(self, job_id: str, cues: list[dict[str, Any]], *, base_revision: int | None = None,
+                  base_fingerprint: str | None = None, base_ids: list[Any] | None = None,
+                  candidate_rows: list[dict[str, Any]] | None = None) -> DemoJob:
+        """Atomically save the complete subtitle draft and optional review rows."""
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None or job.work_dir is None or job.stages.get("translate", {}).get("status") != "completed":
                 raise RuntimeError("翻译阶段完成后才能编辑中文字幕。")
-            if job.status in {"running", "cancelling"}:
-                raise RuntimeError("请等待或取消当前阶段后再编辑字幕。")
+            if job.status in {"running", "cancelling"} or self._running_id or self._subtitle_model_action_id:
+                raise RuntimeError("当前有处理任务正在运行，请完成后再保存字幕。")
+            if base_revision is None or not base_fingerprint or base_ids is None:
+                raise RuntimeError("保存字幕必须携带完整版本基准，请重新加载字幕后再保存。")
             source_path = job.edited_segments or job.artifacts.path("translated_segments") or job.work_dir / "segments.translated.json"
             segments = load_segments(source_path)
-            if len(cues) != len(segments):
+            if base_revision is not None and int(base_revision) != int(job.artifacts.revision):
+                raise RuntimeError("字幕版本已变化，请重新加载后再保存。")
+            if base_fingerprint and not hmac.compare_digest(str(base_fingerprint), hashlib.sha256(source_path.read_bytes()).hexdigest()):
+                raise RuntimeError("字幕内容已变化，请重新加载后再保存。")
+            if base_ids is not None:
+                try: received = [int(item) for item in base_ids]
+                except (TypeError, ValueError): raise RuntimeError("字幕基础行 ID 无效，请重新加载后再保存。") from None
+                if sorted(received) != list(range(len(segments))) or len(received) != len(set(received)):
+                    raise RuntimeError("字幕基础行已变化，请重新加载后再保存。")
+            if not isinstance(cues, list) or len(cues) != len(segments):
                 raise RuntimeError("Subtitle changed while editing; reload the latest cues.")
-            if len(cues) > 20_000:
-                raise RuntimeError("单个任务最多允许编辑 20000 条字幕。")
             kept: list[Segment] = []
             for segment, item in zip(segments, cues):
-                if not isinstance(item, dict):
-                    raise RuntimeError("Invalid subtitle edit payload.")
-                deleted_value = item.get("deleted", False)
-                if type(deleted_value) is not bool:
-                    raise RuntimeError("deleted must be true or false.")
-                deleted = deleted_value
-                if deleted:
-                    continue
-                cleaned = str(item.get("translated", "")).strip()
-                if not cleaned:
-                    raise RuntimeError("Subtitle text cannot be empty.")
-                if len(cleaned) > 2_000:
-                    raise RuntimeError("单条字幕不能超过 2000 个字符。")
-                try:
-                    if type(item.get("start", segment.start)) not in {int, float} or type(item.get("end", segment.end)) not in {int, float}:
-                        raise TypeError
-                    start = float(item.get("start", segment.start))
-                    end = float(item.get("end", segment.end))
-                except (TypeError, ValueError):
-                    raise RuntimeError("Subtitle time must be a number of seconds.") from None
+                if not isinstance(item, dict): raise RuntimeError("Invalid subtitle edit payload.")
+                if item.get("deleted", False): continue
+                source = str(item.get("source", segment.text)).strip()
+                translated = str(item.get("translated", "")).strip()
+                if ((not source and str(segment.text or "").strip()) or not translated or len(source) > 2000 or len(translated) > 2000):
+                    raise RuntimeError("字幕原文和译文不能为空且不能超过 2000 个字符。")
+                try: start, end = float(item.get("start", segment.start)), float(item.get("end", segment.end))
+                except (TypeError, ValueError): raise RuntimeError("字幕时间必须是数字。") from None
                 if not math.isfinite(start) or not math.isfinite(end) or not (0 <= start < end):
-                    raise RuntimeError("Subtitle time is invalid: start must be >= 0 and end must be greater than start.")
-                segment.start = round(start, 2)
-                segment.end = round(end, 2)
-                segment.translated_text = cleaned
-                kept.append(segment)
-            if not kept:
-                raise RuntimeError("At least one subtitle must remain.")
-            next_revision = job.artifacts.revision + 1
-            edited_segments = job.work_dir / f"segments.translated.edited.r{next_revision}.json"
-            edited_srt = job.work_dir / f"zh.edited.r{next_revision}.srt"
+                    raise RuntimeError("Subtitle time is invalid.")
+                review = item.get("needs_review", segment.needs_review)
+                if type(review) is not bool: raise RuntimeError("needs_review must be true or false.")
+                kept.append(Segment(round(start, 2), round(end, 2), source, translated, review))
+            candidate_rows = candidate_rows or []
+            ids = [str(row.get("candidate_id") or "") for row in candidate_rows if isinstance(row, dict)]
+            if len(ids) != len(candidate_rows) or len(ids) != len(set(ids)):
+                raise RuntimeError("candidate_rows 的候选 ID 必须唯一。")
+            session = self._reconcile_subtitle_commit(job)
+            session_candidates = {str(item.get("id")): item for item in (session or {}).get("candidates", [])}
+            if candidate_rows and session and not self._review_media_is_current(job, session):
+                raise RuntimeError("视频源已修改，请重新准备语音复核后再采用候选。")
+            result_candidates = {str(item.get("id")): item for item in (session or {}).get("result_candidates", [])}
+            additions: list[Segment] = []
+            protected_base_intervals = [(float(item.start), float(item.end)) for item in segments if math.isfinite(float(item.start)) and math.isfinite(float(item.end)) and float(item.end) > float(item.start)]
+            for row in candidate_rows:
+                candidate_id = str(row.get("candidate_id"))
+                result_candidate = result_candidates.get(candidate_id)
+                parent_id = str(result_candidate.get("window_id")) if result_candidate else ""
+                candidate = session_candidates.get(parent_id)
+                if not result_candidate or result_candidate.get("status") == "committed" or not candidate or candidate.get("status") != "done":
+                    raise RuntimeError("候选不存在或尚未完成复核。")
+                tier = result_candidate.get("tier")
+                if tier not in {"strong", "weak"}:
+                    raise RuntimeError("诊断候选不能保存。")
+                if (tier == "strong" and result_candidate.get("adoptable") is not True) or (tier == "weak" and (result_candidate.get("adoptable") is not False or row.get("confirmed_weak") is not True)):
+                    raise RuntimeError("弱复核候选必须先人工确认后才能保存。")
+                source = str(row.get("source") or "").strip(); translated = str(row.get("translated") or "").strip()
+                if not source or not translated: raise RuntimeError("候选原文和译文不能为空。")
+                original_source = "".join(str(word.get("text") or "") for word in (result_candidate.get("words") or [])).strip()
+                if original_source and source != original_source and row.get("confirmed_source_edit") is not True:
+                    raise RuntimeError("候选原文已修改，请先确认修改后的原文。")
+                start, end = float(row.get("start")), float(row.get("end"))
+                if not math.isfinite(start) or not math.isfinite(end) or not (0 <= start < end): raise RuntimeError("候选时间无效。")
+                if any(start < base_end and end > base_start for base_start, base_end in protected_base_intervals) or any(start < item.end and end > item.start for item in additions):
+                    raise RuntimeError("候选与现有字幕或其他候选重叠。")
+                additions.append(Segment(round(start, 2), round(end, 2), source, translated, True))
+            kept = sorted([*kept, *additions], key=lambda item: (item.start, item.end))
+            if not kept: raise RuntimeError("At least one subtitle must remain.")
+            revision = job.artifacts.revision + 1
+            commit_id = uuid.uuid4().hex
+            translated_out = job.work_dir / f"segments.translated.edited.r{revision}.{commit_id}.json"
+            translated_srt = job.work_dir / f"zh.edited.r{revision}.{commit_id}.srt"
+            source_out = job.work_dir / f"segments.source.edited.r{revision}.{commit_id}.json"
+            source_srt = job.work_dir / f"source.edited.r{revision}.{commit_id}.srt"
+            base_file_fingerprint = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            commit_staging = job.work_dir / f".subtitle-edit.r{revision}.{uuid.uuid4().hex}.staging.commit.json"
+            commit_path = subtitle_commit_path(job.work_dir, revision, commit_id)
+            committed_receipts: list[dict[str, Any]] = []
+            for row in candidate_rows:
+                candidate_id = str(row.get("candidate_id"))
+                candidate = result_candidates[candidate_id]
+                raw_words = []
+                for word in candidate.get("words", []) if isinstance(candidate.get("words"), list) else []:
+                    raw_words.append({key: word.get(key) for key in ("text", "start", "end", "avg_logprob", "no_speech_prob", "tier") if key in word})
+                try:
+                    ordinal = int(str(candidate_id).rsplit("-", 1)[-1])
+                except ValueError:
+                    ordinal = None
+                committed_receipts.append({
+                    "candidateId": candidate_id,
+                    "parentWindowId": candidate.get("window_id"),
+                    "ordinal": ordinal,
+                    "tier": candidate.get("tier"),
+                    "confirmedWeak": row.get("confirmed_weak") is True,
+                    "rawText": "".join(str(word.get("text") or "") for word in raw_words),
+                    "rawWords": raw_words,
+                    "editedSource": str(row.get("source") or "").strip(),
+                    "editedStart": float(row.get("start")),
+                    "editedEnd": float(row.get("end")),
+                })
+            old_artifact_commit = job.artifacts.subtitle_commit
+            source_only = [Segment(item.start, item.end, item.text, None, item.needs_review) for item in kept]
             try:
-                save_segments(edited_segments, kept)
-                write_srt(edited_srt, kept, display_mode=job.options["subtitle_display_mode"], smart_layout=job.options["smart_subtitle_layout"])
+                save_segments(translated_out, kept); write_srt(translated_srt, kept, display_mode=job.options["subtitle_display_mode"], smart_layout=job.options["smart_subtitle_layout"])
+                save_segments(source_out, source_only); write_srt(source_srt, source_only, display_mode="source")
+                new_file_fingerprint = hashlib.sha256(translated_out.read_bytes()).hexdigest()
+                receipt = {
+                    "version": 1, "commitId": commit_id, "jobId": job.id,
+                    "fromRevision": int(job.artifacts.revision), "toRevision": revision,
+                    "baseFingerprint": base_file_fingerprint, "newFingerprint": new_file_fingerprint,
+                    "sessionFingerprint": (session or {}).get("session_fingerprint"),
+                    "committed": committed_receipts, "createdAt": time.time(),
+                }
+                _atomic_json(commit_staging, receipt)
+                commit_staging.replace(commit_path)
             except Exception:
-                edited_segments.unlink(missing_ok=True)
-                edited_srt.unlink(missing_ok=True)
+                for path in (translated_out, translated_srt, source_out, source_srt, commit_staging, commit_path): path.unlink(missing_ok=True)
                 raise
-            job.edited_segments = edited_segments
-            job.artifacts.translated_segments = str(edited_segments)
-            job.artifacts.translated_srt = str(edited_srt)
-            job.artifacts.revision = next_revision
-            job.artifacts.last_edit = "subtitle"
-            job.artifacts.edit_state = "modified"
-            invalidate_downstream(job.stages, "render")
-            job.next_stage = "render"
-            job.status, job.stage, job.progress = "ready", "字幕已保存，等待重新渲染", 0
-            if job.result:
-                job.result["translated_srt"] = public_path(edited_srt) or edited_srt.name
+            old_state = (job.edited_segments, job.artifacts.source_segments, job.artifacts.source_srt, job.artifacts.translated_segments, job.artifacts.translated_srt, job.artifacts.subtitle_commit, job.artifacts.revision, job.artifacts.last_edit, job.artifacts.edit_state, copy.deepcopy(job.stages), job.next_stage, job.status, job.stage, job.progress)
+            old_session = copy.deepcopy(session)
+            published = False
+            try:
+                job.edited_segments = translated_out
+                job.artifacts.source_segments, job.artifacts.source_srt = str(source_out), str(source_srt)
+                job.artifacts.translated_segments, job.artifacts.translated_srt = str(translated_out), str(translated_srt)
+                job.artifacts.subtitle_commit = str(commit_path)
+                job.artifacts.revision, job.artifacts.last_edit, job.artifacts.edit_state = revision, "subtitle", "modified"
+                invalidate_downstream(job.stages, "render")
+                job.next_stage, job.status, job.stage, job.progress = "render", "ready", "字幕已保存，等待重新渲染", 0
+                self._persist(job)
+                published = True
+                if session:
+                    for item in session.get("result_candidates", []):
+                        if str(item.get("id")) in ids: item["status"] = "committed"
+                    try:
+                        update_session(job.work_dir, candidates=session["candidates"], result_candidates=session.get("result_candidates", []), subtitle_revision=revision, subtitle_fingerprint=new_file_fingerprint)
+                    except Exception as session_exc:
+                        # The authoritative DB and complete published files are
+                        # retained; startup reconciliation can advance this CAS.
+                        job.add_log(f"字幕提交回执已发布，但复核会话稍后重同步：{type(session_exc).__name__}")
+            except Exception:
+                (job.edited_segments, job.artifacts.source_segments, job.artifacts.source_srt, job.artifacts.translated_segments, job.artifacts.translated_srt, job.artifacts.subtitle_commit, job.artifacts.revision, job.artifacts.last_edit, job.artifacts.edit_state, job.stages, job.next_stage, job.status, job.stage, job.progress) = old_state
+                if old_session is not None:
+                    try: _atomic_json(session_path(job.work_dir), old_session)
+                    except OSError: pass
+                # Keep a complete published revision and receipt if persistence
+                # failed: deleting files could leave an already-written DB
+                # pointer dangling.  The next restore can reconcile the receipt.
+                commit_staging.unlink(missing_ok=True)
+                raise
             job.add_log(f"Subtitle edits saved: {len(kept)} cues, {len(segments) - len(kept)} deleted.")
-        self._persist(job)
         return job
+
+    def voice_review(self, job_id: str) -> dict[str, Any]:
+        job = self.get(job_id)
+        if job is None:
+            raise RuntimeError("Task not found.")
+        if not job.work_dir:
+            return {"status": "unavailable", "candidates": [], "remaining": 0}
+        session = self._reconcile_subtitle_commit(job)
+        if session is None:
+            return {"status": "unavailable", "candidates": [], "remaining": 0}
+        if not self._review_media_is_current(job, session):
+            return {"status": "stale_media", "candidates": [], "result_candidates": [], "diagnostics": [], "remaining": 0, "error": "视频源已修改，请重新准备语音复核。"}
+        candidates = session.get("candidates") if isinstance(session.get("candidates"), list) else []
+        return {
+            "status": session.get("status", "pending"),
+            "channel": session.get("channel", "mix"),
+            "baseline_kind": session.get("baseline_kind", "legacy_partial"),
+            "candidates": candidates,
+            "windows": session.get("windows", []),
+            "result_candidates": session.get("result_candidates", []),
+            "diagnostics": session.get("diagnostics", []),
+            "remaining": sum(1 for item in candidates if item.get("status") in {"pending", "running"}),
+            "recovered_words": session.get("recovered_words", []),
+            "review_intervals": session.get("review_intervals", []),
+            "actual_decode_seconds": session.get("actual_decode_seconds", 0),
+            "resource_profile": normalize_resource_profile(job.options.get("resource_profile", "balanced")),
+            "cpu_threads": cpu_thread_limit(job.options.get("resource_profile", "balanced")),
+            "resource_info": session.get("resource_info"),
+            "error": session.get("error"),
+            "updated_at": session.get("updated_at"),
+        }
+
+    def prepare_voice_review(self, job_id: str) -> dict[str, Any]:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise RuntimeError("Task not found.")
+            if self._running_id or self._subtitle_model_action_id or job.status in {"queued", "running", "preparing", "cancelling"} or job_id in self._preparing_ids:
+                raise RuntimeError("当前任务正在运行，不能准备语音复核。")
+            self._preparing_ids.add(job_id)
+        try:
+            return self._prepare_voice_review_impl(job_id)
+        finally:
+            with self._lock:
+                self._preparing_ids.discard(job_id)
+
+    def _prepare_voice_review_impl(self, job_id: str) -> dict[str, Any]:
+        job = self.get(job_id)
+        if job is None or not job.work_dir:
+            raise RuntimeError("Task or output directory is unavailable.")
+        if job.status in {"queued", "running", "preparing", "cancelling"} or self._running_id or self._subtitle_model_action_id:
+            raise RuntimeError("当前任务正在运行，不能准备语音复核。")
+        existing_session = read_session(job.work_dir)
+        source = job.artifacts.path("source_segments")
+        if not source or not source.is_file():
+            raise RuntimeError("请先完成字幕提取，才能准备语音复核。")
+        channel = str(job.options.get("audio_channel") or "mix")
+        raw = job.artifacts.path("raw_video") or job.raw_video
+        if not raw or not raw.is_file():
+            raise RuntimeError("当前任务没有可用于语音复核的原视频。")
+        if channel in {"left", "right"}:
+            channels = audio_stream_channels(raw)
+            if channels != 2:
+                raise RuntimeError(f"当前音频流为 {channels or '未知'} 声道，左右声道复核只支持明确的双声道音频。")
+        current_raw_signature = _path_signature(raw)
+        token = hashlib.sha256(str(current_raw_signature or raw).encode("utf-8")).hexdigest()[:12]
+        target_audio = job.work_dir / "asr-review" / f"review-audio-{token}-{channel}.wav"
+        audio: Path | None = None
+        if existing_session:
+            prior_audio = Path(str(existing_session.get("audio_path") or ""))
+            if (
+                self._valid_review_wav(prior_audio)
+                and existing_session.get("source_video_signature") == current_raw_signature
+                and existing_session.get("channel") == channel
+                and existing_session.get("audio_fingerprint") == _file_fingerprint(prior_audio)
+            ):
+                audio = prior_audio
+        if audio is None:
+            audio = target_audio
+            if not self._valid_review_wav(audio):
+                audio.parent.mkdir(parents=True, exist_ok=True)
+                temporary_audio = audio.with_name(audio.stem + f".part-{uuid.uuid4().hex[:8]}" + audio.suffix)
+                try:
+                    extract_audio(raw, temporary_audio, channel=channel)
+                    if not self._valid_review_wav(temporary_audio):
+                        raise RuntimeError("语音复核音频提取结果不是有效的 16 kHz 单声道 WAV。")
+                    temporary_audio.replace(audio)
+                except Exception:
+                    temporary_audio.unlink(missing_ok=True)
+                    raise
+        words = source.with_name("words." + source.name[len("segments."):]) if source.name.startswith("segments.") else None
+        subtitle_fingerprint_path = job.edited_segments or job.artifacts.path("translated_segments") or source
+        baseline_words = words if words and words.is_file() else source
+        requested_language = resolve_review_language(
+            job.options.get("source_language"), job.artifacts.path("asr_evidence"),
+            allow_detected=job.artifacts.subtitle_extraction_mode in {"audio", "audio-fallback", "merged"},
+        )
+        if requested_language is None and str(job.options.get("source_language") or "").strip().lower() == "auto":
+            try:
+                provenance = json.loads((job.work_dir / "asr-review" / "language-provenance.json").read_text(encoding="utf-8"))
+                if provenance.get("source_video_signature") == current_raw_signature:
+                    requested_language = str(provenance.get("language") or "") or None
+            except (OSError, ValueError, TypeError):
+                pass
+        current_audio_fingerprint = _file_fingerprint(audio) if audio.is_file() else None
+        current_shift = float(getattr(job.artifacts, "asr_timeline_shift_seconds", 0.0) or 0.0)
+        if existing_session and existing_session.get("audio_path") == str(audio) and existing_session.get("audio_fingerprint") == current_audio_fingerprint and existing_session.get("source_video_signature") == current_raw_signature and float(existing_session.get("timeline_shift_seconds") or 0.0) == current_shift and existing_session.get("model") == str(job.options.get("whisper_model_size") or "small") and existing_session.get("language") == requested_language and int(existing_session.get("beam_size") or 5) == int(job.options.get("beam_size") or 5) and existing_session.get("channel") == channel:
+            old_baseline = Path(str(existing_session.get("baseline_words_path") or ""))
+            if old_baseline.is_file():
+                baseline_words = old_baseline
+        session = prepare_session(
+            work_dir=job.work_dir, job_id=job.id, audio_path=audio,
+            baseline_words_path=baseline_words,
+            baseline_kind="canonical" if baseline_words == words and words and words.is_file() else "legacy_partial",
+            model=str(job.options.get("whisper_model_size") or "small"),
+            language=requested_language,
+            beam_size=int(job.options.get("beam_size") or 5),
+            channel=channel,
+            subtitle_revision=int(job.artifacts.revision),
+            subtitle_fingerprint=hashlib.sha256(subtitle_fingerprint_path.read_bytes()).hexdigest(),
+            timeline_shift_seconds=float(getattr(job.artifacts, "asr_timeline_shift_seconds", 0.0) or 0.0),
+            source_video_path=job.artifacts.path("raw_video") or job.raw_video,
+        )
+        job.artifacts.asr_review = str(session_path(job.work_dir))
+        job.add_log(f"语音复核队列已准备：{len(session.get('candidates', []))} 个区间。")
+        self._persist(job)
+        return self.voice_review(job_id)
+
+    def start_voice_review(self, job_id: str) -> dict[str, Any]:
+        job = self.get(job_id)
+        if job is None or not job.work_dir:
+            raise RuntimeError("Task or output directory is unavailable.")
+        with self._lock:
+            if self._running_id or self._subtitle_model_action_id or job.status in {"queued", "running", "preparing", "cancelling"}:
+                raise RuntimeError("当前任务正在运行，不能启动语音复核。")
+            session = self._reconcile_subtitle_commit(job)
+            if session is None:
+                raise RuntimeError("请先准备语音复核队列。")
+            if not self._review_media_is_current(job, session):
+                raise RuntimeError("视频源已修改，请重新准备语音复核。")
+            if session.get("status") == "running" or any(item.get("status") == "running" for item in session.get("candidates", [])):
+                session = reset_interrupted_round(job.work_dir) or session
+            if any(item.get("status") == "pending" for item in session.get("candidates", [])):
+                try:
+                    resources = review_cuda_memory(job.device, str(session.get("model") or "small"), job.compute_type)
+                except ReviewResourceBusy as exc:
+                    update_session(job.work_dir, status="paused", error=str(exc), error_code=exc.code, resource_info=exc.resources)
+                    job.add_log(str(exc))
+                    self._persist(job)
+                    return self.voice_review(job_id)
+                update_session(job.work_dir, resource_info=resources)
+            prepared = start_round(job.work_dir)
+            windows = prepared.get("windows", [])
+            if not windows:
+                return self.voice_review(job_id)
+            job.add_log(f"语音复核已启动：本轮 {len(windows)} 个区间，最多 120 秒。")
+            job.cancellation.reset()
+            self._running_id = job.id
+        self._persist(job)
+        worker = threading.Thread(target=self._run_voice_review, args=(job,), daemon=True, name=f"asr-review-{job.id}")
+        with self._lock:
+            self._voice_review_worker = worker
+        worker.start()
+        return self.voice_review(job_id)
+
+    def _run_voice_review(self, job: DemoJob) -> None:
+        control_dir = job.work_dir / "asr-review" / f".worker-{uuid.uuid4().hex[:10]}"
+        control_dir.mkdir(parents=True, exist_ok=True)
+        request_path = control_dir / "request.json"
+        result_path = control_dir / "result.json"
+        events_path = control_dir / "events.jsonl"
+        request_path.write_text(json.dumps({
+            "mode": "asr-review", "work_dir": str(job.work_dir),
+            "result_path": str(result_path), "events_path": str(events_path),
+            "model_size": str(job.options.get("whisper_model_size") or "small"),
+            "device": job.device, "compute_type": job.compute_type,
+            "resource_profile": normalize_resource_profile(job.options.get("resource_profile", "balanced")),
+            "user_data_root": str(USER_DATA_ROOT),
+            "round_id": str((read_session(job.work_dir) or {}).get("round_id") or ""),
+            "owner_token": str((read_session(job.work_dir) or {}).get("owner_token") or ""),
+        }, ensure_ascii=False), encoding="utf-8")
+        process: subprocess.Popen[str] | None = None
+        try:
+            command = [sys.executable, "--whisper-worker", str(request_path)] if getattr(sys, "frozen", False) else [sys.executable, "-m", "yblocalizer.whisper_worker", str(request_path)]
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+            lower_process_priority(process, job.options.get("resource_profile", "balanced"))
+            with self._lock:
+                self._voice_review_process = process
+            while process.poll() is None:
+                if job.cancellation.cancelled:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill(); process.wait(timeout=5)
+                    reset_interrupted_round(job.work_dir, status="paused", error="已取消；未完成区间保留待续跑。")
+                    return
+                time.sleep(0.1)
+            if process.returncode:
+                detail = ""
+                error_code = ""
+                if result_path.is_file():
+                    try:
+                        result = json.loads(result_path.read_text(encoding="utf-8"))
+                        detail = str(result.get("error") or "")
+                        error_code = str(result.get("error_code") or "")
+                    except (OSError, ValueError): pass
+                if error_code in {"cuda_resource_busy", "cuda_oom"}:
+                    job.add_log(f"语音复核已暂停：{detail}")
+                    return
+                raise RuntimeError(detail or "语音复核子进程失败")
+        except Exception as exc:
+            job.add_log(f"语音复核失败：{type(exc).__name__}: {exc}")
+        finally:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try: process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill(); process.wait(timeout=5)
+            shutil.rmtree(control_dir, ignore_errors=True)
+            with self._lock:
+                if self._voice_review_process is process:
+                    self._voice_review_process = None
+                if self._running_id == job.id:
+                    self._running_id = None
+                if self._voice_review_worker is threading.current_thread():
+                    self._voice_review_worker = None
+            self._persist(job)
+
+    def cancel_voice_review(self, job_id: str) -> dict[str, Any]:
+        job = self.get(job_id)
+        if job is None or not job.work_dir:
+            raise RuntimeError("Task or output directory is unavailable.")
+        session = read_session(job.work_dir)
+        if session is None:
+            raise RuntimeError("语音复核队列不存在。")
+        # Fence and stop the owned process before changing queue state.  This
+        # prevents a late worker checkpoint from restoring running windows.
+        job.cancellation.cancel()
+        with self._lock:
+            process = self._voice_review_process
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill(); process.wait(timeout=5)
+        session = reset_interrupted_round(job.work_dir, status="paused", error="已取消；未完成区间保留待续跑。") or session
+        job.add_log("语音复核已暂停；已完成区间与候选保留，可继续运行。")
+        self._persist(job)
+        return self.voice_review(job_id)
+
+    def translate_voice_candidate(self, job_id: str, candidate_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        job = self.get(job_id)
+        if job is None or not job.work_dir:
+            raise RuntimeError("Task or output directory is unavailable.")
+        session = self._reconcile_subtitle_commit(job)
+        if not session:
+            raise RuntimeError("语音复核队列不存在。")
+        if not self._review_media_is_current(job, session):
+            raise RuntimeError("视频源已修改，请重新准备语音复核。")
+        result = next((item for item in session.get("result_candidates", []) if str(item.get("id")) == str(candidate_id)), None)
+        candidate = next((item for item in session.get("candidates", []) if str(item.get("id")) == str(candidate_id)), None)
+        if candidate is None and isinstance(result, dict):
+            candidate = next((item for item in session.get("candidates", []) if str(item.get("id")) == str(result.get("window_id"))), None)
+        if candidate is None:
+            raise RuntimeError("语音复核候选不存在。")
+        words = list(result.get("words") or []) if isinstance(result, dict) else []
+        if not words:
+            words = [item for item in session.get("recovered_words", []) if item.get("candidate_id") == candidate_id]
+        source = "".join(str(item.get("text") or "") for item in words).strip()
+        if not source:
+            raise RuntimeError("该候选没有可翻译的恢复词，请先完成语音复核。")
+        payload = payload or {}
+        source = str(payload.get("source_text") or source).strip()
+        if not source:
+            raise RuntimeError("候选原文不能为空。")
+        provider = str(job.options.get("translator") or "none").strip().lower()
+        source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        if payload.get("source_hash") and not hmac.compare_digest(str(payload["source_hash"]), source_hash):
+            raise RuntimeError("候选原文已变化，请重新加载后再翻译。")
+        if provider in {"deepseek", "openai"} and payload.get("confirmed_paid") is not True:
+            raise RuntimeError("在线候选翻译可能产生费用，请先确认后再请求。")
+        cache_path = job.work_dir / "asr-review" / "translation-cache.json"
+        try: cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError): cache = {}
+        cache_key = hashlib.sha256(json.dumps({"source": source_hash, "provider": provider, "model": job.options.get("translate_model"), "target": job.options.get("target_lang")}, sort_keys=True).encode()).hexdigest()
+        if isinstance(cache, dict) and isinstance(cache.get(cache_key), dict):
+            return {**cache[cache_key], "cached": True, "requires_confirmation": provider in {"deepseek", "openai"}}
+        with self._lock:
+            if self._running_id or self._subtitle_model_action_id:
+                raise RuntimeError("当前已有处理或字幕模型请求运行，请完成后再试。")
+            self._subtitle_model_action_id = job.id
+        context = ""
+        canonical = job.artifacts.path("source_segments")
+        if canonical and canonical.is_file():
+            try:
+                nearby = [item.text for item in load_segments(canonical) if abs(item.start - float(result.get("start") or 0)) <= 45]
+                context = "\n".join(nearby[:5])
+            except (OSError, ValueError, TypeError):
+                context = ""
+        try:
+            with self._llm_usage_session(job, "single"):
+                translated = translate_single_cue(
+                    source, provider=provider,
+                    target_lang=str(job.options.get("target_lang") or "zh-Hans"),
+                    model=job.options.get("translate_model"),
+                    source_lang=str(session.get("language") or "") or None,
+                    context=context, smart_translation=bool(job.options.get("smart_translation", True)),
+                    deepseek_thinking=str(job.options.get("deepseek_thinking") or "disabled"),
+                )
+        finally:
+            with self._lock:
+                if self._subtitle_model_action_id == job.id:
+                    self._subtitle_model_action_id = None
+        result = {
+            "candidate_id": candidate_id, "source": source, "translated": translated,
+            "start": result.get("start"), "end": result.get("end"),
+            "source_hash": source_hash, "requires_confirmation": provider in {"deepseek", "openai"},
+        }
+        cache[cache_key] = result
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(cache_path)
+        return result
+
+    def apply_voice_candidates(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        job = self.get(job_id)
+        if job is None or not job.work_dir:
+            raise RuntimeError("Task or output directory is unavailable.")
+        if job.status in {"queued", "running", "preparing", "cancelling"} or self._running_id or self._subtitle_model_action_id:
+            raise RuntimeError("当前任务正在运行，不能采用语音复核候选。")
+        session = self._reconcile_subtitle_commit(job)
+        if not session:
+            raise RuntimeError("语音复核队列不存在。")
+        if not self._review_media_is_current(job, session):
+            raise RuntimeError("视频源已修改，请重新准备语音复核。")
+        ids = payload.get("candidate_ids")
+        translations = payload.get("translations")
+        if not isinstance(ids, list) or len(ids) != len({str(item) for item in ids}):
+            raise ValueError("candidate_ids must be a unique list.")
+        translations = translations if isinstance(translations, dict) else {}
+        confirmed_weak = payload.get("confirmed_weak") if isinstance(payload.get("confirmed_weak"), dict) else {}
+        source_path = job.edited_segments or job.artifacts.path("translated_segments")
+        if not source_path or not source_path.is_file():
+            raise RuntimeError("当前译文字幕不存在。")
+        segments = load_segments(source_path)
+        candidates = {str(item.get("id")): item for item in session.get("candidates", [])}
+        result_candidates = {str(item.get("id")): item for item in session.get("result_candidates", [])}
+        additions: list[Segment] = []
+        for candidate_id in [str(item) for item in ids]:
+            result_candidate = result_candidates.get(candidate_id)
+            parent_id = str(result_candidate.get("window_id")) if result_candidate else ""
+            candidate = candidates.get(parent_id)
+            if not result_candidate or result_candidate.get("status") == "committed" or not candidate or candidate.get("status") != "done":
+                raise RuntimeError(f"候选 {candidate_id} 尚未完成复核。")
+            text = "".join(str(item.get("text") or "") for item in (result_candidate.get("words") or [])).strip()
+            if not text:
+                text = "".join(str(item.get("text") or "") for item in session.get("recovered_words", []) if item.get("candidate_id") == candidate_id).strip()
+            translated = str(translations.get(candidate_id) or "").strip()
+            if not text or not translated:
+                raise ValueError(f"候选 {candidate_id} 必须同时提供原文和译文。")
+            if result_candidate.get("tier") not in {"strong", "weak"} or (result_candidate.get("tier") == "strong" and result_candidate.get("adoptable") is not True) or (result_candidate.get("tier") == "weak" and result_candidate.get("adoptable") is not False):
+                raise RuntimeError("弱复核候选必须先人工确认后才能保存。")
+            if result_candidate.get("tier") == "weak" and confirmed_weak.get(candidate_id) is not True:
+                raise RuntimeError("弱复核候选必须先确认已重听。")
+            start, end = float(result_candidate["start"]), float(result_candidate["end"])
+            if any(start < segment.end and end > segment.start for segment in segments) or any(start < item.end and end > item.start for item in additions):
+                raise RuntimeError(f"候选 {candidate_id} 与现有字幕时间重叠，不能自动插入。")
+            additions.append(Segment(start, end, text, translated, True))
+        if not additions:
+            return {"preview": True, "candidates": [], "message": "没有选择候选。"}
+        # Candidate adoption is preview-only.  The single durable commit path
+        # is PUT /cues with base_ids, candidate_rows and CAS metadata.
+        return {
+            "preview": True,
+            "candidates": [
+                {"candidate_id": str(item), "start": row.start, "end": row.end, "source": row.text, "translated": row.translated_text, "confirmed_weak": confirmed_weak.get(str(item)) is True}
+                for item, row in zip([str(item) for item in ids], additions)
+            ],
+            "message": "候选仅已加入本地编辑草稿；请在字幕页保存后正式采用。",
+        }
+    def _begin_subtitle_model_action(self, job_id: str) -> tuple[DemoJob, list[Segment]]:
+        with self._lock:
+            if self._running_id or self._subtitle_model_action_id:
+                raise RuntimeError("当前已有处理或字幕模型请求运行，请完成后再试。")
+            job = self._jobs.get(job_id)
+            if job is None or job.work_dir is None:
+                raise RuntimeError("任务或字幕目录不可用。")
+            if job.status in {"queued", "running", "preparing", "cancelling"}:
+                raise RuntimeError("任务正在运行，请等待当前阶段结束后再校对。")
+            if job.stages.get("translate", {}).get("status") != "completed":
+                raise RuntimeError("翻译阶段完成后才能使用字幕模型校对。")
+            source_path = job.edited_segments or job.artifacts.path("translated_segments")
+            if source_path is None or not source_path.is_file():
+                raise RuntimeError("当前任务没有可用的已翻译字幕。")
+            try:
+                segments = load_segments(source_path)
+            except (OSError, TypeError, ValueError) as exc:
+                raise RuntimeError("字幕数据无效，请重新加载任务字幕。") from exc
+            if not segments:
+                raise RuntimeError("当前任务没有可编辑的字幕。")
+            self._subtitle_model_action_id = job_id
+            return job, segments
+
+    def _end_subtitle_model_action(self, job_id: str) -> None:
+        with self._lock:
+            if self._subtitle_model_action_id == job_id:
+                self._subtitle_model_action_id = None
+
+    @staticmethod
+    def _subtitle_model_label(job: DemoJob) -> tuple[str, str]:
+        provider = str(job.options.get("translator") or "none").strip().lower()
+        provider_label = {
+            "deepseek": "DeepSeek",
+            "openai": "OpenAI",
+            "ollama": "Ollama 本地模型",
+        }.get(provider, provider or "未知模型")
+        model = str(job.options.get("translate_model") or "").strip()
+        if not model:
+            model = {
+                "deepseek": os.getenv("DEEPSEEK_TRANSLATE_MODEL", "deepseek-v4-flash"),
+                "openai": os.getenv("OPENAI_TRANSLATE_MODEL", "gpt-4.1-mini"),
+                "ollama": "当前 Ollama 模型",
+            }.get(provider, provider_label)
+        return provider_label, model
+
+    def retranslate_cue(
+        self,
+        job_id: str,
+        cue_id: int,
+        source_text: str,
+        context_override: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        if isinstance(cue_id, bool) or not isinstance(cue_id, int) or cue_id < 0:
+            raise ValueError("字幕编号无效。")
+        if not isinstance(source_text, str) or len(source_text.strip()) > 2_000:
+            raise ValueError("原文必须是 2000 个字符以内的文本。")
+        corrected_source = source_text.strip()
+        if not corrected_source:
+            raise ValueError("原文不能为空。")
+        job, segments = self._begin_subtitle_model_action(job_id)
+        try:
+            if cue_id >= len(segments):
+                raise ValueError("字幕编号已变化，请重新加载字幕列表。")
+            provider = str(job.options.get("translator") or "none").strip().lower()
+            if provider not in {"deepseek", "openai", "ollama"}:
+                raise RuntimeError("当前任务未配置可用的翻译模型。")
+            context_by_id: dict[int, dict[str, Any]] = {}
+            for neighbor_id in (cue_id - 1, cue_id + 1):
+                if 0 <= neighbor_id < len(segments):
+                    neighbor = segments[neighbor_id]
+                    context_by_id[neighbor_id] = {
+                        "cue": neighbor_id + 1,
+                        "source": neighbor.text,
+                        "translation": neighbor.translated_text or "",
+                    }
+            if context_override is not None:
+                if not isinstance(context_override, list) or len(context_override) > 2:
+                    raise ValueError("相邻字幕上下文无效。")
+                seen_context_ids: set[int] = set()
+                for item in context_override:
+                    if not isinstance(item, dict):
+                        raise ValueError("相邻字幕上下文无效。")
+                    neighbor_id = item.get("cue_id")
+                    if (
+                        isinstance(neighbor_id, bool)
+                        or not isinstance(neighbor_id, int)
+                        or neighbor_id not in context_by_id
+                        or neighbor_id in seen_context_ids
+                    ):
+                        raise ValueError("相邻字幕上下文编号无效。")
+                    source = item.get("source")
+                    translation = item.get("translated")
+                    if (
+                        not isinstance(source, str)
+                        or not isinstance(translation, str)
+                        or len(source) > 2_000
+                        or len(translation) > 2_000
+                    ):
+                        raise ValueError("相邻字幕上下文长度无效。")
+                    context_by_id[neighbor_id] = {
+                        "cue": neighbor_id + 1,
+                        "source": source,
+                        "translation": translation,
+                    }
+                    seen_context_ids.add(neighbor_id)
+            source_language = resolve_review_language(
+                job.options.get("source_language"),
+                job.artifacts.path("asr_evidence"),
+                allow_detected=job.artifacts.subtitle_extraction_mode in {"audio", "audio-fallback"},
+            )
+            configured_source_language = str(job.options.get("source_language") or "").strip()
+            if source_language is None and configured_source_language and configured_source_language.lower() != "auto":
+                source_language = configured_source_language
+            if source_language is None and job.artifacts.asr_evidence and job.artifacts.subtitle_extraction_mode in {"audio", "audio-fallback"}:
+                try:
+                    evidence = json.loads(Path(job.artifacts.asr_evidence).read_text(encoding="utf-8"))
+                except (OSError, ValueError, TypeError):
+                    evidence = {}
+                if not isinstance(evidence, dict):
+                    evidence = {}
+                detected = str(evidence.get("detected_language") or "").strip()
+                try:
+                    probability = float(evidence.get("language_probability"))
+                except (TypeError, ValueError):
+                    probability = 0.0
+                if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+                    probability = 0.0
+                if detected and probability >= 0.80:
+                    source_language = detected
+            with self._llm_usage_session(job, "single"):
+                candidate = translate_single_cue(
+                    corrected_source,
+                    provider=provider,
+                    target_lang=str(job.options.get("target_lang") or "zh-Hans"),
+                    model=str(job.options.get("translate_model") or "") or None,
+                    source_lang=source_language,
+                    context=json.dumps(
+                        [context_by_id[index] for index in sorted(context_by_id)],
+                        ensure_ascii=False,
+                    ),
+                    smart_translation=bool(job.options.get("smart_translation", True)),
+                    deepseek_thinking=str(job.options.get("deepseek_thinking") or "disabled"),
+                )
+            provider_label, model_label = self._subtitle_model_label(job)
+            return {
+                "cue_id": cue_id,
+                "translation": candidate,
+                "provider": provider_label,
+                "model": model_label,
+            }
+        finally:
+            self._end_subtitle_model_action(job_id)
+
+    def compact_cues(
+        self,
+        job_id: str,
+        cue_ids: list[int],
+        cue_overrides: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(cue_ids, list) or not cue_ids or len(cue_ids) > 50:
+            raise ValueError("请选择 1–50 条字幕生成精简建议。")
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in cue_ids):
+            raise ValueError("字幕编号无效。")
+        if len(set(cue_ids)) != len(cue_ids):
+            raise ValueError("字幕编号不能重复。")
+        job, segments = self._begin_subtitle_model_action(job_id)
+        try:
+            indexes = sorted(cue_ids)
+            if indexes[-1] >= len(segments):
+                raise ValueError("字幕编号已变化，请重新加载字幕列表。")
+            provider = str(job.options.get("translator") or "none").strip().lower()
+            if provider not in {"deepseek", "openai", "ollama"}:
+                raise RuntimeError("当前任务未配置可用的翻译模型。")
+            preview_segments = copy.deepcopy(segments)
+            if cue_overrides is not None:
+                if not isinstance(cue_overrides, list) or len(cue_overrides) > 50:
+                    raise ValueError("字幕草稿数据无效。")
+                seen_override_ids: set[int] = set()
+                for item in cue_overrides:
+                    if not isinstance(item, dict):
+                        raise ValueError("字幕草稿数据无效。")
+                    override_id = item.get("cue_id")
+                    source = item.get("source")
+                    translated = item.get("translated")
+                    if (
+                        isinstance(override_id, bool)
+                        or not isinstance(override_id, int)
+                        or override_id not in indexes
+                        or override_id in seen_override_ids
+                        or not isinstance(source, str)
+                        or not isinstance(translated, str)
+                        or len(source) > 2_000
+                        or len(translated) > 2_000
+                    ):
+                        raise ValueError("字幕草稿数据无效。")
+                    preview_segments[override_id].text = source
+                    preview_segments[override_id].translated_text = translated
+                    seen_override_ids.add(override_id)
+            line_width, display_limit = self._cue_layout_limits(job)
+            target_units = {
+                index: max(1, min(36, int(max(0.1, preview_segments[index].end - preview_segments[index].start) * 12)))
+                for index in indexes
+            }
+            errors: dict[int, str] = {}
+            with self._llm_usage_session(job, "formatting"):
+                candidates, unresolved = compact_overflowing_subtitles(
+                    preview_segments,
+                    indexes,
+                    provider=provider,
+                    target_lang=str(job.options.get("target_lang") or "zh-Hans"),
+                    model=str(job.options.get("translate_model") or "") or None,
+                    max_chars_per_line=line_width,
+                    max_display_units_per_line=display_limit,
+                    smart_layout=bool(job.options.get("smart_subtitle_layout", True)),
+                    checkpoint_path=None,
+                    force_compact=True,
+                    target_display_units=target_units,
+                    max_attempts=1,
+                    errors=errors,
+                    display_mode=str(job.options.get("subtitle_display_mode") or "translated"),
+                    deepseek_thinking=str(job.options.get("deepseek_thinking") or "disabled"),
+                )
+            provider_label, model_label = self._subtitle_model_label(job)
+            unresolved_indexes = set(unresolved)
+            return {
+                "provider": provider_label,
+                "model": model_label,
+                "request_count": sum(1 for index in indexes if preview_segments[index].translated_text),
+                "candidates": [
+                    {
+                        "cue_id": index,
+                        "original": preview_segments[index].translated_text or preview_segments[index].text,
+                        "candidate": candidates[index].translated_text or preview_segments[index].text,
+                        "error": errors.get(index),
+                        "still_overflowing": index in unresolved_indexes,
+                    }
+                    for index in indexes
+                ],
+            }
+        finally:
+            self._end_subtitle_model_action(job_id)
 
     def shutdown(self, timeout: float = 8.0) -> None:
         """Cancel the active stage and preserve a recoverable status before exit."""
         with self._lock:
             job = self._jobs.get(self._running_id or "")
             worker = self._worker
+            review_worker = self._voice_review_worker
+            review_process = self._voice_review_process
+            review_job = self._jobs.get(self._running_id or "") if review_worker else None
+            if review_job:
+                review_job.cancellation.cancel()
+                review_job.add_log("Application is closing; ASR review worker cancellation requested.")
+            if review_process and review_process.poll() is None:
+                review_process.terminate()
             if job and job.status in {"queued", "running", "cancelling"}:
                 job.status, job.stage = "cancelling", "正在安全停止当前阶段"
                 job.add_log("Application is closing; cancellation requested.")
                 job.cancellation.cancel()
-        if not job:
+        if not job and not review_job:
+            return
+        if review_worker and review_worker.is_alive() and review_worker is not threading.current_thread():
+            review_worker.join(max(0.0, timeout))
+        if review_job:
+            self._persist(review_job)
+            if review_process and review_process.poll() is None:
+                review_process.terminate()
+                try: review_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    review_process.kill(); review_process.wait(timeout=5)
+            try: reset_interrupted_round(review_job.work_dir, status="pending", error="应用关闭，当前复核窗口可继续。")
+            except OSError: pass
             return
         self._persist(job)
         if worker and worker.is_alive() and worker is not threading.current_thread():
@@ -2232,7 +3264,7 @@ class WorkbenchJobs:
             job = self._jobs.get(job_id)
             if job is None or job.work_dir is None or job.raw_video is None or job.status != "completed":
                 raise RuntimeError("完成初始任务后才能对齐字幕。")
-            if self._running_id:
+            if self._running_id or self._subtitle_model_action_id:
                 raise RuntimeError("已有任务在运行。")
         work_dir = job.work_dir
         source_parent = job.artifacts.path("source_segments")
@@ -2305,7 +3337,7 @@ class WorkbenchJobs:
             job = self._jobs.get(job_id)
             if job is None or job.work_dir is None or job.raw_video is None or job.status != "completed":
                 raise RuntimeError("完成初始任务后才能修改视频。")
-            if self._running_id:
+            if self._running_id or self._subtitle_model_action_id:
                 raise RuntimeError("已有任务在运行。")
         # 参数校验（在进入任务状态机之前，参数错误直接报错而不创建失败任务）
         duration = _probe_media(job.raw_video)[0] or 0
@@ -2543,9 +3575,34 @@ class WorkbenchJobs:
         rendered = work_dir / "rendered.mp4"
         rendered_candidate.replace(rendered)
         new_duration = _probe_media(new_raw)[0]
+        # A video edit changes the source clock and invalidates the extracted
+        # audio/word timeline. Preserve the old review session for audit, but
+        # never let a later prepare call reuse it for the new raw video.
+        review_file = session_path(work_dir)
+        prior_session = read_session(work_dir)
+        prior_language = (prior_session or {}).get("language")
+        prior_raw_signature = _path_signature(new_raw)
+        if review_file.is_file():
+            stale_review = review_file.with_name(f"session-stale-{uuid.uuid4().hex[:10]}.json")
+            review_file.replace(stale_review)
+        if prior_language and prior_raw_signature:
+            _atomic_json(work_dir / "asr-review" / "language-provenance.json", {"language": prior_language, "source_video_signature": prior_raw_signature, "reason": "video edit preserved source language"})
+        current_source_segments = None
+        current_source_srt = None
+        if segments_file is not None and segments_file.is_file():
+            current_source_segments = work_dir / f"segments.source.current.{uuid.uuid4().hex[:8]}.json"
+            current_source_srt = work_dir / f"source.current.{uuid.uuid4().hex[:8]}.srt"
+            remapped_segments = load_segments(segments_file)
+            source_only = [Segment(item.start, item.end, item.text, None, item.needs_review) for item in remapped_segments]
+            save_segments(current_source_segments, source_only)
+            write_srt(current_source_srt, source_only, display_mode="source")
         with self._lock:
             job.artifacts.original_video = job.artifacts.original_video or job.artifacts.raw_video or str(new_raw)
             job.artifacts.raw_video = str(new_raw)
+            job.artifacts.audio = None
+            job.artifacts.asr_evidence = None
+            job.artifacts.asr_review = None
+            job.artifacts.asr_timeline_shift_seconds = 0.0
             job.artifacts.rendered_video = str(rendered)
             job.artifacts.revision += 1
             job.artifacts.last_edit = operation
@@ -2554,6 +3611,9 @@ class WorkbenchJobs:
                 job.artifacts.translated_srt = str(subtitle)
             if segments_file is not None:
                 job.artifacts.translated_segments = str(segments_file)
+            if current_source_segments is not None:
+                job.artifacts.source_segments = str(current_source_segments)
+                job.artifacts.source_srt = str(current_source_srt)
             job.raw_video = new_raw
             job.rendered_video = rendered
             if segments_file:
@@ -2609,7 +3669,7 @@ class WorkbenchJobs:
             job = self._jobs.get(job_id)
             if job is None or job.work_dir is None or job.raw_video is None or job.status != "completed":
                 raise RuntimeError("Finish the initial task before trimming the video.")
-            if self._running_id:
+            if self._running_id or self._subtitle_model_action_id:
                 raise RuntimeError("A task is already running.")
             work_dir = job.work_dir
             raw_video = job.raw_video
@@ -2699,7 +3759,7 @@ class WorkbenchJobs:
         if job and job.workflow_version >= WORKFLOW_VERSION and job.stages.get("translate", {}).get("status") == "completed":
             return self.run_stage(job_id, "render")
         with self._lock:
-            if self._running_id:
+            if self._running_id or self._subtitle_model_action_id:
                 raise RuntimeError("A task is already running.")
             job = self._jobs.get(job_id)
             if job is None or job.work_dir is None or job.raw_video is None or job.status != "completed":
@@ -2842,22 +3902,35 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if path == "/api/diagnostics":
             self._json(self._diagnostics()); return
         if path == "/api/dependencies":
-            if parse_qs(urlparse(self.path).query).get("refresh") == ["1"]:
+            query = parse_qs(urlparse(self.path).query)
+            ocr_language = str(query.get("ocr_language", ["eng"])[0])
+            if query.get("refresh") == ["1"]:
                 clear_dependency_cache()
-            self._json(self.dependencies.snapshot()); return
+            self._json(self.dependencies.snapshot(ocr_language)); return
         match = re.fullmatch(r"/api/dependencies/jobs/([a-f0-9]+)", path)
         if match:
             install_job = self.dependencies.get_job(match.group(1))
             self._json(install_job.snapshot() if install_job else {"error": "安装任务不存在。"}, HTTPStatus.OK if install_job else HTTPStatus.NOT_FOUND)
             return
         if path == "/api/templates":
-            self._json({"templates": [{"name": name, "body": body} for name, body in get_all_templates().items()]}); return
+            query = parse_qs(urlparse(self.path).query)
+            platform = normalize_publish_platform(str(query.get("platform", ["bilibili"])[0]))
+            self._json({
+                "platform": platform,
+                "templates": [
+                    {"name": name, "body": body}
+                    for name, body in get_all_templates(platform).items()
+                ],
+            })
+            return
         if path == "/api/outputs":
             self._json(self._outputs_snapshot(OUTPUT_ROOT)); return
         if path == "/api/publish/status":
             browser = "msedge" if str(parse_qs(urlparse(self.path).query).get("browser", ["chromium"])[0]).lower() in {"edge", "msedge"} else "chromium"
-            pids = self._publish_profile_process_ids(browser)
-            self._json({"profile_busy": bool(pids), "process_count": len(pids), "message": "B 站自动化浏览器正在使用中。" if pids else "B 站自动化 Profile 可用。"}); return
+            platform = "douyin" if str(parse_qs(urlparse(self.path).query).get("platform", ["bilibili"])[0]).lower() == "douyin" else "bilibili"
+            pids = self._publish_profile_process_ids(browser, platform)
+            platform_name = "抖音" if platform == "douyin" else "B 站"
+            self._json({"profile_busy": bool(pids), "process_count": len(pids), "message": f"{platform_name}自动化浏览器正在使用中。" if pids else f"{platform_name}专用浏览器资料可用。"}); return
         if path == "/api/publish/assist/status":
             self._json(self.jobs.publish_session().snapshot()); return
         if path == "/api/materials":
@@ -2929,6 +4002,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             try: self._json(self.jobs.cues(match.group(1)))
             except RuntimeError as exc: self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
             return
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/voice-review", path)
+        if match:
+            try: self._json(self.jobs.voice_review(match.group(1)))
+            except RuntimeError as exc: self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
+            return
         match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/logs", path)
         if match:
             try:
@@ -2964,10 +4042,50 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             payload = self._payload()
         except PayloadReadError as exc:
             self._json(exc.payload(), exc.status); return
+        if path == "/api/dependencies/ollama/start":
+            try:
+                result = self.dependencies.start_ollama()
+            except RuntimeError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
+            else:
+                status = HTTPStatus.ACCEPTED if result["state"] == "starting" else HTTPStatus.OK
+                self._json(result, status)
+            return
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/cues/(\d+)/retranslate", path)
+        if match:
+            try:
+                result = self.jobs.retranslate_cue(
+                    match.group(1), int(match.group(2)), payload.get("source"),
+                    payload.get("context"),
+                )
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST); return
+            except RuntimeError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
+            self._json(result); return
+        if path == "/api/dependencies/tesseract/start":
+            try:
+                result = self.dependencies.start_tesseract_installer()
+            except RuntimeError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
+            else:
+                self._json(result, HTTPStatus.ACCEPTED)
+            return
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/cues/compact", path)
+        if match:
+            try:
+                result = self.jobs.compact_cues(
+                    match.group(1), payload.get("cue_ids"), payload.get("cues"),
+                )
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST); return
+            except RuntimeError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
+            self._json(result); return
         match = re.fullmatch(r"/api/dependencies/([a-z0-9-]+)/install", path)
         if match:
             try:
-                install_job = self.dependencies.start(match.group(1), payload.get("confirmed") is True)
+                install_job = self.dependencies.start(match.group(1), payload.get("confirmed") is True, str(payload.get("ocr_language") or "eng"))
             except ValueError as exc:
                 self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except RuntimeError as exc:
@@ -3106,16 +4224,25 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             try:
                 name = require_text(payload.get("name", ""), "name", 50, allow_empty=False)
                 body = require_text(payload.get("body", ""), "body", MAX_DESCRIPTION_LENGTH, allow_empty=False)
-                save_custom_template(name, body)
+                platform = normalize_publish_platform(str(payload.get("platform", "bilibili")))
+                save_custom_template(name, body, platform=platform)
             except InputValidationError as exc: self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
             except ValueError as exc: self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
-            else: self._json({"saved": True})
+            else: self._json({"saved": True, "platform": platform})
             return
         if path == "/api/publish/description":
             try:
-                template_name = require_text(payload.get("template", "授权本地化"), "template", 50, allow_empty=False)
+                platform = normalize_publish_platform(str(payload.get("platform", "bilibili")))
+                default_template = "中文字幕版" if platform == "douyin" else "授权本地化"
+                template_name = require_text(payload.get("template", default_template), "template", 50, allow_empty=False)
                 source_link = require_text(payload.get("source_url", ""), "source_url", MAX_URL_LENGTH)
-                include_link = require_boolean(payload.get("include_source_link", True), "include_source_link")
+                include_default = platform != "douyin"
+                include_link = require_boolean(
+                    payload.get("include_source_link", include_default),
+                    "include_source_link",
+                )
+                if platform == "douyin":
+                    include_link = False
                 custom_text = require_text(payload.get("custom_text", ""), "custom_text", MAX_DESCRIPTION_LENGTH)
                 template_body = require_text(payload.get("template_body", ""), "template_body", MAX_DESCRIPTION_LENGTH)
                 extra_value = payload.get("extra_lines", [])
@@ -3125,19 +4252,37 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                         limits={"max_items": 20},
                     )
                 extra_lines = [require_text(line, f"extra_lines[{index}]", 500) for index, line in enumerate(extra_value)]
-                body = build_bilibili_description(
-                    template_name, source_link, include_link, custom_text,
-                    [line for line in extra_lines if line], template_body=template_body or None,
+                body = build_publish_description(
+                    platform,
+                    template_name,
+                    source_link,
+                    include_link,
+                    custom_text,
+                    [line for line in extra_lines if line],
+                    template_body=template_body or None,
                 )
             except InputValidationError as exc:
                 self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
             except ValueError as exc:
                 self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             else:
-                self._json({"description": body})
+                self._json({"description": body, "platform": platform})
             return
         if path == "/api/publish/copy":
             self._publish_copy(payload); return
+        if path == "/api/publish/douyin/open":
+            try:
+                opened = webbrowser.open(DOUYIN_UPLOAD_URL, new=2, autoraise=True)
+            except (OSError, webbrowser.Error) as exc:
+                self._json({"error": f"打开抖音创作者服务平台失败：{exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            else:
+                if opened:
+                    self._json({"opened": True, "message": "已在默认浏览器打开抖音创作者服务平台；请手动选择视频、粘贴文案并检查后发布。"}, HTTPStatus.ACCEPTED)
+                else:
+                    self._json({"error": f"系统未能打开浏览器。请手动访问：{DOUYIN_UPLOAD_URL}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        if path == "/api/publish/douyin/assist":
+            self._start_douyin_publish_assist(payload); return
         if path == "/api/publish/check":
             self._start_publish_check(payload); return
         if path == "/api/publish/assist":
@@ -3235,6 +4380,28 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                         os.startfile(job.work_dir)  # type: ignore[attr-defined]
                     except OSError as exc: self._json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR); return
             self._json(job.snapshot() if job else {"error": "Task not found."}, HTTPStatus.OK if job else HTTPStatus.NOT_FOUND); return
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/voice-review/(prepare|start|resume|cancel)", path)
+        if match:
+            job_id, action = match.groups()
+            try:
+                result = self.jobs.prepare_voice_review(job_id) if action == "prepare" else self.jobs.cancel_voice_review(job_id) if action == "cancel" else self.jobs.start_voice_review(job_id)
+            except RuntimeError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
+            self._json(result, HTTPStatus.ACCEPTED if action in {"start", "resume"} else HTTPStatus.OK); return
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/voice-review/candidates/([^/]+)/translate", path)
+        if match:
+            try:
+                result = self.jobs.translate_voice_candidate(*match.groups(), payload)
+            except (RuntimeError, ValueError) as exc:
+                self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
+            self._json(result); return
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/voice-review/apply", path)
+        if match:
+            try:
+                result = self.jobs.apply_voice_candidates(match.group(1), payload)
+            except (RuntimeError, ValueError) as exc:
+                self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
+            self._json(result); return
         match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/trim", path)
         if match:
             try: job = self.jobs.trim(match.group(1), payload.get("cut_ranges", []))
@@ -3268,7 +4435,14 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         cues = payload.get("cues")
         if not isinstance(cues, list):
             self._json({"error": "cues must be a list of {start, end, translated, deleted}."}, HTTPStatus.BAD_REQUEST); return
-        try: job = self.jobs.save_cues(match.group(1), cues)
+        try:
+            job = self.jobs.save_cues(
+                match.group(1), cues,
+                base_revision=payload.get("base_revision"),
+                base_fingerprint=payload.get("base_fingerprint"),
+                base_ids=payload.get("base_ids"),
+                candidate_rows=payload.get("candidate_rows"),
+            )
         except RuntimeError as exc: self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
         else: self._json(job.snapshot())
 
@@ -3302,9 +4476,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if not match: self._json({"error": "Route not found."}, HTTPStatus.NOT_FOUND); return
         try:
             name = require_text(unquote(match.group(1)), "name", 50, allow_empty=False)
+            query = parse_qs(urlparse(self.path).query)
+            platform = normalize_publish_platform(str(query.get("platform", ["bilibili"])[0]))
         except InputValidationError as exc:
             self._json(exc.payload(), HTTPStatus.BAD_REQUEST); return
-        if delete_custom_template(name): self._json({"deleted": True})
+        if delete_custom_template(name, platform=platform): self._json({"deleted": True, "platform": platform})
         else: self._json({"error": "Only custom templates can be deleted."}, HTTPStatus.NOT_FOUND)
 
     def _save_settings(self, payload: dict[str, Any]) -> None:
@@ -3425,6 +4601,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "rendered_exists": bool(rendered_value and Path(rendered_value).expanduser().is_file()),
                 "created_at": record.get("created_at"),
                 "finished_at": record.get("finished_at"),
+                "llm_usage_total": (record.get("artifacts") or {}).get("llm_usage_total"),
             })
         return public
 
@@ -3570,11 +4747,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         except (ValueError, RuntimeError, OSError) as exc: self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         else: self._json({"deleted_bytes": deleted, "deleted_size": format_bytes(deleted), "removed_history": removed_history, "results": results})
 
-    def _publish_profile_dir(self, browser: str) -> Path:
-        return USER_DATA_ROOT / "data" / ("bilibili-edge-profile" if browser == "msedge" else "bilibili-profile")
+    def _publish_profile_dir(self, browser: str, platform: str = "bilibili") -> Path:
+        prefix = "douyin" if platform == "douyin" else "bilibili"
+        suffix = "edge-profile" if browser == "msedge" else "profile"
+        return USER_DATA_ROOT / "data" / f"{prefix}-{suffix}"
 
-    def _publish_profile_process_ids(self, browser: str) -> list[str]:
-        profile = str(self._publish_profile_dir(browser).resolve()).replace("'", "''")
+    def _publish_profile_process_ids(self, browser: str, platform: str = "bilibili") -> list[str]:
+        profile = str(self._publish_profile_dir(browser, platform).resolve()).replace("'", "''")
         command = "Get-CimInstance Win32_Process | Where-Object { $_.Name -notin @('powershell.exe','pwsh.exe') -and $_.CommandLine -and $_.CommandLine -like '*" + profile + "*' } | Select-Object -ExpandProperty ProcessId"
         try:
             completed = subprocess.run(["powershell", "-NoProfile", "-Command", command], capture_output=True, text=True, timeout=5)
@@ -3588,6 +4767,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         return {**result, "issues": issues, "message": "基础配置可以运行。" if result["ready"] else "；".join(issues)}
 
     def _start_publish_check(self, payload: dict[str, Any]) -> None:
+        if self.jobs.publish_session().status in {"running", "waiting_review"}:
+            self._json({"error": "已有投稿辅助浏览器正在运行，请先关闭后再打开登录检查。"}, HTTPStatus.CONFLICT); return
         browser = "msedge" if str(payload.get("browser", "chromium")).lower() in {"edge", "msedge"} else "chromium"
         session = self.jobs.begin_publish_session()
         session.status, session.message = "running", "正在打开 B 站登录检查页…"
@@ -3637,17 +4818,27 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             source_url = ""
             if job:
                 source_url = job.material.source_url or job.artifacts.webpage_url or ""
-            include_link = True
+            platform = normalize_publish_platform(str(payload.get("platform", "bilibili")))
+            include_link = platform != "douyin"
             if "include_source_link" in payload:
                 include_link = require_boolean(payload.get("include_source_link"), "include_source_link")
-            template_name = require_text(payload.get("template", "授权本地化"), "template", 50) or "授权本地化"
+            if platform == "douyin":
+                include_link = False
+            default_template = "中文字幕版" if platform == "douyin" else "授权本地化"
+            template_name = require_text(payload.get("template", default_template), "template", 50) or default_template
             template_body = require_text(payload.get("template_body", ""), "template_body", MAX_DESCRIPTION_LENGTH) or None
             extra_value = payload.get("extra_lines", [])
             extra_lines = []
             if isinstance(extra_value, list):
                 extra_lines = [require_text(line, f"extra_lines[{index}]", 500) for index, line in enumerate(extra_value) if str(line).strip()]
-            description = build_bilibili_description(
-                template_name, source_url, include_link, "", extra_lines, template_body=template_body,
+            description = build_publish_description(
+                platform,
+                template_name,
+                source_url,
+                include_link,
+                "",
+                extra_lines,
+                template_body=template_body,
             )
         tags = _validate_tags(payload.get("tags", [])) or list(copy["tags"])
         if job and not tags:
@@ -3690,6 +4881,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._json({"error": "请先确认拥有授权，并在投稿前人工检查。"}, HTTPStatus.BAD_REQUEST); return
         try:
             browser = "msedge" if str(payload.get("browser", "chromium")).lower() in {"edge", "msedge"} else "chromium"
+            if self.jobs.publish_session().status in {"running", "waiting_review"}:
+                raise ValueError("已有投稿辅助浏览器正在运行，请先关闭后再开始新的辅助。")
             close_after_fill = require_boolean(payload.get("close_after_fill", False), "close_after_fill")
             if self._publish_profile_process_ids(browser):
                 raise ValueError("B 站自动化浏览器正在使用中。请先关闭后台浏览器，再开始投稿辅助。")
@@ -3719,10 +4912,45 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         except (ValueError, OSError) as exc: self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
         else: self._json({"started": True, "message": "正在打开 B 站投稿辅助。填写完成后请人工检查并手动投稿。"}, HTTPStatus.ACCEPTED)
 
+    def _start_douyin_publish_assist(self, payload: dict[str, Any]) -> None:
+        if payload.get("confirmed") is not True:
+            self._json({"error": "请确认要将所选成片上传到抖音，并在发布前人工检查。"}, HTTPStatus.BAD_REQUEST); return
+        try:
+            browser = "msedge" if str(payload.get("browser", "chromium")).lower() in {"edge", "msedge"} else "chromium"
+            if self.jobs.publish_session().status in {"running", "waiting_review"}:
+                raise ValueError("已有投稿辅助浏览器正在运行，请先关闭后再开始新的辅助。")
+            if self._publish_profile_process_ids(browser, "douyin"):
+                raise ValueError("抖音专用自动化浏览器正在使用中。请先关闭该窗口，再开始新的投稿辅助。")
+            video, job = self._resolve_publish_video(payload)
+            title, description, tags = self._compose_publish_fields(payload, video, job)
+            session = self.jobs.begin_publish_session()
+            session.message = "正在打开抖音创作者中心投稿页…"
+            session.logs = [session.message]
+
+            def assist_runner() -> None:
+                try:
+                    assist_douyin_publish(
+                        video_path=video, title=title, description=description, tags=tags,
+                        profile_dir=self._publish_profile_dir(browser, "douyin"), browser=browser,
+                        wait_for_review=True, log=self.jobs._publish_log,
+                    )
+                except Exception as exc:
+                    traceback.print_exc()
+                    session.status, session.error = "failed", str(exc)
+                    session.message = f"抖音投稿辅助失败：{exc}"
+                else:
+                    if session.status != "failed":
+                        session.status, session.message = "finished", "抖音投稿辅助已结束（浏览器已关闭）。"
+            threading.Thread(target=assist_runner, daemon=True, name="douyin-assist").start()
+        except InputValidationError as exc: self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
+        except (ValueError, OSError) as exc: self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+        else: self._json({"started": True, "message": "抖音投稿辅助已启动。成片上传并填写后会停在发布前，等待你检查。"}, HTTPStatus.ACCEPTED)
+
     def _close_publish_browser(self, payload: dict[str, Any]) -> None:
         if payload.get("confirmed") is not True:
             self._json({"error": "Closing a browser requires explicit confirmation."}, HTTPStatus.BAD_REQUEST); return
-        profiles = [str((USER_DATA_ROOT / "data" / name).resolve()) for name in ("bilibili-profile", "bilibili-edge-profile")]
+        platform = "douyin" if str(payload.get("platform", "bilibili")).lower() == "douyin" else "bilibili"
+        profiles = [str(self._publish_profile_dir(browser, platform).resolve()) for browser in ("chromium", "msedge")]
         patterns = " -or ".join("$_.CommandLine -like '*{}*'".format(value.replace("'", "''")) for value in profiles)
         command = "Get-CimInstance Win32_Process | Where-Object { $_.Name -notin @('powershell.exe','pwsh.exe') -and $_.CommandLine -and (" + patterns + ") } | Select-Object -ExpandProperty ProcessId"
         try:

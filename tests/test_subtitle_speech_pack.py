@@ -1,18 +1,38 @@
 from types import SimpleNamespace
 from pathlib import Path
 import pytest
+from yblocalizer.models import Segment
 
 from yblocalizer.subtitle_speech_pack import (
     TimedWord,
     load_words,
-    long_gap_fragment_warnings,
     normalize_word_stream,
     pack_cues_from_words,
+    pack_cues_from_words_detailed,
     save_words,
     timed_words_from_whisper_item,
     words_path_for_segments,
+    group_speech_translation_units,
 )
 from yblocalizer.transcribe import _uncovered_speech_gaps
+
+
+def test_grouping_keeps_numeric_spanish_quantity_boundary_even_at_hard_cut() -> None:
+    cues = [
+        Segment(0, 4, "Tengo 1000"),
+        Segment(4.7, 11, "de esos"),
+    ]
+    grouped = group_speech_translation_units(cues)
+    assert len(grouped) == 1
+    assert grouped[0].text == "Tengo 1000 de esos"
+
+
+def test_grouping_propagates_review_flag() -> None:
+    grouped = group_speech_translation_units([
+        Segment(0, 1, "hello", None, False),
+        Segment(1, 2, "world", None, True),
+    ])
+    assert grouped[0].needs_review is True
 
 
 def test_words_path_for_segments() -> None:
@@ -196,8 +216,11 @@ def test_long_silence_keeps_fragments_separate_and_flags_review() -> None:
         TimedWord(200.0, 200.4, "Spanish"),
         TimedWord(320.0, 320.4, "mackerel"),
     ]
-    cues = pack_cues_from_words(words)
-    warnings = long_gap_fragment_warnings(cues)
-    assert [cue.text for cue in cues] == ["I", "did it", "Spanish", "mackerel"]
-    assert len(warnings) == 2
-    assert "Spanish" in warnings[1]
+    packed = pack_cues_from_words_detailed(words)
+    assert [cue.text for cue in packed.cues] == ["did it", "mackerel"]
+    assert [fragment.text for fragment in packed.detached_fragments] == ["I", "Spanish"]
+    assert [(fragment.start, fragment.end) for fragment in packed.detached_fragments] == [
+        (1.0, 1.2),
+        (200.0, 200.4),
+    ]
+    assert all("未放入成片字幕" in fragment.reason for fragment in packed.detached_fragments)

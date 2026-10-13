@@ -1,5 +1,9 @@
 from types import SimpleNamespace
 
+from yblocalizer.subtitle_speech_pack import (
+    pack_cues_from_words_detailed,
+    timed_words_from_whisper_item,
+)
 from yblocalizer.transcribe import _segment_from_whisper, _segments_from_whisper, _timed_words_with_fallback
 
 
@@ -88,10 +92,11 @@ def test_orphan_article_does_not_bridge_long_silence() -> None:
         ],
     )
 
-    cues = _segments_from_whisper(item)
+    packed = pack_cues_from_words_detailed(timed_words_from_whisper_item(item))
 
-    assert [cue.text for cue in cues] == ["The", "overview captured above."]
-    assert cues[0].start == 167.02
-    assert cues[0].end == 167.56
-    assert cues[1].start == 174.24
-    assert cues[1].end == 175.8
+    assert [cue.text for cue in packed.cues] == ["overview captured above."]
+    assert packed.cues[0].start == 174.24
+    assert packed.cues[0].end == 175.8
+    assert [fragment.text for fragment in packed.detached_fragments] == ["The"]
+    assert packed.detached_fragments[0].start == 167.02
+    assert packed.detached_fragments[0].end == 167.44

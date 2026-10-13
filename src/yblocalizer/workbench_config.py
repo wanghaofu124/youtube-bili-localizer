@@ -8,9 +8,10 @@ from typing import Any, Callable
 
 from .dependencies import OLLAMA_MODEL_TAGS, dependency_capabilities, ollama_local_status
 from .download import po_token_provider_status
-from .ocr_subtitle import _normalize_ocr_language, available_ocr_languages
+from .ocr_subtitle import _normalize_ocr_language, available_ocr_languages, ocr_language_ready
 from .render import render_encoder_status
 from .performance import normalize_resource_profile
+from .llm_cost import normalize_custom
 
 
 COLOR_MAP = {
@@ -152,6 +153,7 @@ def _validate_strict_source(source: dict[str, Any]) -> None:
         "description": MAX_DESCRIPTION_LENGTH,
         "whisper_model_size": MAX_MODEL_LENGTH,
         "translate_model": MAX_MODEL_LENGTH,
+        "deepseek_thinking": 32,
         "font_name": MAX_FONT_NAME_LENGTH,
         "target_lang": MAX_TARGET_LANGUAGE_LENGTH,
         "source_language": MAX_TARGET_LANGUAGE_LENGTH,
@@ -212,11 +214,13 @@ def default_options(output_dir: str = "outputs/workbench_demo") -> dict[str, Any
         "download_quality": "1080p", "render_encoder": "auto",
         "resource_profile": "balanced",
         "subtitle_source": "audio", "prefer_platform_subtitles": True,
-        "whisper_model_size": "small", "source_language": "",
+        "whisper_model_size": "small", "source_language": "", "audio_channel": "mix",
         "beam_size": 5, "ocr_interval": 0.5, "ocr_crop_ratio": 0.30, "ocr_min_chars": 3,
         "ocr_language": "eng",
         "subtitle_margin_ratio": 0.055, "render_crf": 20,
         "translator": "deepseek", "target_lang": "zh-Hans", "translate_model": "",
+        "deepseek_thinking": "disabled",
+        "llm_pricing_mode": "auto", "llm_custom_pricing": {},
         "smart_translation": True, "smart_subtitle_layout": True,
         "font_name": "Microsoft YaHei", "font_size": 24,
         "subtitle_display_mode": "translated", "subtitle_color": "白色",
@@ -238,6 +242,26 @@ def normalize_options(value: Any, output_dir: str, *, strict: bool = True) -> di
     if translator not in {"deepseek", "openai", "ollama", "none"}:
         raise InputValidationError("翻译器必须是 deepseek、openai、ollama 或 none。", code="invalid_choice", field="translator")
     translate_model = _text(raw["translate_model"]) or None
+    deepseek_thinking = str(raw.get("deepseek_thinking") or "disabled").strip().lower()
+    if deepseek_thinking not in {"disabled", "enabled", "auto"}:
+        if strict:
+            raise InputValidationError("DeepSeek 思考模式必须是 disabled、enabled 或 auto。", code="invalid_choice", field="deepseek_thinking")
+        deepseek_thinking = "disabled"
+    llm_pricing_mode = str(raw.get("llm_pricing_mode") or "auto").strip().lower()
+    if llm_pricing_mode not in {"auto", "custom", "off"}:
+        if strict:
+            raise InputValidationError("费用估算模式必须是 auto、custom 或 off。", code="invalid_choice", field="llm_pricing_mode")
+        llm_pricing_mode = "auto"
+    custom_pricing = raw.get("llm_custom_pricing") if isinstance(raw.get("llm_custom_pricing"), dict) else {}
+    try:
+        custom_pricing = normalize_custom(custom_pricing)
+        if llm_pricing_mode == "custom" and not custom_pricing:
+            raise ValueError("使用自定义单价前，请填写服务、接口、模型和三项单价。")
+    except ValueError as exc:
+        if strict:
+            raise InputValidationError(str(exc), field="llm_custom_pricing") from exc
+        custom_pricing = {}
+        llm_pricing_mode = "auto"
     # Keep saved user preferences and older job manifests usable after the
     # TranslateGemma 4B choice was replaced by the tested 12B model.
     if translator == "ollama" and translate_model == "translategemma:4b":
@@ -252,6 +276,9 @@ def normalize_options(value: Any, output_dir: str, *, strict: bool = True) -> di
                 code="invalid_choice", field="translate_model",
             )
         translate_model = None
+    audio_channel = str(raw.get("audio_channel") or "mix").strip().lower()
+    if audio_channel not in {"mix", "left", "right"}:
+        raise InputValidationError("声道必须是 mix、left 或 right。", code="invalid_choice", field="audio_channel")
     subtitle_source = str(raw["subtitle_source"])
     if subtitle_source not in {"auto", "audio", "ocr", "merged"}:
         raise InputValidationError("字幕来源选项无效。", code="invalid_choice", field="subtitle_source")
@@ -306,6 +333,7 @@ def normalize_options(value: Any, output_dir: str, *, strict: bool = True) -> di
         "prefer_platform_subtitles": raw["prefer_platform_subtitles"] if strict else bool(raw["prefer_platform_subtitles"]),
         "whisper_model_size": str(raw["whisper_model_size"]),
         "source_language": _text(raw["source_language"]) or None,
+        "audio_channel": audio_channel,
         "beam_size": int(raw["beam_size"]) if strict else max(1, min(10, int(raw["beam_size"]))),
         "ocr_interval": float(raw["ocr_interval"]) if strict else max(0.2, min(60.0, float(raw["ocr_interval"]))),
         "ocr_crop_ratio": float(raw["ocr_crop_ratio"]) if strict else max(0.05, min(1.0, float(raw["ocr_crop_ratio"]))),
@@ -315,6 +343,8 @@ def normalize_options(value: Any, output_dir: str, *, strict: bool = True) -> di
         "render_crf": int(raw["render_crf"]) if strict else max(14, min(32, int(raw["render_crf"]))),
         "translator": translator, "target_lang": str(raw["target_lang"]).strip() or "zh-Hans",
         "translate_model": translate_model,
+        "deepseek_thinking": deepseek_thinking,
+        "llm_pricing_mode": llm_pricing_mode, "llm_custom_pricing": custom_pricing,
         "smart_translation": raw["smart_translation"] if strict else bool(raw["smart_translation"]),
         "smart_subtitle_layout": raw["smart_subtitle_layout"] if strict else bool(raw["smart_subtitle_layout"]),
         "font_name": str(raw["font_name"]).strip() or "Microsoft YaHei", "font_size": font_size,
@@ -428,7 +458,8 @@ def preflight(
     if needs("extract") and options["subtitle_source"] in {"ocr", "merged"} and caps is not None and caps["tesseract"]["available"]:
         installed = available_ocr_languages()
         missing = [item for item in options["ocr_language"].split("+") if item not in installed]
-        if missing:
+        ready, _ = ocr_language_ready(options["ocr_language"])
+        if missing and not ready:
             add_block("ocr_language_missing", f"Tesseract 缺少语言包：{', '.join(missing)}。请安装语言数据或更改 OCR 语言。")
     if needs("publish") and options["publish_to_bilibili"] and profile_in_use and profile_in_use(options["bilibili_browser"]): add_block("bilibili_profile_busy", "B 站自动化浏览器正在使用中，请关闭后再开始全流程。")
     return {"ready": not blocking, "blocking": blocking, "warnings": warnings, "normalized_options": options}

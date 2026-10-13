@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from typing import Callable
 
-from .dependencies import resolve_command
+from .dependencies import default_user_data_root, managed_tessdata_root, parse_ocr_languages, resolve_command
 from .models import Segment, save_segments
 from .performance import ffmpeg_thread_args, normalize_resource_profile
 from .runtime import CancellationRequested
@@ -172,6 +172,7 @@ def extract_ocr_subtitles(
     """
     require_command("ffmpeg")
     language = _check_ocr_runtime(ocr_language)
+    ocr_config = _tessdata_config(language)
 
     video_path = video_path.resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -199,6 +200,7 @@ def extract_ocr_subtitles(
             min_chars=min_chars,
             crop_bottom_ratio=crop_bottom_ratio,
             ocr_language=language,
+            ocr_config=ocr_config,
             cancel_check=cancel_check,
             stats=stats,
             progress=progress,
@@ -300,12 +302,35 @@ def _check_ocr_runtime(ocr_language: str = "eng") -> str:
     language = _normalize_ocr_language(ocr_language)
     available = available_ocr_languages(tesseract_cmd)
     missing = [item for item in language.split("+") if item not in available]
-    if missing:
+    ready, _ = ocr_language_ready(language, tesseract_cmd)
+    if not ready:
         raise RuntimeError(
             f"Tesseract 缺少 OCR 语言包：{', '.join(missing)}。"
             f"当前已安装：{', '.join(sorted(available)) or '无法读取'}。"
         )
     return language
+
+
+def _tessdata_config(language: str, tesseract_cmd: str | None = None) -> str:
+    tokens = set(_normalize_ocr_language(language).split("+"))
+    system = set(available_ocr_languages(tesseract_cmd))
+    if tokens <= system:
+        return ""
+    managed = managed_tessdata_root()
+    if tokens <= {item.stem for item in managed.glob("*.traineddata")}:
+        return f' --tessdata-dir "{managed}"'
+    return ""
+
+
+def ocr_language_ready(language: str, tesseract_cmd: str | None = None) -> tuple[bool, str | None]:
+    tokens = set(_normalize_ocr_language(language).split("+"))
+    system = set(available_ocr_languages(tesseract_cmd))
+    if tokens <= system:
+        return True, None
+    managed = managed_tessdata_root()
+    if tokens <= {item.stem for item in managed.glob("*.traineddata")}:
+        return True, str(managed)
+    return False, None
 
 
 def _find_tesseract_command() -> str | None:
@@ -322,10 +347,7 @@ def _find_tesseract_command() -> str | None:
 
 
 def _normalize_ocr_language(value: str | None) -> str:
-    language = str(value or "eng").strip().lower()
-    if not re.fullmatch(r"[a-z0-9_+-]{2,80}", language):
-        raise ValueError("OCR 语言代码无效；请使用 eng、chi_sim 或 eng+chi_sim 这类 Tesseract 代码。")
-    return language
+    return "+".join(parse_ocr_languages(value))
 
 
 def available_ocr_languages(tesseract_cmd: str | None = None) -> frozenset[str]:
@@ -357,6 +379,7 @@ def _frames_to_segments(
     min_chars: int,
     crop_bottom_ratio: float = 0.30,
     ocr_language: str = "eng",
+    ocr_config: str | None = None,
     cancel_check: Callable[[], bool] | None = None,
     stats: dict[str, int] | None = None,
     progress: Callable[[float], None] | None = None,
@@ -402,6 +425,7 @@ def _frames_to_segments(
                 crop_bottom_ratio=crop_bottom_ratio,
                 language=ocr_language,
                 preferred_region=preferred_region,
+                ocr_config=ocr_config,
             )
         counters["ocr_calls"] += attempted
         if attempted > 1:
@@ -441,6 +465,7 @@ def _adaptive_frame_candidate(
     crop_bottom_ratio: float,
     language: str,
     preferred_region: str = "bottom",
+    ocr_config: str | None = None,
 ) -> tuple[OCRCandidate | None, int]:
     specs = {name: (y_ratio, height_ratio) for name, y_ratio, height_ratio in _ocr_region_specs(crop_bottom_ratio)}
     order = list(dict.fromkeys([preferred_region, "bottom", "full", "top", "middle"]))
@@ -450,7 +475,7 @@ def _adaptive_frame_candidate(
         if region not in specs:
             continue
         attempted += 1
-        candidate = _ocr_region_candidate(pytesseract, image, region, *specs[region], language=language)
+        candidate = _ocr_region_candidate(pytesseract, image, region, *specs[region], language=language, ocr_config=ocr_config)
         if candidate and (best is None or candidate.score > best.score):
             best = candidate
         if candidate and candidate.score >= 0.74:
@@ -466,13 +491,14 @@ def _ocr_region_candidate(
     height_ratio: float,
     *,
     language: str,
+    ocr_config: str | None = None,
 ) -> OCRCandidate | None:
     width, height = image.size
     top = max(0, min(height - 1, round(height * y_ratio)))
     bottom = max(top + 1, min(height, round(height * (y_ratio + height_ratio))))
     cropped = image.crop((0, top, width, bottom))
     prepared = _prepare_ocr_image(cropped)
-    text, confidence = _ocr_frame_candidate(pytesseract, prepared, language=language, sparse=region == "full")
+    text, confidence = _ocr_frame_candidate(pytesseract, prepared, language=language, sparse=region == "full", ocr_config=ocr_config)
     quality = ocr_text_quality(text)
     if not text or quality <= 0:
         return None
@@ -502,9 +528,10 @@ def _ocr_frame_candidate(
     *,
     language: str = "eng",
     sparse: bool = False,
+    ocr_config: str | None = None,
 ) -> tuple[str, float]:
     psm = 11 if sparse else 6
-    config = f"--psm {psm}"
+    config = f"--psm {psm}{ocr_config if ocr_config is not None else _tessdata_config(language)}"
     try:
         data = pytesseract.image_to_data(
             image,

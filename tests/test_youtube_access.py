@@ -90,9 +90,9 @@ def test_normal_download_extracts_once(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert job.raw_video == tmp_path / "demo.mp4"
     assert "height<=1080" in captured["format"]
     assert "bestvideo+bestaudio/best" not in captured["format"]
-    assert "continuedl" not in captured
+    assert captured["continuedl"] is True
     assert "overwrites" not in captured
-    assert "nopart" not in captured
+    assert captured["nopart"] is False
 
 
 def test_original_proposal_reports_ytdlp_selection_not_our_bitrate_rank() -> None:

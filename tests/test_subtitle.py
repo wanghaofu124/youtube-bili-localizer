@@ -74,7 +74,10 @@ def test_dense_chinese_layout_never_emits_more_than_two_rows_per_cue() -> None:
 def test_dense_chinese_layout_is_rejected_before_render() -> None:
     dense = Segment(0, 4, "source", "一段明显超出两行画面容量的字幕，一段明显超出两行画面容量的字幕，一段明显超出两行画面容量的字幕。")
     concise = Segment(4, 6, "source", "简短字幕。")
-    assert [item[0] for item in translated_layout_issues([dense, concise])] == [1]
+    assert translated_layout_issues([dense, concise]) == []
+    rendered = format_segment_text(dense)
+    assert len(rendered.splitlines()) == 2
+    assert "".join(rendered.splitlines()) == dense.translated_text
 
 
 def test_balanced_chinese_rows_do_not_strand_a_measure_word() -> None:

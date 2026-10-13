@@ -139,13 +139,14 @@ def translated_layout_issues(
     segments: list[Segment], *, smart_layout: bool = True,
     max_chars_per_line: int = 18,
     max_display_units_per_line: float = 36.5,
+    display_mode: str = "translated",
 ) -> list[tuple[int, float, str]]:
     """Report cues that exceed the same row geometry used to write the SRT."""
     issues: list[tuple[int, float, str]] = []
     for index, segment in enumerate(segments, start=1):
         text = format_segment_text(
             segment,
-            display_mode="translated",
+            display_mode=display_mode,
             smart_layout=smart_layout,
             max_chars_per_line=max_chars_per_line,
         )

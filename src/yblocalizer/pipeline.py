@@ -72,6 +72,7 @@ class PipelineOptions:
     ocr_crop_ratio: float = 0.30
     ocr_min_chars: int = 3
     ocr_language: str = "eng"
+    audio_channel: str = "mix"
     subtitle_margin_ratio: float = 0.055
     render_crf: int = 20
     render_encoder: str = "auto"
@@ -80,6 +81,7 @@ class PipelineOptions:
     translator: str = "deepseek"
     target_lang: str = "zh-Hans"
     translate_model: str | None = None
+    deepseek_thinking: str = "disabled"
     batch_size: int = 40
     smart_translation: bool = True
     smart_subtitle_layout: bool = True

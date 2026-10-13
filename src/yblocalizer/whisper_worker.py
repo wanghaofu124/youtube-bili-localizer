@@ -24,6 +24,18 @@ def main(argv: list[str] | None = None) -> int:
 
     os.environ["YBLOCALIZER_WHISPER_WORKER"] = "1"
     try:
+        if request.get("mode") == "asr-review":
+            from .asr_review import decode_round
+            decode_round(
+                work_dir=Path(request["work_dir"]),
+                model_size=request["model_size"], device=request["device"],
+                compute_type=request["compute_type"], user_data_root=Path(request["user_data_root"]),
+                round_id=str(request.get("round_id") or ""), owner_token=str(request.get("owner_token") or ""),
+                resource_profile=request.get("resource_profile", "balanced"),
+                cancel_check=lambda: None, log=log,
+            )
+            result_path.write_text(json.dumps({"status": "completed"}, ensure_ascii=False), encoding="utf-8")
+            return 0
         from .transcribe import _transcribe_audio_in_process
         _transcribe_audio_in_process(
             Path(request["audio_path"]),
@@ -36,6 +48,7 @@ def main(argv: list[str] | None = None) -> int:
             initial_prompt=request.get("initial_prompt"),
             beam_size=request["beam_size"],
             resource_profile=request["resource_profile"],
+            evidence_path=Path(request["evidence_path"]) if request.get("evidence_path") else None,
             log=log,
         )
     except Exception as exc:

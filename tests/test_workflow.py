@@ -31,6 +31,13 @@ from yblocalizer.runtime import PipelineContext
 from yblocalizer.workbench_api import WorkbenchJobs, _restored_created_at
 
 
+def test_asr_evidence_artifact_round_trips_without_raw_path_loss() -> None:
+    artifacts = WorkflowArtifacts(asr_evidence="job/asr-evidence.json", asr_timeline_shift_seconds=-0.75)
+    restored = WorkflowArtifacts.from_dict(artifacts.to_dict())
+    assert restored.asr_evidence == "job/asr-evidence.json"
+    assert restored.asr_timeline_shift_seconds == -0.75
+
+
 @pytest.fixture(autouse=True)
 def valid_imported_test_media(monkeypatch: pytest.MonkeyPatch) -> None:
     """Workflow unit tests use byte stubs; media validation has dedicated tests."""
@@ -75,6 +82,52 @@ def test_translategemma_workflow_uses_translation_only_path(tmp_path: Path, monk
     assert Path(result.translated_srt).name == "zh.srt"
     assert result.publish_metadata and Path(result.publish_metadata).is_file()
     assert any("跳过通用模型语义切句与源文校对" in message for message in messages)
+
+
+@pytest.mark.parametrize(
+    ("configured", "mode", "probability", "expected"),
+    [("en", "audio", 0.99, "en"), ("", "audio", 0.80, "es"), ("", "audio", 0.79, None), ("", "merged", 0.99, None)],
+)
+def test_translate_resolves_asr_language_only_for_confident_pure_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, configured: str, mode: str, probability: float, expected: str | None,
+) -> None:
+    source_path = tmp_path / "segments.source.json"
+    save_segments(source_path, [Segment(0, 1, "hola")])
+    evidence_path = tmp_path / "asr-evidence.json"
+    evidence_path.write_text(json.dumps({"detected_language": "es", "language_probability": probability}), encoding="utf-8")
+    artifacts = WorkflowArtifacts(source_segments=str(source_path), asr_evidence=str(evidence_path), subtitle_extraction_mode=mode)
+    captured: dict[str, object] = {}
+
+    def fake_translate(input_json: Path, output_json: Path, output_srt: Path, **kwargs):
+        captured.update(kwargs)
+        translated = [Segment(item.start, item.end, item.text, "你好") for item in load_segments(input_json)]
+        save_segments(output_json, translated); write_srt(output_srt, translated, display_mode="translated")
+        return translated
+
+    monkeypatch.setattr("yblocalizer.workflow.translate_segments_file", fake_translate)
+    options = SimpleNamespace(translator="none", translate_model="", source_language=configured, subtitle_source="ocr", smart_translation=False, target_lang="zh-Hans", batch_size=1, subtitle_display_mode="translated", smart_subtitle_layout=True, resource_profile="balanced", title="Sample")
+    run_translate(options, tmp_path, artifacts, PipelineContext(), lambda _message: None)
+    assert captured["source_lang"] == expected
+
+
+def test_translate_maps_raw_asr_suspect_interval_through_ocr_shift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source_path = tmp_path / "segments.source.json"
+    save_segments(source_path, [Segment(0, 5, "first"), Segment(5, 10, "second")])
+    evidence_path = tmp_path / "asr-evidence.json"
+    evidence_path.write_text(json.dumps({"suspect_intervals": [{"start": 7, "end": 8}]}), encoding="utf-8")
+    artifacts = WorkflowArtifacts(source_segments=str(source_path), asr_evidence=str(evidence_path), asr_timeline_shift_seconds=-2.0, subtitle_extraction_mode="audio")
+
+    def fake_translate(input_json: Path, output_json: Path, output_srt: Path, **_kwargs):
+        translated = load_segments(input_json)
+        for item in translated: item.translated_text = "你好"
+        save_segments(output_json, translated); write_srt(output_srt, translated, display_mode="translated")
+        return translated
+
+    monkeypatch.setattr("yblocalizer.workflow.translate_segments_file", fake_translate)
+    options = SimpleNamespace(translator="none", translate_model="", source_language="en", subtitle_source="audio", smart_translation=False, target_lang="zh-Hans", batch_size=1, subtitle_display_mode="translated", smart_subtitle_layout=True, resource_profile="balanced", title="Sample")
+    result = run_translate(options, tmp_path, artifacts, PipelineContext(), lambda _message: None)
+    translated = load_segments(Path(result.translated_segments))
+    assert [item.needs_review for item in translated] == [False, True]
 
 
 def test_audio_translation_uses_speech_cues_without_crossing_long_silence(

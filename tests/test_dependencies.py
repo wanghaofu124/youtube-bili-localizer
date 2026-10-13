@@ -101,17 +101,127 @@ def test_ollama_model_dependency_waits_for_runtime(monkeypatch: pytest.MonkeyPat
     assert model["depends_on"] == "ollama-runtime"
 
 
+def test_start_ollama_uses_installed_cli_once_and_accepts_running_service(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manager = DependencyManager(tmp_path)
+    runtime_state = {"state": "stopped"}
+    monkeypatch.setenv("OLLAMA_HOST", "0.0.0.0:11434")
+    monkeypatch.setenv("OLLAMA_MODELS", str(tmp_path / "existing-models"))
+    monkeypatch.setattr("yblocalizer.dependencies.ollama_local_status", lambda: {
+        "runtime_state": runtime_state["state"],
+        "runtime_available": runtime_state["state"] == "ready",
+        "runtime_message": "Ollama is stopped",
+    })
+    executable = tmp_path / "ollama.exe"
+    monkeypatch.setattr("yblocalizer.dependencies.resolve_command", lambda name, tools_root=None: executable)
+    monkeypatch.setattr("yblocalizer.dependencies.time.sleep", lambda _seconds: None)
+    launches: list[tuple[list[str], dict]] = []
+
+    class RunningProcess:
+        def poll(self) -> None:
+            return None
+
+    def launch(command: list[str], **options):
+        launches.append((command, options))
+        return RunningProcess()
+
+    monkeypatch.setattr("yblocalizer.dependencies.subprocess.Popen", launch)
+
+    assert manager.start_ollama()["state"] == "starting"
+    assert manager.start_ollama()["state"] == "starting"
+    assert len(launches) == 1
+    assert launches[0][0] == [str(executable), "serve"]
+    assert launches[0][1]["stdin"] is not None
+    assert launches[0][1]["env"]["OLLAMA_HOST"] == "127.0.0.1:11434"
+    assert launches[0][1]["env"]["OLLAMA_MODELS"] == str(tmp_path / "existing-models")
+
+    runtime_state["state"] = "ready"
+    assert manager.start_ollama()["state"] == "ready"
+    assert len(launches) == 1
+    terminated: list[object] = []
+    monkeypatch.setattr("yblocalizer.dependencies._terminate_process_tree", lambda process: terminated.append(process))
+    manager.shutdown()
+    assert len(terminated) == 1
+
+
+def test_start_ollama_prefers_windows_desktop_app_and_does_not_stop_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    if sys.platform != "win32":
+        pytest.skip("The Ollama desktop app is a Windows installation detail.")
+    app_dir = tmp_path / "Ollama"
+    app_dir.mkdir()
+    executable = app_dir / "ollama.exe"
+    desktop_app = app_dir / "ollama app.exe"
+    desktop_app.write_bytes(b"app")
+    monkeypatch.setattr("yblocalizer.dependencies.ollama_local_status", lambda: {
+        "runtime_state": "stopped", "runtime_available": False,
+    })
+    monkeypatch.setattr("yblocalizer.dependencies.resolve_command", lambda name, tools_root=None: executable)
+    launched: list[list[str]] = []
+
+    class RunningProcess:
+        def poll(self) -> None:
+            return None
+
+    monkeypatch.setattr("yblocalizer.dependencies.subprocess.Popen", lambda command, **_options: (launched.append(command), RunningProcess())[1])
+    stopped: list[object] = []
+    monkeypatch.setattr("yblocalizer.dependencies._terminate_process_tree", lambda process: stopped.append(process))
+
+    manager = DependencyManager(tmp_path)
+    assert manager.start_ollama()["state"] == "starting"
+    assert launched == [[str(desktop_app)]]
+    manager.shutdown()
+    assert stopped == []
+
+
+def test_start_ollama_reports_cli_exit_with_log_detail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    manager = DependencyManager(tmp_path)
+    monkeypatch.setattr("yblocalizer.dependencies.dependency_statuses", lambda _root=None: [
+        {"id": "ollama-runtime", "available": False, "required": False, "message": "stopped"},
+    ])
+    monkeypatch.setattr("yblocalizer.dependencies.ollama_local_status", lambda: {
+        "runtime_state": "stopped", "runtime_available": False,
+    })
+    monkeypatch.setattr("yblocalizer.dependencies.resolve_command", lambda name, tools_root=None: tmp_path / "ollama.exe")
+    monkeypatch.setattr("yblocalizer.dependencies.time.sleep", lambda _seconds: None)
+
+    class ExitedProcess:
+        returncode = 1
+
+        def poll(self) -> int:
+            return 1
+
+    def fail_serve(_command: list[str], **options):
+        options["stdout"].write(b"listen tcp 127.0.0.1:11434: bind failed")
+        options["stdout"].flush()
+        return ExitedProcess()
+
+    monkeypatch.setattr("yblocalizer.dependencies.subprocess.Popen", fail_serve)
+    with pytest.raises(RuntimeError, match="bind failed"):
+        manager.start_ollama()
+    runtime = next(row for row in manager.snapshot()["dependencies"] if row["id"] == "ollama-runtime")
+    assert "bind failed" in runtime["message"]
+
+
 def test_ollama_model_download_uses_only_registered_tag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager = DependencyManager(tmp_path)
     job = InstallJob("pull", "ollama-qwen35-4b")
+    monkeypatch.setenv("OLLAMA_HOST", "192.0.2.1:9999")
+    monkeypatch.setenv("OLLAMA_MODELS", str(tmp_path / "existing-models"))
     monkeypatch.setattr("yblocalizer.dependencies.ollama_local_status", lambda: {"runtime_available": True})
     monkeypatch.setattr("yblocalizer.dependencies.resolve_command", lambda name, tools_root=None: Path("ollama.exe"))
-    commands: list[list[str]] = []
-    monkeypatch.setattr(manager, "_stream_command", lambda current, command, env=None: commands.append(command))
+    commands: list[tuple[list[str], dict[str, str]]] = []
+    monkeypatch.setattr(manager, "_stream_command", lambda current, command, env=None: commands.append((command, env)))
     manager._install_ollama_model(job, "qwen3.5:4b")
-    assert commands == [["ollama.exe", "pull", "qwen3.5:4b"]]
+    assert commands[0][0] == ["ollama.exe", "pull", "qwen3.5:4b"]
+    assert commands[0][1]["OLLAMA_HOST"] == "127.0.0.1:11434"
+    assert commands[0][1]["OLLAMA_MODELS"] == str(tmp_path / "existing-models")
     manager._install_ollama_model(InstallJob("pull-gemma", "ollama-translategemma-12b"), "translategemma:12b")
-    assert commands[-1] == ["ollama.exe", "pull", "translategemma:12b"]
+    assert commands[-1][0] == ["ollama.exe", "pull", "translategemma:12b"]
     with pytest.raises(RuntimeError, match="不允许下载"):
         manager._install_ollama_model(job, "untrusted/model:latest")
 

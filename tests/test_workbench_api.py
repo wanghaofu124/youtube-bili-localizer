@@ -402,6 +402,24 @@ def test_cues_translated_only_legacy_job_without_work_dir_reads_pointer(tmp_path
     assert result["cues"][0]["translated"] == "你好"
 
 
+def test_cues_adds_review_issues_and_defaults_legacy_marker_to_false(tmp_path: Path) -> None:
+    jobs = WorkbenchJobs()
+    job = DemoJob("review-cues", Material("review", DEMO_VIDEO, "demo.mp4", 10, 1280, 720, True), "cpu", "int8")
+    translated = tmp_path / "segments.translated.json"
+    translated.write_text(json.dumps([
+        {"start": 0.0, "end": 0.5, "text": "hello", "translated_text": "你好", "needs_review": True},
+        {"start": 0.4, "end": 1.2, "text": "there", "translated_text": "世界"},
+    ], ensure_ascii=False), encoding="utf-8")
+    job.artifacts.translated_segments = str(translated)
+    jobs._jobs[job.id] = job
+
+    cues = jobs.cues(job.id)["cues"]
+
+    assert cues[0]["needs_review"] is True
+    assert {"short-duration", "overlap"}.issubset(cues[0]["issues"])
+    assert cues[1]["needs_review"] is False
+
+
 def test_cues_rejects_corrupt_subtitle_file_as_controlled_error(tmp_path: Path) -> None:
     jobs = WorkbenchJobs()
     job = DemoJob("bad-cues", Material("bad", DEMO_VIDEO, "demo.mp4", 10, 1280, 720, True), "cpu", "int8", work_dir=tmp_path)
@@ -565,6 +583,159 @@ def test_subtitle_saves_keep_the_previous_valid_edit(tmp_path: Path) -> None:
     assert first.name == "segments.translated.edited.r1.json"
     assert second.name == "segments.translated.edited.r2.json"
     assert first.is_file() and second.is_file()
+
+
+def test_subtitle_save_persists_source_and_manual_review_without_changing_raw_source(tmp_path: Path) -> None:
+    from yblocalizer.models import Segment, load_segments, save_segments
+
+    jobs = WorkbenchJobs()
+    job = jobs.create("demo", "cpu", "int8", {
+        "translator": "none", "target_lang": "en", "output_dir": str(tmp_path / "out"),
+    })
+    original = job.work_dir / "segments.translated.json"
+    raw_source = job.work_dir / "segments.source.json"
+    save_segments(original, [Segment(0, 1, "source before", "译文之前")])
+    save_segments(raw_source, [Segment(0, 1, "source before")])
+    original_bytes = original.read_bytes()
+    raw_source_bytes = raw_source.read_bytes()
+    job.artifacts.translated_segments = str(original)
+    job.artifacts.source_segments = str(raw_source)
+    job.stages["translate"]["status"] = "completed"
+
+    jobs.save_cues(job.id, [{
+        "start": 0, "end": 1, "source": "修正原文", "translated": "修正译文",
+        "deleted": False, "needs_review": True,
+    }])
+    saved = load_segments(Path(job.artifacts.translated_segments or ""))[0]
+
+    assert saved.text == "修正原文"
+    assert saved.translated_text == "修正译文"
+    assert saved.needs_review is True
+    assert original.read_bytes() == original_bytes
+    assert raw_source.read_bytes() == raw_source_bytes
+
+
+def test_single_cue_retranslation_uses_task_model_and_draft_context_without_writing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from yblocalizer.models import Segment, save_segments
+
+    jobs = WorkbenchJobs()
+    job = jobs.create("demo", "cpu", "int8", {
+        "translator": "ollama", "translate_model": "qwen3.5:9b", "source_language": "en",
+        "target_lang": "zh-Hans", "output_dir": str(tmp_path / "out"),
+    })
+    translated = job.work_dir / "segments.translated.json"
+    save_segments(translated, [Segment(0, 1, "before", "之前"), Segment(1, 2, "old source", "旧译文"), Segment(2, 3, "after", "之后")])
+    original_bytes = translated.read_bytes()
+    job.artifacts.translated_segments = str(translated)
+    job.stages["translate"]["status"] = "completed"
+    captured: dict[str, object] = {}
+
+    def fake_translate(source_text: str, **kwargs: object) -> str:
+        captured["source"] = source_text
+        captured["reserved_job"] = jobs._subtitle_model_action_id
+        captured.update(kwargs)
+        return "候选译文"
+
+    monkeypatch.setattr("yblocalizer.workbench_api.translate_single_cue", fake_translate)
+    result = jobs.retranslate_cue(job.id, 1, "draft source", [
+        {"cue_id": 0, "source": "draft before", "translated": "草稿之前"},
+        {"cue_id": 2, "source": "draft after", "translated": "草稿之后"},
+    ])
+
+    assert result["translation"] == "候选译文"
+    assert result["provider"] == "Ollama 本地模型"
+    assert captured["source"] == "draft source"
+    assert captured["reserved_job"] == job.id
+    assert captured["provider"] == "ollama"
+    assert captured["model"] == "qwen3.5:9b"
+    context = json.loads(str(captured["context"]))
+    assert [entry["source"] for entry in context] == ["draft before", "draft after"]
+    assert translated.read_bytes() == original_bytes
+    assert jobs._subtitle_model_action_id is None
+
+
+def test_single_cue_model_failure_keeps_subtitle_file_and_releases_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from yblocalizer.models import Segment, save_segments
+
+    jobs = WorkbenchJobs()
+    job = jobs.create("demo", "cpu", "int8", {
+        "translator": "ollama", "translate_model": "qwen3.5:9b", "output_dir": str(tmp_path / "out"),
+    })
+    translated = job.work_dir / "segments.translated.json"
+    save_segments(translated, [Segment(0, 1, "source", "原译文")])
+    original_bytes = translated.read_bytes()
+    job.artifacts.translated_segments = str(translated)
+    job.stages["translate"]["status"] = "completed"
+    def fail_translation(*_args: object, **_kwargs: object) -> str:
+        assert jobs._subtitle_model_action_id == job.id
+        raise RuntimeError("model unavailable")
+
+    monkeypatch.setattr("yblocalizer.workbench_api.translate_single_cue", fail_translation)
+
+    with pytest.raises(RuntimeError, match="model unavailable"):
+        jobs.retranslate_cue(job.id, 0, "corrected source")
+
+    assert translated.read_bytes() == original_bytes
+    assert jobs._subtitle_model_action_id is None
+
+
+def test_compaction_preview_uses_unsaved_draft_and_does_not_write_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from yblocalizer.models import Segment, save_segments
+
+    jobs = WorkbenchJobs()
+    job = jobs.create("demo", "cpu", "int8", {
+        "translator": "ollama", "translate_model": "qwen3.5:9b", "output_dir": str(tmp_path / "out"),
+    })
+    translated = job.work_dir / "segments.translated.json"
+    save_segments(translated, [Segment(0, 2, "source", "saved translation")])
+    original_bytes = translated.read_bytes()
+    job.artifacts.translated_segments = str(translated)
+    job.stages["translate"]["status"] = "completed"
+    captured: dict[str, object] = {}
+
+    def fake_compact(segments: list[Segment], indexes: list[int], **kwargs: object) -> tuple[list[Segment], list[int]]:
+        captured["source"] = segments[0].text
+        captured["translation"] = segments[0].translated_text
+        captured["reserved_job"] = jobs._subtitle_model_action_id
+        captured.update(kwargs)
+        return ([Segment(segments[0].start, segments[0].end, segments[0].text, "draft compact")], [])
+
+    monkeypatch.setattr("yblocalizer.workbench_api.compact_overflowing_subtitles", fake_compact)
+    result = jobs.compact_cues(job.id, [0], [{
+        "cue_id": 0, "source": "draft source", "translated": "draft translation",
+    }])
+
+    assert captured["source"] == "draft source"
+    assert captured["translation"] == "draft translation"
+    assert captured["provider"] == "ollama"
+    assert captured["reserved_job"] == job.id
+    assert result["request_count"] == 1
+    assert result["candidates"][0]["original"] == "draft translation"
+    assert result["candidates"][0]["candidate"] == "draft compact"
+    assert translated.read_bytes() == original_bytes
+    assert jobs._subtitle_model_action_id is None
+
+
+def test_subtitle_model_action_blocks_save_without_marking_pipeline_interrupted(tmp_path: Path) -> None:
+    from yblocalizer.models import Segment, save_segments
+
+    jobs = WorkbenchJobs()
+    job = jobs.create("demo", "cpu", "int8", {
+        "translator": "ollama", "translate_model": "qwen3.5:9b", "output_dir": str(tmp_path / "out"),
+    })
+    translated = job.work_dir / "segments.translated.json"
+    save_segments(translated, [Segment(0, 1, "source", "译文")])
+    job.artifacts.translated_segments = str(translated)
+    job.stages["translate"]["status"] = "completed"
+    job.status = "completed"
+    jobs._subtitle_model_action_id = job.id
+
+    with pytest.raises(RuntimeError, match="正在运行"):
+        jobs.save_cues(job.id, [{"start": 0, "end": 1, "translated": "新译文"}])
+    jobs.shutdown(timeout=0)
+
+    assert job.status == "completed"
+    assert translated.is_file()
 
 
 def test_failed_subtitle_save_removes_inactive_candidate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

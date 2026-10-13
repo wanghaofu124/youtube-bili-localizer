@@ -4,6 +4,7 @@ import pytest
 
 from yblocalizer.publish_text import (
     build_bilibili_description,
+    build_publish_description,
     ensure_source_link,
     get_all_templates,
     save_custom_template,
@@ -92,6 +93,33 @@ def test_publish_description_has_one_source_link() -> None:
     assert ensure_source_link(description, source) == description
 
 
+def test_douyin_description_omits_source_link() -> None:
+    source = "https://example.com/video"
+    description = build_publish_description(
+        "douyin",
+        "中文字幕版",
+        source,
+        include_source_link=True,  # forced off for Douyin
+    )
+    assert source not in description
+    assert "原视频链接" not in description
+    assert "中文字幕版" in description
+
+
+def test_platform_templates_are_isolated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("YBLOCALIZER_DATA_DIR", str(tmp_path / "user-data"))
+    save_custom_template("B站专用", "B：{source}", platform="bilibili")
+    save_custom_template("抖音专用", "抖音：{custom_text}", platform="douyin")
+    assert "B站专用" in get_all_templates("bilibili")
+    assert "B站专用" not in get_all_templates("douyin")
+    assert "抖音专用" in get_all_templates("douyin")
+    assert "抖音专用" not in get_all_templates("bilibili")
+    assert "原视频链接" in get_all_templates("bilibili")["授权本地化"]
+    assert "原视频链接" not in get_all_templates("douyin")["中文字幕版"]
+
+
 def test_custom_template_rejects_unknown_variables() -> None:
     with pytest.raises(ValueError, match="模板变量不支持"):
         validate_template("{source} {secret}")
@@ -101,6 +129,18 @@ def test_custom_templates_follow_current_user_data_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("YBLOCALIZER_DATA_DIR", str(tmp_path / "user-data"))
-    save_custom_template("测试模板", "来源：{source}")
+    save_custom_template("测试模板", "来源：{source}", platform="bilibili")
     assert (tmp_path / "user-data" / "custom_templates.json").exists()
-    assert get_all_templates()["测试模板"] == "来源：{source}"
+    assert get_all_templates("bilibili")["测试模板"] == "来源：{source}"
+    assert "测试模板" not in get_all_templates("douyin")
+
+
+def test_legacy_flat_custom_templates_migrate_to_bilibili(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("YBLOCALIZER_DATA_DIR", str(tmp_path / "user-data"))
+    path = tmp_path / "user-data" / "custom_templates.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"旧模板": "链接：{source}"}', encoding="utf-8")
+    assert get_all_templates("bilibili")["旧模板"] == "链接：{source}"
+    assert "旧模板" not in get_all_templates("douyin")

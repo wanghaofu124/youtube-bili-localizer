@@ -6,8 +6,8 @@ import sys
 
 
 def main() -> int:
-    request = json.load(sys.stdin)
     try:
+        request = json.load(sys.stdin)
         import httpx
         from openai import OpenAI
 
@@ -23,10 +23,12 @@ def main() -> int:
         )
         response = client.chat.completions.create(**request["kwargs"])
         content = response.choices[0].message.content or ""
-        json.dump({"status": "completed", "content": content}, sys.stdout, ensure_ascii=False)
+        # Keep the subprocess protocol ASCII even when Windows chooses a local
+        # code page for this console-less worker's stdout.
+        json.dump({"status": "completed", "content": content}, sys.stdout, ensure_ascii=True)
         return 0
     except Exception as exc:
-        json.dump({"status": "failed", "error": str(exc)}, sys.stdout, ensure_ascii=False)
+        json.dump({"status": "failed", "error": str(exc)}, sys.stdout, ensure_ascii=True)
         return 1
 
 

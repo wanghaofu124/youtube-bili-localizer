@@ -47,6 +47,23 @@ class DownloadResolutionMismatch(RuntimeError):
         )
 
 
+def _extended_io_path(path: Path) -> Path:
+    """Use Win32 extended-length syntax only for filesystem I/O.
+
+    Containment and symlink checks intentionally continue to use ordinary
+    resolved paths; this conversion is only for the actual open/stat/rename
+    operations in the resume-protection area.
+    """
+    if os.name != "nt":
+        return path
+    raw = str(path.resolve())
+    if raw.startswith("\\\\?\\"):
+        return Path(raw)
+    if raw.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + raw.lstrip("\\"))
+    return Path("\\\\?\\" + raw)
+
+
 class DownloadProposalMismatch(RuntimeError):
     code = "download_proposal_mismatch"
 
@@ -67,7 +84,7 @@ def _sha256_prefix(path: Path, length: int) -> str | None:
     digest = hashlib.sha256()
     remaining = length
     try:
-        with path.open("rb") as handle:
+        with _extended_io_path(path).open("rb") as handle:
             while remaining:
                 block = handle.read(min(1024 * 1024, remaining))
                 if not block:
@@ -108,39 +125,47 @@ def _snapshot_existing_partials(work_dir: Path, log: Callable[[str], None] | Non
         protection_root.is_symlink() or protection_root.resolve().parent != work_dir.resolve()
     ):
         raise RuntimeError("续传保护目录路径不安全；原未完成文件未改动，本次下载未开始。")
-    protection_root.mkdir(exist_ok=True)
+    _extended_io_path(protection_root).mkdir(exist_ok=True)
     snapshot_dir = protection_root / uuid.uuid4().hex
-    snapshot_dir.mkdir()
+    _extended_io_path(snapshot_dir).mkdir()
     snapshots: list[_PartialSnapshot] = []
     try:
         for path, before in partials:
             backup = snapshot_dir / path.name
             digest = hashlib.sha256()
             copied = 0
-            with path.open("rb") as source, backup.open("xb") as target:
-                while True:
-                    block = source.read(1024 * 1024)
-                    if not block:
-                        break
-                    target.write(block)
-                    digest.update(block)
-                    copied += len(block)
-                target.flush()
-                os.fsync(target.fileno())
-            shutil.copystat(path, backup)
-            after = path.stat()
+            try:
+                with _extended_io_path(path).open("rb") as source, _extended_io_path(backup).open("xb") as target:
+                    while True:
+                        block = source.read(1024 * 1024)
+                        if not block:
+                            break
+                        target.write(block)
+                        digest.update(block)
+                        copied += len(block)
+                    target.flush()
+                    os.fsync(target.fileno())
+            except FileNotFoundError as exc:
+                if os.name == "nt" and len(str(_extended_io_path(backup))) >= 260:
+                    raise RuntimeError(
+                        "续传保护副本创建失败：保护路径超过 Windows 文件路径限制；"
+                        "原未完成文件未改动，请缩短任务输出目录后重试。"
+                    ) from exc
+                raise RuntimeError("续传保护副本创建失败，原未完成文件未改动。") from exc
+            shutil.copystat(_extended_io_path(path), _extended_io_path(backup))
+            after = _extended_io_path(path).stat()
             if (
                 copied != before.st_size
                 or after.st_size != before.st_size
                 or after.st_mtime_ns != before.st_mtime_ns
-                or backup.stat().st_size != before.st_size
+                or _extended_io_path(backup).stat().st_size != before.st_size
             ):
                 raise RuntimeError(f"未完成下载在保护期间发生变化：{path.name}；原文件保持不动。")
             snapshots.append(_PartialSnapshot(path, backup, before.st_size, digest.hexdigest(), snapshot_dir))
     except BaseException:
-        shutil.rmtree(snapshot_dir, ignore_errors=True)
+        shutil.rmtree(_extended_io_path(snapshot_dir), ignore_errors=True)
         try:
-            protection_root.rmdir()
+            _extended_io_path(protection_root).rmdir()
         except OSError:
             pass
         raise
@@ -152,11 +177,11 @@ def _snapshot_existing_partials(work_dir: Path, log: Callable[[str], None] | Non
 
 def _clean_empty_snapshot_dirs(snapshot_dir: Path) -> None:
     try:
-        snapshot_dir.rmdir()
+        _extended_io_path(snapshot_dir).rmdir()
     except OSError:
         return
     try:
-        snapshot_dir.parent.rmdir()
+        _extended_io_path(snapshot_dir.parent).rmdir()
     except OSError:
         pass
 
@@ -167,7 +192,7 @@ def _restore_changed_partials(snapshots: list[_PartialSnapshot], log: Callable[[
         current_matches = False
         try:
             if snapshot.path.is_file() and not snapshot.path.is_symlink():
-                current_size = snapshot.path.stat().st_size
+                current_size = _extended_io_path(snapshot.path).stat().st_size
                 current_matches = (
                     current_size >= snapshot.size
                     and _sha256_prefix(snapshot.path, snapshot.size) == snapshot.sha256
@@ -177,7 +202,7 @@ def _restore_changed_partials(snapshots: list[_PartialSnapshot], log: Callable[[
 
         if current_matches:
             try:
-                snapshot.backup.unlink(missing_ok=True)
+                _extended_io_path(snapshot.backup).unlink(missing_ok=True)
             except OSError:
                 if log:
                     log("续传校验通过，但无法清理临时保护副本；保护副本仍保留在续传保护目录。")
@@ -191,10 +216,10 @@ def _restore_changed_partials(snapshots: list[_PartialSnapshot], log: Callable[[
         try:
             if restarted_candidate_exists:
                 rejected_dir = snapshot.directory / "restarted"
-                rejected_dir.mkdir(exist_ok=True)
+                _extended_io_path(rejected_dir).mkdir(exist_ok=True)
                 rejected = rejected_dir / f"{snapshot.path.name}.{uuid.uuid4().hex[:8]}.restarted"
-                snapshot.path.replace(rejected)
-            snapshot.backup.replace(snapshot.path)
+                _extended_io_path(snapshot.path).replace(_extended_io_path(rejected))
+            _extended_io_path(snapshot.backup).replace(_extended_io_path(snapshot.path))
         except OSError as exc:
             if log:
                 log(
@@ -214,7 +239,7 @@ def _restore_changed_partials(snapshots: list[_PartialSnapshot], log: Callable[[
 
 def _discard_partial_snapshots(snapshots: list[_PartialSnapshot]) -> None:
     for directory in {snapshot.directory for snapshot in snapshots}:
-        shutil.rmtree(directory, ignore_errors=True)
+        shutil.rmtree(_extended_io_path(directory), ignore_errors=True)
         _clean_empty_snapshot_dirs(directory)
 
 

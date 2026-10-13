@@ -35,6 +35,7 @@ def resegment_source_segments(
     cancel_check: Callable[[], None] | None = None,
     progress: Callable[[float], None] | None = None,
     log: Callable[[str], None] | None = None,
+    deepseek_thinking: str = "disabled",
 ) -> list[Segment]:
     """Regroup cues by asking the model which adjacent boundaries to join.
 
@@ -74,6 +75,8 @@ def resegment_source_segments(
             core_end = min(edge_count, core_start + core_batch)
             missing = [edge for edge in range(core_start, core_end) if edge not in decisions]
             if not missing:
+                from .llm_usage import note_cache_reuse
+                note_cache_reuse(client, "segmentation", core_end - core_start)
                 if progress:
                     progress(core_end / edge_count)
                 continue
@@ -84,6 +87,8 @@ def resegment_source_segments(
                 model=resolved_model,
                 payload=payload,
                 owned_left_ids=[edge + 1 for edge in owned],
+                provider=provider_key,
+                deepseek_thinking=deepseek_thinking,
             )
             allowed = {edge + 1 for edge in owned}
             for left_id in allowed:
@@ -219,11 +224,13 @@ def _build_request_payload(segments: list[Segment], owned_edges: list[int]) -> d
     }
 
 
-def _request_join_after(client, *, model: str, payload: dict[str, Any], owned_left_ids: list[int]) -> set[int]:
+def _request_join_after(client, *, model: str, payload: dict[str, Any], owned_left_ids: list[int], provider: str = "openai", deepseek_thinking: str = "disabled") -> set[int]:
+    from .translate import _completion_create, _deepseek_request_options
     owned = set(owned_left_ids)
-    response = client.chat.completions.create(
+    response = _completion_create(client, checkpoint_path=None, kind="segmentation", provider=provider,
         model=model,
         temperature=0.0,
+        **_deepseek_request_options(provider, deepseek_thinking, model),
         messages=[
             {
                 "role": "system",

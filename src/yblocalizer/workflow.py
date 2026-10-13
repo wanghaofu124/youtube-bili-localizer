@@ -15,6 +15,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from . import dependencies
+from .asr_review import prepare_session, resolve_review_language, session_path
 from .download import download_with_ytdlp, import_local_video
 from .media import extract_audio
 from .models import Segment, VideoJob, load_segments, save_segments
@@ -57,7 +58,7 @@ STAGE_LABELS = {
 STAGE_PROGRESS = {"acquire": 8, "extract": 28, "translate": 62, "render": 84, "publish": 96}
 CONFIG_INVALIDATION: tuple[tuple[frozenset[str], str], ...] = (
     (frozenset({"source", "source_kind", "output_dir", "cookies_from_browser", "cookies_file", "youtube_po_token_mode", "youtube_proxy", "download_quality", "max_seconds", "require_reuse_allowed", "prefer_platform_subtitles"}), "acquire"),
-    (frozenset({"subtitle_source", "ocr_fallback_to_audio", "whisper_model_size", "source_language", "beam_size", "device", "compute_type", "ocr_interval", "ocr_crop_ratio", "ocr_min_chars", "ocr_language"}), "extract"),
+    (frozenset({"subtitle_source", "ocr_fallback_to_audio", "whisper_model_size", "source_language", "beam_size", "device", "compute_type", "ocr_interval", "ocr_crop_ratio", "ocr_min_chars", "ocr_language", "audio_channel"}), "extract"),
     (frozenset({"translator", "target_lang", "translate_model", "batch_size", "smart_translation", "smart_subtitle_layout"}), "translate"),
     (frozenset({"font_name", "font_size", "subtitle_display_mode", "subtitle_color", "subtitle_outline_color", "subtitle_outline", "subtitle_shadow", "subtitle_margin_ratio", "render_crf", "render_encoder"}), "render"),
     (frozenset({"title", "description", "tags", "publish_to_bilibili", "include_source_link", "bilibili_browser", "close_after_fill"}), "publish"),
@@ -69,12 +70,19 @@ class WorkflowArtifacts:
     original_video: str | None = None
     raw_video: str | None = None
     audio: str | None = None
+    asr_evidence: str | None = None
+    asr_review: str | None = None
+    subtitle_commit: str | None = None
+    asr_timeline_shift_seconds: float = 0.0
     platform_subtitles: str | None = None
     source_segments: str | None = None
     source_srt: str | None = None
     translated_segments: str | None = None
     translated_srt: str | None = None
     publish_metadata: str | None = None
+    llm_usage_path: str | None = None
+    llm_usage_index_path: str | None = None
+    llm_usage_total: dict[str, Any] | None = None
     rendered_video: str | None = None
     title: str | None = None
     description: str = ""
@@ -108,7 +116,7 @@ class WorkflowArtifacts:
 
     def public_summary(self) -> dict[str, dict[str, Any]]:
         output: dict[str, dict[str, Any]] = {}
-        for name in ("original_video", "raw_video", "audio", "platform_subtitles", "source_segments", "source_srt", "translated_segments", "translated_srt", "publish_metadata", "rendered_video", "thumbnail_path"):
+        for name in ("original_video", "raw_video", "audio", "asr_evidence", "asr_review", "subtitle_commit", "platform_subtitles", "source_segments", "source_srt", "translated_segments", "translated_srt", "publish_metadata", "rendered_video", "thumbnail_path"):
             path = self.path(name)
             output[name] = {
                 "available": bool(path and path.is_file()),
@@ -542,6 +550,11 @@ def _shift_segments(segments: list[Any], offset: float) -> None:
 
 
 def run_extract(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx: PipelineContext, log: Callable[[str], None], progress: Callable[[float], None] | None = None) -> WorkflowArtifacts:
+    # Extraction can be retried with a different subtitle source; never carry
+    # language evidence from the previous attempt into the new translation.
+    artifacts.asr_evidence = None
+    artifacts.asr_review = None
+    artifacts.asr_timeline_shift_seconds = 0.0
     raw_video = artifacts.path("raw_video")
     if not raw_video or not validate_media(raw_video, "video"):
         raise RuntimeError("原视频检查点无效，请先重新获取素材。")
@@ -569,7 +582,10 @@ def run_extract(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx:
         # Always refresh. Cached WAV may predate timestamp-preserving extract_audio
         # fixes, or belong to a previous raw_video after acquire.
         _emit(ctx, PipelineStage.AUDIO, 16, "正在提取音频", log)
-        audio = _extract_audio(raw_video, work_dir / "audio.wav", ctx)
+        audio = extract_audio(
+            raw_video, work_dir / "audio.wav", cancel_check=ctx.is_cancelled,
+            channel=getattr(options, "audio_channel", "mix"),
+        )
         artifacts.audio = str(audio)
         return audio
 
@@ -580,13 +596,27 @@ def run_extract(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx:
             write_srt(target_srt, copied, display_mode="source")
             return copied
         source_audio = ensure_audio()
-        return transcribe_audio(
+        evidence_path = target_json.with_name(target_json.stem + ".asr-evidence.json")
+        result = transcribe_audio(
             source_audio, segments_json=target_json, srt_path=target_srt,
             model_size=options.whisper_model_size, language=options.source_language,
             device=options.device, compute_type=options.compute_type, initial_prompt=None,
             beam_size=options.beam_size, log=log, cancel_check=ctx.check_cancelled,
             resource_profile=options.resource_profile,
+            evidence_path=evidence_path,
         )
+        artifacts.asr_evidence = str(evidence_path)
+        try:
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            detected = str(evidence.get("detected_language") or "").strip()
+            probability = float(evidence.get("language_probability"))
+        except (OSError, ValueError, TypeError):
+            detected, probability = "", 0.0
+        if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+            probability = 0.0
+        if detected:
+            log(f"Whisper 检测语言：{detected}（置信度 {probability:.2f}）。")
+        return result
 
     def ocr(target_json: Path, target_srt: Path) -> list[Any]:
         return extract_ocr_subtitles(
@@ -614,6 +644,7 @@ def run_extract(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx:
         offset = _estimate_audio_offset(audio_items, ocr_items)
         if offset is not None and 0.12 <= abs(offset) <= 3.0:
             _shift_segments(audio_items, offset); log(f"Audio timeline corrected by {offset:+.2f}s using OCR anchors.")
+            artifacts.asr_timeline_shift_seconds = offset
         items = merge_audio_ocr_segments(audio_items, ocr_items)
         if platform_items:
             artifacts.subtitle_extraction_mode = "platform+ocr" if used_ocr else "platform"
@@ -642,6 +673,7 @@ def run_extract(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx:
         artifacts.subtitle_extraction_mode = "platform" if platform_items else "audio"
         artifacts.ocr_status, artifacts.ocr_message = "not-requested", None
         if not items and (mode == "auto" or options.ocr_fallback_to_audio):
+            artifacts.asr_evidence = None
             try:
                 items = ocr(source_segments, source_srt); used_ocr = True
             except CancellationRequested:
@@ -681,6 +713,28 @@ def run_extract(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx:
         )
     artifacts.source_segments, artifacts.source_srt = str(source_segments), str(source_srt)
     artifacts.used_ocr_subtitles = used_ocr
+    # Prepare a durable review queue without loading a model or running VAD.
+    # The queue is advisory until the user explicitly starts a review round.
+    if audio and audio.is_file() and mode in {"audio", "auto", "merged"}:
+        baseline_words = words_path_for_segments(source_segments)
+        review = prepare_session(
+            work_dir=work_dir.parent, job_id=work_dir.parent.name, audio_path=audio,
+            baseline_words_path=baseline_words if baseline_words.is_file() else source_segments,
+            baseline_kind="canonical" if baseline_words.is_file() else "legacy_partial",
+            model=str(options.whisper_model_size),
+            language=resolve_review_language(
+                options.source_language,
+                Path(artifacts.asr_evidence) if artifacts.asr_evidence else None,
+                allow_detected=mode in {"audio", "audio-fallback", "merged"},
+            ),
+            beam_size=int(options.beam_size), channel=getattr(options, "audio_channel", "mix"),
+            subtitle_revision=int(artifacts.revision),
+            subtitle_fingerprint=hashlib.sha256(source_segments.read_bytes()).hexdigest(),
+            timeline_shift_seconds=float(artifacts.asr_timeline_shift_seconds or 0.0),
+            source_video_path=raw_video,
+        )
+        artifacts.asr_review = str(session_path(work_dir.parent))
+        log(f"语音复核队列已保存：{len(review.get('candidates', []))} 个待复核区间；未自动启动模型。")
     return artifacts
 
 
@@ -690,6 +744,33 @@ def run_translate(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ct
         raise RuntimeError("源字幕检查点无效，请先重新提取字幕。")
     work_dir = _attempt_dir(work_dir, "translate")
     extracted_items = load_segments(source_segments)
+    configured_source_language = str(options.source_language or "").strip() or None
+    effective_source_language = resolve_review_language(
+        configured_source_language,
+        Path(artifacts.asr_evidence) if artifacts.asr_evidence else None,
+        allow_detected=artifacts.subtitle_extraction_mode in {"audio", "audio-fallback"},
+    )
+    if effective_source_language is None and configured_source_language and configured_source_language.lower() != "auto":
+        effective_source_language = configured_source_language
+    if effective_source_language is None and artifacts.asr_evidence and artifacts.subtitle_extraction_mode in {"audio", "audio-fallback"}:
+        try:
+            evidence = json.loads(Path(artifacts.asr_evidence).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            evidence = {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+        detected = str(evidence.get("detected_language") or "").strip()
+        try:
+            probability = float(evidence.get("language_probability"))
+        except (TypeError, ValueError):
+            probability = 0.0
+        if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+            probability = 0.0
+        if detected and probability >= 0.80:
+            effective_source_language = detected
+            log(f"ASR 检测语言：{detected}（置信度 {probability:.2f}）；翻译将使用该语言。")
+        elif detected:
+            log(f"ASR 检测语言 {detected} 的置信度为 {probability:.2f}，低于 0.80；翻译保持自动识别。")
     translation_source = work_dir / "segments.translation-source.json"
     translation_source_srt = work_dir / "translation-source.srt"
 
@@ -741,6 +822,7 @@ def run_translate(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ct
                     strict_alignment=True,
                     checkpoint_path=_seed_attempt_checkpoint(work_dir, "source_correction_checkpoint.json"),
                     log=log,
+                    deepseek_thinking=getattr(options, "deepseek_thinking", "disabled"),
                 )
             except CancellationRequested:
                 raise
@@ -788,6 +870,7 @@ def run_translate(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ct
             cancel_check=ctx.check_cancelled,
             progress=prepare_progress,
             log=log,
+            deepseek_thinking=getattr(options, "deepseek_thinking", "disabled"),
         )
     else:
         source_items = coalesce_incomplete_source_cues(extracted_items)
@@ -796,6 +879,39 @@ def run_translate(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ct
         if specialized_translation_only:
             log("TranslateGemma 专用于翻译；本次跳过通用模型语义切句与源文校对，保留规则切句结果。")
 
+    if artifacts.asr_evidence:
+        try:
+            evidence = json.loads(Path(artifacts.asr_evidence).read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            evidence = {}
+        suspect_intervals = evidence.get("suspect_intervals") if isinstance(evidence, dict) else []
+        if isinstance(suspect_intervals, list):
+            valid_intervals: list[tuple[float, float]] = []
+            try:
+                clock_offset = float(artifacts.asr_timeline_shift_seconds or 0.0)
+            except (TypeError, ValueError):
+                clock_offset = 0.0
+            if not math.isfinite(clock_offset):
+                clock_offset = 0.0
+            for interval in suspect_intervals:
+                if not isinstance(interval, dict):
+                    continue
+                try:
+                    start, end = float(interval.get("start")), float(interval.get("end"))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(start) and math.isfinite(end) and end > start:
+                    valid_intervals.append((start - clock_offset, end - clock_offset))
+            for unit in source_items:
+                flagged = any(
+                    start < unit.end and end > unit.start
+                    for start, end in valid_intervals
+                )
+                if flagged:
+                    unit.needs_review = True
+            flagged_count = sum(1 for unit in source_items if unit.needs_review)
+            if flagged_count:
+                log(f"ASR 低置信度区间与 {flagged_count} 个翻译单元重叠，已标记待复核。")
     save_segments(translation_source, source_items)
     write_srt(translation_source_srt, source_items, display_mode="source")
     content_warning = instruction_like_content_warning(source_items)
@@ -834,6 +950,7 @@ def run_translate(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ct
                 strict_alignment=strict_speech_alignment,
                 checkpoint_path=_seed_attempt_checkpoint(work_dir, "source_correction_checkpoint.json"),
                 log=log,
+                deepseek_thinking=getattr(options, "deepseek_thinking", "disabled"),
             )
             if corrected:
                 source_items = corrected
@@ -870,7 +987,8 @@ def run_translate(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ct
         source_timing_slots=extracted_items if not strict_speech_alignment else None,
         strict_alignment=strict_speech_alignment,
         log=log,
-        source_lang=options.source_language,
+        source_lang=effective_source_language,
+        deepseek_thinking=getattr(options, "deepseek_thinking", "disabled"),
     )
     dense_count = subtitle_density_overflow_count(translated_items)
     if dense_count:
@@ -898,6 +1016,7 @@ def run_translate(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ct
             source_segments=source_items, translated_segments=translated_items,
             provider=metadata_provider, target_lang=options.target_lang, model=options.translate_model,
             cancel_check=ctx.check_cancelled,
+            deepseek_thinking=getattr(options, "deepseek_thinking", "disabled"),
         )
         ctx.check_cancelled()
     except CancellationRequested:
@@ -1092,6 +1211,7 @@ def run_render(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx: 
                             checkpoint_path=work_dir / "subtitle-layout-repair.json",
                             cancel_check=ctx.check_cancelled,
                             log=log,
+                            deepseek_thinking=getattr(options, "deepseek_thinking", "disabled"),
                         )
                     except CancellationRequested:
                         raise

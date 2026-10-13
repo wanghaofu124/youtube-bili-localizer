@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.2.7",
+    [string]$Version = "0.2.55",
     [string]$SigningThumbprint = "",
     [switch]$RequireSignature
 )
