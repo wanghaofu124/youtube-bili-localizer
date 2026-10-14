@@ -3,7 +3,7 @@
 ## 隐私与 Code signing policy
 
 - [隐私政策](docs/privacy-policy.md)：说明本机保存、用户主动选择的来源平台和在线 AI 服务请求。
-- [Code signing policy](docs/signing/code-signing-policy-draft.md)：申请准备中，尚未批准、赞助或提供签名。
+- [Code signing policy](docs/signing/code-signing-policy-draft.md)：SignPath 申请已于 2026-10-14 提交，正在等待资格评估；尚无赞助、证书或签名批准。
 
 面向**已获授权视频**的 Python 本地化工具：将本地文件或授权 URL 转为中文字幕硬字幕视频，并在人工确认前辅助填写 B 站投稿信息。
 

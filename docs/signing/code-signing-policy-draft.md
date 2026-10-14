@@ -1,6 +1,6 @@
 # Code signing policy (proposal)
 
-**Status:** preparing application; not approved, sponsored, or currently providing signing.
+**Status:** application submitted 2026-10-14; eligibility assessment pending. No sponsorship, certificate, or signature approval exists.
 
 **Public privacy policy:** [privacy-policy.md](../privacy-policy.md)
 
