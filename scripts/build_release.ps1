@@ -107,6 +107,8 @@ $Arguments += @(
     "--add-data", "$ProjectRoot\frontend\dist;frontend\dist",
     "--add-data", "$ProjectRoot\demo\authorized-demo-10s.mp4;demo",
     "--add-data", "$ProjectRoot\demo\artifacts;demo\artifacts",
+    "--add-data", "$ProjectRoot\LICENSE;.",
+    "--add-data", "$ProjectRoot\PORTABLE-README.txt;.",
     "--distpath", $DistRoot,
     "--workpath", (Join-Path $BuildRoot "pyinstaller"),
     "--specpath", $BuildRoot,

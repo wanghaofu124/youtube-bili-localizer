@@ -96,7 +96,7 @@ from .publish_text import (
     normalize_publish_platform,
     save_custom_template,
 )
-from .translate import compact_overflowing_subtitles, generate_publish_metadata, save_publish_metadata, translate_single_cue
+from .translate import ai_provider_request_info, compact_overflowing_subtitles, generate_publish_metadata, save_publish_metadata, translate_single_cue
 from .render import burn_subtitles, subtitle_line_capacity
 from .subtitle import translated_layout_issues
 from .subtitle_sentence_plan import (
@@ -131,6 +131,8 @@ from .workflow import (
 from .asr_review import _atomic_json, _file_fingerprint, _path_signature, next_round, prepare_session, read_session, reset_interrupted_round, resolve_review_language, session_path, start_round, subtitle_commit_path, update_session
 
 LOGGER = logging.getLogger("yblocalizer.workbench")
+TUTORIAL_VERSION = 1
+TUTORIAL_PREFERENCES_MAX_BYTES = 4096
 JOB_ID_PATTERN = r"(?=[^/]{1,128}(?:/|$))[\w-]+(?:\.[\w-]+)*"
 
 
@@ -393,6 +395,53 @@ def _upsert_env(path: Path, updates: dict[str, str]) -> None:
     remaining = [line for line in normalized if line.partition("=")[0].strip() not in updates]
     remaining.extend(f"{key}={value}" for key, value in updates.items())
     path.write_text("\n".join(remaining).rstrip() + "\n", encoding="utf-8")
+
+
+_tutorial_preferences_lock = threading.Lock()
+
+
+def _tutorial_preferences_path() -> Path:
+    # Resolve at request time so isolated preview/test data roots are honored.
+    return USER_DATA_ROOT / "tutorial-preferences.json"
+
+
+def _read_tutorial_preferences() -> dict[str, int]:
+    path = _tutorial_preferences_path()
+    try:
+        if not path.is_file() or path.stat().st_size > TUTORIAL_PREFERENCES_MAX_BYTES:
+            if path.is_file():
+                LOGGER.warning("Ignoring missing or oversized tutorial preferences file.")
+            return {"dismissedVersion": 0}
+        value = json.loads(path.read_text(encoding="utf-8"))
+        version = value.get("dismissedVersion") if isinstance(value, dict) else None
+        if type(version) is not int or version < 0:
+            LOGGER.warning("Ignoring invalid tutorial preferences file.")
+            return {"dismissedVersion": 0}
+        return {"dismissedVersion": version}
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        LOGGER.warning("Ignoring unreadable tutorial preferences file.")
+        return {"dismissedVersion": 0}
+
+
+def _write_tutorial_preferences(payload: dict[str, Any]) -> None:
+    if set(payload) != {"dismissedVersion"}:
+        raise InputValidationError("教程偏好字段无效。", code="invalid_payload")
+    version = payload.get("dismissedVersion")
+    if type(version) is not int or version != TUTORIAL_VERSION:
+        raise InputValidationError("教程偏好版本无效。", code="invalid_value", field="dismissedVersion")
+    path = _tutorial_preferences_path()
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:10]}.tmp")
+    with _tutorial_preferences_lock:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps({"dismissedVersion": version}, ensure_ascii=False), encoding="utf-8")
+            os.replace(temporary, path)
+        except OSError:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
 
 def _normalize_cut_ranges(value: Any, duration: float) -> list[tuple[float, float]]:
@@ -3846,7 +3895,79 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
     jobs: WorkbenchJobs
     dependencies: DependencyManager
     csrf_token: str
+    _external_consent_lock = threading.Lock()
+    _external_consents: dict[str, tuple[float, tuple[str, ...]]] = {}
+    _external_consent_limit = 512
     server_version = "YBLocalizerWorkbench/2.0"
+
+    @staticmethod
+    def _consent_text(value: Any, limit: int = 120) -> str:
+        text = re.sub(r"[^\w .:/@+_-]", "", str(value or "").strip())
+        return text[:limit]
+
+    def _external_ai_binding(self, path: str, payload: dict[str, Any]) -> tuple[tuple[str, ...], dict[str, str]] | None:
+        """Return a stable consent binding for routes that can call online AI."""
+        job_id = None
+        match = re.match(r"/api/jobs/([^/]+)", path)
+        if match:
+            job_id = match.group(1)
+        elif path == "/api/publish/copy":
+            job_id = str(payload.get("job_id") or "") or None
+        job = self.jobs.get(job_id) if job_id else None
+        options = payload.get("options") if path == "/api/jobs" else (job.options if job else None)
+        options = options if isinstance(options, dict) else {}
+        translator = str(options.get("translator") or ("deepseek" if path == "/api/jobs" else "")).lower()
+        if translator not in {"deepseek", "openai", "ollama"}:
+            return None
+        guarded = re.search(r"/(run-all|resume|retranslate|compact|stages/(translate|render)/run|voice-review/candidates/[^/]+/translate)$", path) or (path == "/api/publish/copy" and payload.get("generate") is True)
+        if guarded:
+            provider, resolved_model_raw, origin, local = ai_provider_request_info(translator, options.get("translate_model"))
+            if local:
+                return None
+            model = self._consent_text(resolved_model_raw)
+            operation = "在线 AI 翻译"
+            if "/retranslate" in path: operation = "在线 AI 单条重译"
+            elif "/compact" in path: operation = "在线 AI 压缩候选"
+            elif "voice-review" in path: operation = "在线 AI 语音复核候选"
+            elif path == "/api/publish/copy": operation = "在线 AI 生成投稿文案"
+            elif path == "/api/jobs": operation = "在线 AI 主任务翻译"
+            data_kinds = "OCR/转写字幕、字幕原文、任务标题/简介、相邻上下文"
+            if path == "/api/publish/copy": data_kinds = "字幕文本、来源标题和简介、投稿文案上下文"
+            elif "voice-review" in path: data_kinds = "语音复核候选文本、相邻字幕上下文"
+            material = str(payload.get("material_id") or payload.get("source_url") or job_id or "")
+            revision = str(job.artifacts.revision if job else "")
+            body_for_binding = {key: value for key, value in payload.items() if key != "external_ai_consent"}
+            request_hash = hashlib.sha256(json.dumps(body_for_binding, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+            binding = (self.command, path, provider, origin, resolved_model_raw[:256], data_kinds, material[:128], revision[:128], request_hash)
+            return binding, {"provider": provider, "endpoint_origin": origin, "model": model, "data_kinds": data_kinds, "operation": operation, "fee_notice": "可能产生服务商 API 费用，请核对服务商账单。"}
+        return None
+
+    def _require_external_ai_consent(self, path: str, payload: dict[str, Any]) -> bool:
+        result = self._external_ai_binding(path, payload)
+        if result is None:
+            return True
+        binding, disclosure = result
+        supplied = payload.get("external_ai_consent")
+        now = time.monotonic()
+        with self._external_consent_lock:
+            for key, (expires, _) in list(self._external_consents.items()):
+                if expires <= now:
+                    self._external_consents.pop(key, None)
+            if isinstance(supplied, dict) and supplied.get("approved") is True:
+                token = str(supplied.get("consent_id") or "")
+                stored = self._external_consents.get(token)
+                if stored and stored[0] > now and hmac.compare_digest("|".join(stored[1]).encode("utf-8"), "|".join(binding).encode("utf-8")):
+                    self._external_consents.pop(token, None)
+                    payload.pop("external_ai_consent", None)
+                    return True
+        consent_id = secrets.token_urlsafe(24)
+        with self._external_consent_lock:
+            while len(self._external_consents) >= self._external_consent_limit:
+                oldest = min(self._external_consents, key=lambda key: self._external_consents[key][0])
+                self._external_consents.pop(oldest, None)
+            self._external_consents[consent_id] = (now + 600, binding)
+        self._json({"code": "external_ai_consent_required", "consent_id": consent_id, "disclosure": disclosure}, HTTPStatus.CONFLICT)
+        return False
 
     def do_OPTIONS(self) -> None:  # noqa: N802
         origin = self.headers.get("Origin", "")
@@ -3899,6 +4020,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "youtube_proxy_configured": bool(os.getenv("YBLOCALIZER_YOUTUBE_PROXY")),
                 "youtube_po_token": po_token_provider_status(),
             }); return
+        if path == "/api/tutorial-preferences":
+            self._json(_read_tutorial_preferences()); return
         if path == "/api/diagnostics":
             self._json(self._diagnostics()); return
         if path == "/api/dependencies":
@@ -4042,6 +4165,16 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             payload = self._payload()
         except PayloadReadError as exc:
             self._json(exc.payload(), exc.status); return
+        if path == "/api/tutorial-preferences":
+            try:
+                _write_tutorial_preferences(payload)
+            except InputValidationError as exc:
+                self._json(exc.payload(), HTTPStatus.BAD_REQUEST); return
+            except OSError:
+                self._json({"error": "教程偏好无法保存。", "code": "preference_write_failed"}, HTTPStatus.INTERNAL_SERVER_ERROR); return
+            self._json({"saved": True, "dismissedVersion": TUTORIAL_VERSION}); return
+        if not self._require_external_ai_consent(path, payload):
+            return
         if path == "/api/dependencies/ollama/start":
             try:
                 result = self.dependencies.start_ollama()

@@ -11,6 +11,7 @@ import sys
 import time
 from types import SimpleNamespace
 from typing import Any, Callable
+from urllib.parse import urlparse
 
 from .models import PublishMetadata, Segment, load_segments, save_segments
 from .dependencies import (
@@ -20,6 +21,41 @@ from .dependencies import (
     ollama_local_status,
     resolve_command,
 )
+
+
+def ai_provider_request_info(provider: str, model: str | None = None) -> tuple[str, str, str, bool]:
+    """Resolve the same provider/model/origin used by request constructors.
+
+    The boolean identifies loopback Ollama, which is treated as local by the UI.
+    This helper does not load keys or make a request.
+    """
+    name = str(provider or "").strip().lower()
+    if name == "deepseek":
+        selected = model or os.getenv("DEEPSEEK_TRANSLATE_MODEL", "deepseek-v4-flash")
+        endpoint = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    elif name == "openai":
+        selected = model or os.getenv("OPENAI_TRANSLATE_MODEL", "gpt-4.1-mini")
+        endpoint = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    elif name == "ollama":
+        selected = model or OLLAMA_MODEL_TAGS.get("qwen3.5:4b", "qwen3.5:4b")
+        endpoint = f"{OLLAMA_BASE_URL}/v1"
+    else:
+        return name, str(model or ""), "", False
+    parsed = urlparse(endpoint)
+    try:
+        valid_endpoint = parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+        port = parsed.port
+    except ValueError:
+        valid_endpoint, port = False, None
+    if valid_endpoint:
+        host = parsed.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        origin = f"{parsed.scheme}://{host}{f':{port}' if port else ''}"
+    else:
+        origin = "unknown://configured-endpoint"
+    local = name == "ollama" and (parsed.hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
+    return name, str(selected), origin, local
 from .runtime import CancellationRequested
 from .subtitle import write_srt
 from .subtitle_continuity import (

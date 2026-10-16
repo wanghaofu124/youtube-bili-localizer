@@ -2,8 +2,20 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { publishStageButton, sameTaskOption, stageAvailability, workflowPrimaryLabel } from "./workflowState";
 import { retainVisibleVideoLibrarySelection, selectableVideoLibraryIds, videoLibraryCategory, videoLibraryMatches, type VideoLibraryCategory } from "./videoLibrary";
 import { cueNeedsReview, replaceLiteral } from "./subtitleEditor";
+import { TutorialModal, type TutorialAction } from "./TutorialModal";
 
 type View = "material" | "library" | "process" | "subtitle" | "publish" | "files";
+const CURRENT_TUTORIAL_VERSION = 1;
+const TUTORIAL_STORAGE_KEY = "ybl-onboarding";
+const readTutorialDismissed = () => {
+  try {
+    const raw = localStorage.getItem(TUTORIAL_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) as { dismissedVersion?: unknown } : null;
+    return parsed?.dismissedVersion === CURRENT_TUTORIAL_VERSION;
+  } catch {
+    return false;
+  }
+};
 type WorkflowStageName = "acquire" | "extract" | "translate" | "render" | "publish";
 type RecoveryAction = {
   id: "retry_extract_with_lower_resource";
@@ -374,7 +386,7 @@ const defaults: Options = {
   subtitle_effect: "描边",
   output_dir: "outputs/workbench_demo",
 };
-type NavIconName = "material" | "library" | "process" | "subtitle" | "publish" | "files" | "save" | "link" | "rerender" | "download" | "voice" | "translate" | "render" | "upload" | "check" | "running" | "error" | "pause" | "ear" | "speed" | "text" | "video" | "subtitle-file" | "audio" | "cover" | "file";
+type NavIconName = "material" | "library" | "process" | "subtitle" | "publish" | "files" | "save" | "link" | "rerender" | "download" | "voice" | "translate" | "render" | "upload" | "check" | "running" | "error" | "pause" | "ear" | "speed" | "text" | "video" | "subtitle-file" | "audio" | "cover" | "file" | "book";
 const nav: Array<[View, string, string, NavIconName]> = [
   ["material", "素材", "链接、本地视频与授权", "material"],
   ["library", "任务库", "待处理、可继续与成片", "library"],
@@ -411,6 +423,7 @@ function NavIcon({ name, className = "nav-icon" }: { name: NavIconName; classNam
     audio: <><path d="M5 9v6M9 6v12M13 3v18M17 7v10M21 10v4" /></>,
     cover: <><rect x="3" y="4" width="18" height="16" rx="2" /><circle cx="8" cy="9" r="1" /><path d="m4 17 5-5 3 3 2-2 6 5" /></>,
     file: <><path d="M6 3h8l4 4v14H6z" /><path d="M14 3v5h5M9 13h6M9 17h6" /></>,
+    book: <><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v16H6.5A2.5 2.5 0 0 0 4 21z" /><path d="M4 5.5v15M8 7h8M8 11h8" /></>,
   };
   return <svg className={className} aria-hidden="true" focusable="false" viewBox="0 0 24 24">{paths[name]}</svg>;
 }
@@ -648,17 +661,49 @@ class ApiError extends Error {
   }
 }
 
+type ExternalAiDisclosure = {
+  provider: string;
+  endpoint_origin: string;
+  model: string;
+  data_kinds: string;
+  operation: string;
+  fee_notice: string;
+};
+
+function externalAiConfirmation(disclosure: ExternalAiDisclosure): boolean {
+  return window.confirm([
+    `即将进行${disclosure.operation}`,
+    `服务商：${disclosure.provider}`,
+    `端点：${disclosure.endpoint_origin}`,
+    `模型：${disclosure.model}`,
+    `发送内容：${disclosure.data_kinds}`,
+    disclosure.fee_notice,
+    "确认后仅允许当前请求发送；取消不会启动或修改任务。",
+  ].join("\n"));
+}
+
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const form = options?.body instanceof FormData;
   const method = (options?.method ?? "GET").toUpperCase();
   const mutation = !["GET", "HEAD", "OPTIONS"].includes(method);
-  const response = await fetch(path, {
+  const request = (body?: BodyInit | null): RequestInit => ({
     ...options,
+    ...(body === undefined ? {} : { body }),
     headers: form
       ? { ...(mutation && csrfToken ? { "X-YBL-CSRF": csrfToken } : {}), ...(options?.headers ?? {}) }
       : { "Content-Type": "application/json", ...(mutation && csrfToken ? { "X-YBL-CSRF": csrfToken } : {}), ...(options?.headers ?? {}) },
   });
-  const payload = (await response.json()) as T & { error?: string; field?: string; code?: string };
+  let response = await fetch(path, request());
+  let payload = (await response.json()) as T & { error?: string; field?: string; code?: string; consent_id?: string; disclosure?: ExternalAiDisclosure };
+  if (response.status === 409 && payload.code === "external_ai_consent_required" && payload.consent_id && payload.disclosure && !form && mutation) {
+    if (!externalAiConfirmation(payload.disclosure)) throw new ApiError("已取消在线 AI 请求。", undefined, "external_ai_consent_cancelled");
+    let original: unknown;
+    try { original = options?.body === undefined ? {} : JSON.parse(String(options.body)); } catch { original = null; }
+    if (!original || typeof original !== "object" || Array.isArray(original)) throw new ApiError("请求无法附加在线 AI 确认。", undefined, "external_ai_consent_invalid");
+    const retryBody = JSON.stringify({ ...(original as Record<string, unknown>), external_ai_consent: { consent_id: payload.consent_id, approved: true } });
+    response = await fetch(path, request(retryBody));
+    payload = (await response.json()) as T & { error?: string; field?: string; code?: string };
+  }
   if (!response.ok) throw new ApiError(payload.error ?? "本地服务请求失败", payload.field, payload.code);
   return payload;
 }
@@ -804,6 +849,12 @@ function App() {
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
+  const [tutorialOpen, setTutorialOpen] = useState(false);
+  const [preferencesLoading, setPreferencesLoading] = useState(true);
+  const [dismissedVersion, setDismissedVersion] = useState<number | null>(null);
+  const [sessionDismissed, setSessionDismissed] = useState(readTutorialDismissed);
+  const tutorialDismissed = sessionDismissed || dismissedVersion === CURRENT_TUTORIAL_VERSION;
+  const tutorialTriggerRef = useRef<HTMLButtonElement>(null);
   const [dependenciesOpen, setDependenciesOpen] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [savingSettings, setSavingSettings] = useState(false);
@@ -1370,6 +1421,16 @@ function App() {
       message: item.available ? "已检测到。" : item.required ? "必需组件未安装。" : "可选组件未安装；不影响默认音频模式。",
     })));
   };
+  const loadTutorialPreferences = async () => {
+    try {
+      const preferences = await api<{ dismissedVersion: number }>("/api/tutorial-preferences");
+      setDismissedVersion(preferences.dismissedVersion);
+    } catch {
+      setSessionDismissed(readTutorialDismissed());
+    } finally {
+      setPreferencesLoading(false);
+    }
+  };
   const previewAuthorizedDemo = async () => {
     try {
       const data = await api<{ cues: Cue[]; translation_ready: boolean }>("/api/demo/cues");
@@ -1738,6 +1799,37 @@ function App() {
     localStorage.setItem("ybl-mode", next);
     setMessage(next === "advanced" ? "已切换到高级模式，显示全部参数。" : "已切换到基础模式，仅显示常用参数。");
   };
+  const dismissTutorial = () => {
+    setSessionDismissed(true);
+    setDismissedVersion(CURRENT_TUTORIAL_VERSION);
+    try { localStorage.setItem(TUTORIAL_STORAGE_KEY, JSON.stringify({ dismissedVersion: CURRENT_TUTORIAL_VERSION })); } catch { /* Keep the dismissal for this session when storage is unavailable. */ }
+    if (!csrfToken) return;
+    void api<{ saved: boolean }>("/api/tutorial-preferences", {
+      method: "POST",
+      body: JSON.stringify({ dismissedVersion: CURRENT_TUTORIAL_VERSION }),
+    }).catch(() => setMessage("偏好未能保存，下次启动可能再次显示。"));
+  };
+  const closeTutorial = () => {
+    setTutorialOpen(false);
+    window.setTimeout(() => tutorialTriggerRef.current?.focus(), 0);
+  };
+  const openTutorial = () => {
+    if (settingsOpen || dependenciesOpen || shortcutHelpOpen || templateEditorOpen) return;
+    setTutorialOpen(true);
+  };
+  const handleTutorialAction = (action: TutorialAction) => {
+    if (action === "dependencies") {
+      setView("process");
+      window.setTimeout(() => setDependenciesOpen(true), 0);
+      return;
+    }
+    if (action === "settings") {
+      setView("process");
+      window.setTimeout(() => setSettingsOpen(true), 0);
+      return;
+    }
+    setView(action);
+  };
   const applyRecommended = () => {
     setDevice("cpu");
     setComputeType("int8");
@@ -1748,13 +1840,16 @@ function App() {
 
   useEffect(() => {
     loadBootstrap()
-      .then(() => Promise.all([
-        loadMaterials(),
-        loadTemplates(),
-        loadSettings(),
-        loadDependencies(),
-        loadRestorableJobs(),
-      ]))
+      .then(() => {
+        void loadTutorialPreferences();
+        return Promise.all([
+          loadMaterials(),
+          loadTemplates(),
+          loadSettings(),
+          loadDependencies(),
+          loadRestorableJobs(),
+        ]);
+      })
       .then(() => {
         setOnline(true);
         setMessage("本地服务已就绪。选择素材后即可开始处理。");
@@ -1885,6 +1980,7 @@ function App() {
   }, [job?.started_at, running]);
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (tutorialOpen) return;
       const target = event.target as HTMLElement | null;
       const typing = target?.matches("input, textarea, select");
       if (event.ctrlKey && event.key.toLowerCase() === "o") {
@@ -1902,7 +1998,7 @@ function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [running, sourceUrl, selected?.id, authorized, device, computeType, options, description, tags, publishInPipeline, includeSourceLink, fullVideo, durationValue, durationUnit]);
+  }, [running, tutorialOpen, sourceUrl, selected?.id, authorized, device, computeType, options, description, tags, publishInPipeline, includeSourceLink, fullVideo, durationValue, durationUnit]);
 
   const confirmDiscardSubtitles = (action: string) =>
     !dirty ||
@@ -2805,6 +2901,7 @@ function App() {
   };
   useEffect(() => {
     const onSubtitleKeyDown = (event: KeyboardEvent) => {
+      if (tutorialOpen) return;
       if (view !== "subtitle") return;
       const target = event.target as HTMLElement | null;
       const typing = Boolean(target?.isContentEditable || target?.closest("input, textarea, select, [contenteditable='true']"));
@@ -2837,7 +2934,7 @@ function App() {
     };
     window.addEventListener("keydown", onSubtitleKeyDown);
     return () => window.removeEventListener("keydown", onSubtitleKeyDown);
-  }, [view, running, selectedCue, activeCue, cues, visibleCueRows, save]);
+  }, [view, tutorialOpen, running, selectedCue, activeCue, cues, visibleCueRows, save]);
   const saveSettings = async () => {
     if (savingSettingsRef.current) return;
     savingSettingsRef.current = true;
@@ -3271,6 +3368,16 @@ function App() {
         <h1>添加素材</h1>
         <p>选择视频链接或本地文件；仅处理你已获授权的内容。</p>
       </header>
+      {!preferencesLoading && !tutorialDismissed && (
+        <div className="welcome-banner tutorial-welcome">
+          <div>
+            <b>第一次使用？先看新手教程</b>
+            <span>用几分钟了解素材、依赖、字幕校对、渲染和投稿辅助。教程不会启动任务或下载。</span>
+          </div>
+          <button className="primary small" onClick={() => { dismissTutorial(); openTutorial(); }}>开始教程</button>
+          <button className="secondary small" onClick={dismissTutorial}>以后再看</button>
+        </div>
+      )}
       {apiKeyConfigured === false && options.translator === "deepseek" && (
         <div className="welcome-banner">
           <div>
@@ -5549,6 +5656,9 @@ function App() {
           </span>
         </div>
         <div className="top-actions">
+          <button ref={tutorialTriggerRef} className="tutorial-trigger" onClick={openTutorial} disabled={settingsOpen || dependenciesOpen || shortcutHelpOpen || templateEditorOpen} aria-label="打开新手教程">
+            <NavIcon name="book" className="app-icon" />新手教程
+          </button>
           <span className={online ? "status online" : "status"}>
             {online ? "本地已连接" : "未连接"}
           </span>
@@ -6027,6 +6137,7 @@ function App() {
           </section>
         </div>
       )}
+      {tutorialOpen && <TutorialModal onClose={closeTutorial} onAction={handleTutorialAction} />}
       {shortcutHelpOpen && (
         <div className="modal-backdrop" role="presentation">
           <section className="template-modal help-modal" role="dialog" aria-modal="true" aria-label="使用帮助">
@@ -6049,7 +6160,7 @@ function App() {
           <span>{message}</span>
           <CopyButton text={message} label="复制消息" />
         </div>
-        <span>视频、字幕、浏览器 Profile 与密钥均留在本机</span>
+        <span>视频、字幕、浏览器 Profile 与密钥默认保存在本机；在线服务按确认内容处理请求。 <a href="https://github.com/wanghaofu124/youtube-bili-localizer/issues/new" target="_blank" rel="noreferrer">报告不当或错误的 AI 输出</a>（公开 Issue 请勿粘贴敏感信息）</span>
       </footer>
       {ctxMenu && (
         <div className="ctx-menu" style={{ left: ctxMenu.x, top: ctxMenu.y }} onClick={(event) => event.stopPropagation()}>
