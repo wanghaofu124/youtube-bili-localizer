@@ -945,6 +945,14 @@ def _quality_proposal(info: dict, quality: str) -> dict[str, Any]:
     }
 
 
+_QUALITY_HEIGHTS = {"720p": 720, "1080p": 1080, "1440p": 1440, "2160p": 2160}
+
+
+def _requested_height(quality: str | None) -> int | None:
+    """把画质档位换算成目标高度，用于判断本次是否发生了降级。"""
+    return _QUALITY_HEIGHTS.get(str(quality or "").strip().lower())
+
+
 def _format_for_quality(
     quality: str,
     minimum_resolution: tuple[int, int] | None = None,
@@ -1554,10 +1562,18 @@ def download_with_ytdlp(
     else:
         _discard_partial_snapshots(partial_snapshots)
     if actual_dimensions and log:
-        log(
-            f"原片分辨率校验通过：{actual_dimensions[0]}×{actual_dimensions[1]}；"
-            f"画质选择为 {download_quality}，未自动降低画质。"
-        )
+        requested_height = _requested_height(download_quality)
+        if requested_height and actual_dimensions[1] + 1 < requested_height:
+            log(
+                f"原片分辨率校验：源站本次可用的最高画质为 {actual_dimensions[0]}×{actual_dimensions[1]}，"
+                f"低于请求的 {download_quality}；已按可用画质下载，画质未再被缩放。"
+                "如需高清，可稍后重试或更换网络出口。"
+            )
+        else:
+            log(
+                f"原片分辨率校验通过：{actual_dimensions[0]}×{actual_dimensions[1]}；"
+                f"画质选择为 {download_quality}。"
+            )
 
     thumbnail_url = _best_thumbnail_url(info)
     thumbnail_path = _download_thumbnail(thumbnail_url, work_dir, video_id, proxy) if thumbnail_url else None

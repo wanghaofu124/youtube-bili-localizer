@@ -626,6 +626,37 @@ def test_managed_playwright_chromium_can_mint_po_tokens(
     assert _find_chromium_browser() == str(chrome.resolve())
 
 
+def test_quality_downgrade_is_stated_in_log(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """源站只能给低画质时，日志必须如实说明，而不是继续声称“未降低画质”。"""
+    logs: list[str] = []
+    monkeypatch.setattr("yblocalizer.download._probe_video_dimensions", lambda _path: (640, 360))
+    monkeypatch.setattr(
+        "yblocalizer.download.po_token_provider_status",
+        lambda: {"available": False, "browser_path": None},
+    )
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def extract_info(self, _url: str, download: bool):
+            (tmp_path / "demo.mp4").write_bytes(b"video")
+            return {"id": "demo", "title": "Demo", "formats": []}
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
+
+    download_with_ytdlp("https://example.test/video", tmp_path, download_quality="1080p", log=logs.append)
+
+    assert any("低于请求的 1080p" in line for line in logs), logs
+    assert not any("未自动降低画质" in line for line in logs)
+
+
 def test_range_download_stitches_bounded_blocks(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """分块读取必须把每块按顺序拼接，并删掉 .part。"""
     payload = b"abcdefghijklmnopqrstuvwxyz"
