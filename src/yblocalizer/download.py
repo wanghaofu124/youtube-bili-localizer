@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import contextmanager
@@ -10,14 +10,16 @@ from pathlib import Path
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import uuid
 from typing import Any, Callable
+from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from .cancellation import check_cancelled as legacy_check_cancelled
-from .dependencies import resolve_command
+from .dependencies import default_user_data_root, resolve_command
 from .models import VideoJob
 from .runtime import CancellationRequested
 from .performance import download_rate_limit, lower_process_priority, normalize_resource_profile
@@ -304,6 +306,13 @@ class _YtDlpTaskLogger:
         self._log(f"yt-dlp error: {_safe_diagnostic_text(message)}")
 
 
+_NO_POT_CLIENTS = frozenset({"android_vr", "tv_simply", "android", "ios"})
+
+# 取流降级链：先走不需要 PO Token 的客户端；DASH 能力强的排前面，
+# tv_simply 只提供封装好的 muxed 格式，放最后当兜底。
+_YOUTUBE_CLIENT_CHAIN: tuple[str, ...] = ("android_vr", "mweb", "web", "tv_simply")
+
+
 def po_token_provider_status() -> dict[str, str | bool | None]:
     """Report whether the optional yt-dlp PO Token provider can be used."""
     try:
@@ -338,6 +347,13 @@ def _find_chromium_browser() -> str | None:
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate.resolve())
+    # 依赖中心安装的 Playwright Chromium 也能当验证浏览器用：装过投稿浏览器的
+    # 机器不必再要求系统装 Chrome/Edge。
+    managed_browsers = default_user_data_root() / "browsers" / "ms-playwright"
+    for pattern in ("chromium-*/chrome-win*/chrome.exe", "chromium-*/chrome-win64*/chrome.exe"):
+        for candidate in sorted(managed_browsers.glob(pattern)):
+            if candidate.is_file():
+                return str(candidate.resolve())
     return None
 
 
@@ -351,10 +367,11 @@ def _validate_proxy(proxy: str | None) -> str | None:
     return value
 
 
-def _youtube_access_opts(proxy: str | None, po_token_mode: str) -> dict:
+def _youtube_access_opts(proxy: str | None, po_token_mode: str, client: str = "mweb") -> dict:
     mode = str(po_token_mode or "auto").strip().lower()
     if mode not in {"auto", "off"}:
         raise ValueError("YouTube 浏览器验证模式必须是 auto 或 off。")
+    selected = str(client or "mweb").strip().lower() or "mweb"
     opts: dict = {}
     valid_proxy = _validate_proxy(proxy)
     if valid_proxy:
@@ -362,15 +379,23 @@ def _youtube_access_opts(proxy: str | None, po_token_mode: str) -> dict:
     if mode == "off":
         return opts
 
+    if selected in _NO_POT_CLIENTS:
+        # 这些客户端不依赖 GVS PO Token：不启动浏览器、不探测 provider，
+        # 也避免复用任何已作废的令牌。
+        opts["extractor_args"] = {"youtube": {"player_client": [selected], "fetch_pot": ["never"]}}
+        return opts
+
     status = po_token_provider_status()
     if not status["available"]:
         # Source checkouts remain usable without the optional package. The
         # packaged release includes it and preflight exposes any packaging bug.
+        # 没有 provider 时仍显式指定客户端，保证降级链不会被空字典覆盖成同一个请求。
+        opts["extractor_args"] = {"youtube": {"player_client": [selected], "fetch_pot": ["never"]}}
         return opts
     extractor_args: dict[str, dict[str, list[str]]] = {
         "youtube": {
-            "player_client": ["mweb"],
-            "fetch_pot": ["auto"],
+            "player_client": [selected],
+            "fetch_pot": ["always"],
         }
     }
     browser_path = status.get("browser_path")
@@ -380,6 +405,25 @@ def _youtube_access_opts(proxy: str | None, po_token_mode: str) -> dict:
     return opts
 
 
+def _portable_runtime(name: str) -> Path | None:
+    """Locate a runtime installed by the dependency center.
+
+    Portable archives land in ``tools/<name>/<sha12>/<archive-root>/<name>.exe``
+    while ``resolve_command`` only looks two levels deep, so a runtime the user
+    explicitly installed used to be invisible to yt-dlp.
+    """
+    executable = f"{name}.exe"
+    root = Path(os.environ.get("YBLOCALIZER_TOOLS_DIR", "") or default_user_data_root() / "tools")
+    try:
+        matches = sorted(root.glob(f"{name}/**/{executable}"))
+    except OSError:
+        return None
+    for candidate in matches:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def _js_runtime_opts() -> dict:
     """Best-effort options for YouTube's n-challenge solver.
 
@@ -387,11 +431,14 @@ def _js_runtime_opts() -> dict:
     ``ejs`` challenge solver script to obtain playable stream URLs.  When no
     runtime is installed the previous behaviour is kept (warning only).
     """
-    runtimes = {
-        name: {"path": None}
-        for name in ("deno", "node", "bun", "quickjs")
-        if resolve_command(name)
-    }
+    runtimes: dict[str, dict[str, str | None]] = {}
+    for name in ("deno", "node", "bun", "quickjs"):
+        if resolve_command(name):
+            runtimes[name] = {"path": None}
+            continue
+        portable = _portable_runtime(name)
+        if portable is not None:
+            runtimes[name] = {"path": str(portable)}
     if not runtimes:
         # PyInstaller 打包的 EXE 有时 PATH 不完整，探测不到 node；
         # 兜底检查常见安装位置，避免 yt-dlp 缺少 JS 运行时解 n-sig 导致
@@ -408,6 +455,460 @@ def _js_runtime_opts() -> dict:
     if not runtimes:
         return {}
     return {"js_runtimes": runtimes, "remote_components": ["ejs:github"]}
+
+
+_NON_RETRYABLE_YOUTUBE_MARKERS = (
+    "private video",
+    "members-only",
+    "join this channel",
+    "age-restricted",
+    "video unavailable",
+    "not available in your country",
+    "removed by the uploader",
+    "http error 429",
+    "too many requests",
+    "unsupported url",
+    "http error 416",
+    "range not satisfiable",
+)
+
+_RETRYABLE_CLIENT_MARKERS = (
+    "http error 403",
+    "forbidden",
+    "requested format is not available",
+    "confirm you're not a bot",
+    "confirm you’re not a bot",
+    "no video formats found",
+    "unable to extract player response",
+)
+
+
+_HIGH_DEFINITION_HEIGHT = 720
+
+
+def _selected_player_client(opts: dict) -> str:
+    args = opts.get("extractor_args") or {}
+    youtube = args.get("youtube") or {}
+    clients = youtube.get("player_client") or []
+    return str(clients[0]).lower() if clients else ""
+
+
+def _needs_po_token(client: str) -> bool:
+    if not client:
+        return False
+    return client not in _NO_POT_CLIENTS
+
+
+def _hd_formats_missing_url(info: dict) -> bool:
+    """True when every >=720p video stream came back without a download URL.
+
+    YouTube 对需要令牌的客户端会返回格式清单但省略高清流的 URL；这通常意味着
+    本次 PO Token 没有被接受。判定用 all()，避免源本身就没有高清时误判。
+    """
+    formats = info.get("formats") or []
+    hd = [
+        item for item in formats
+        if isinstance(item, dict)
+        and (item.get("height") or 0) >= _HIGH_DEFINITION_HEIGHT
+        and item.get("vcodec") not in (None, "none")
+    ]
+    if not hd:
+        return False
+    return all(not item.get("url") for item in hd)
+
+
+def _should_try_next_client(exc: BaseException) -> bool:
+    """Decide whether a failure is worth retrying with another player_client."""
+    text = str(exc).lower()
+    if any(marker in text for marker in _NON_RETRYABLE_YOUTUBE_MARKERS):
+        return False
+    return any(marker in text for marker in _RETRYABLE_CLIENT_MARKERS)
+
+
+def _extract_with_client_chain(
+    *,
+    opts: dict,
+    url: str,
+    proxy: str | None,
+    po_token_mode: str,
+    log: Callable[[str], None] | None,
+    extract: Callable[[dict], dict],
+    clients: tuple[str, ...] | None = None,
+) -> dict:
+    """Run one extraction per ``player_client`` until one of them succeeds.
+
+    yt-dlp's own HTTP retry re-requests the exact stream URL that the CDN just
+    rejected, while a YouTube 403 is bound to the player_client and the token of
+    that request.  Re-extracting with a different client is what actually gets a
+    fresh stream, so失败后按链换客户端，而不是原地重试同一个地址。
+    """
+    if str(po_token_mode or "").strip().lower() == "off":
+        return extract(dict(opts))
+    chain = tuple(clients or _YOUTUBE_CLIENT_CHAIN)
+    last_exc: BaseException | None = None
+    for index, client in enumerate(chain):
+        trial = dict(opts)
+        trial.update(_youtube_access_opts(proxy, po_token_mode, client=client))
+        if index and log:
+            log(f"YouTube 取流切换到 {client} 客户端重新提取。")
+        try:
+            return extract(trial)
+        except (CancellationRequested, DownloadProposalMismatch, DownloadResolutionMismatch):
+            raise
+        except Exception as exc:  # noqa: BLE001 - 逐客户端降级
+            if not _should_try_next_client(exc):
+                raise
+            last_exc = exc
+            if log:
+                log(f"YouTube 取流失败（{client}）：{_safe_diagnostic_text(str(exc))[:200]}")
+            continue
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("YouTube 取流失败：没有可用的 player_client。")
+
+
+def _range_streaming_enabled() -> bool:
+    """Ranged streaming is opt-in.
+
+    实测 YouTube 的媒体侧只放行「从头开始」的有限 Range；按偏移取块会被
+    DASH 分片校验拒绝，因此这条路径暂不作为默认下载方式，仅在显式开启时启用。
+    """
+    return os.environ.get("YBLOCALIZER_RANGE_STREAM", "").strip().lower() in {"1", "true", "yes"}
+
+
+_RANGE_BLOCK_SIZE = 8 * 1024 * 1024
+_RANGE_MIN_BLOCK = 128 * 1024
+_RANGE_BLOCK_ATTEMPTS = 4
+_DEFAULT_MEDIA_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
+)
+
+
+class _RangeDownloadUnavailable(RuntimeError):
+    """Ranged reads cannot make progress here; the caller falls back to yt-dlp."""
+
+
+class _RangeHTTPError(RuntimeError):
+    """A ranged read came back with a non-success status."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__(f"HTTP {code}")
+        self.code = code
+
+
+def _fetch_range(
+    url: str,
+    start: int,
+    end: int,
+    headers: dict[str, str],
+    proxy: str | None = None,
+) -> tuple[bytes, int | None]:
+    """Read one bounded byte range through curl.
+
+    urllib's request shape (identity encoding + its own redirect rebuild) is
+    answered with 403 by the media CDN for the same URL that curl reads fine,
+    so the ranged read shells out to curl and only the body comes back here.
+    """
+    curl = shutil.which("curl") or shutil.which("curl.exe")
+    if not curl:
+        raise _RangeDownloadUnavailable("系统没有可用的 curl，无法做分块下载")
+    handle, temp_name = tempfile.mkstemp(prefix="ybl-range-", suffix=".bin")
+    os.close(handle)
+    temp_path = Path(temp_name)
+    command = [curl, "-s", "-L", "-D", "-", "-o", str(temp_path),
+               "-H", f"Range: bytes={start}-{end}",
+               "-A", headers.get("User-Agent") or _DEFAULT_MEDIA_UA,
+               "--max-time", "120"]
+    if proxy:
+        command += ["-x", proxy]
+    command.append(url)
+    try:
+        completed = subprocess.run(command, capture_output=True, timeout=180,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        header_text = (completed.stdout or b"").decode("utf-8", "replace")
+        statuses = re.findall(r"HTTP/\d(?:\.\d)? (\d{3})", header_text)
+        status = int(statuses[-1]) if statuses else 0
+        if status == 200:
+            raise _RangeDownloadUnavailable("服务端忽略了 Range，返回整文件")
+        if status not in (206,):
+            raise _RangeHTTPError(status or 0)
+        total = None
+        match = re.search(r"[Cc]ontent-[Rr]ange:\s*bytes \d+-\d+/(\d+)", header_text)
+        if match:
+            total = int(match.group(1))
+        return temp_path.read_bytes(), total
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _range_download(
+    url: str,
+    destination: Path,
+    *,
+    headers: dict[str, str],
+    initial_block: int | None = None,
+    proxy: str | None = None,
+    expected_size: int | None,
+    stop_at: int | None = None,
+    check: Callable[[], None],
+    progress: Callable[[float], None] | None = None,
+    log: Callable[[str], None] | None = None,
+    refresh: Callable[[], str | None] | None = None,
+) -> int:
+    """Download one media stream with bounded HTTP Range reads.
+
+    YouTube 的媒体请求现在只放行「首尾字节都明确」的 Range：整文件 GET 与
+    ``bytes=0-`` 都会被 403，所以分块是唯一稳定的落地方式。失败时先退避重试，
+    仍然失败就换取流 URL 再来，避免把整次下载耗在一个已失效的地址上。
+    """
+    part = destination.with_name(destination.name + ".part")
+    offset = part.stat().st_size if part.is_file() else 0
+    total = int(expected_size or 0) or None
+    current = url
+    refreshed = False
+    failures = 0
+    block = max(_RANGE_MIN_BLOCK, min(int(initial_block or _RANGE_BLOCK_SIZE), _RANGE_BLOCK_SIZE))
+    with part.open("ab" if offset else "wb") as handle:
+        while True:
+            check()
+            if stop_at and offset >= stop_at:
+                break
+            end = offset + block - 1
+            if total:
+                end = min(end, total - 1)
+            if stop_at:
+                end = min(end, stop_at - 1)
+            requested = end - offset + 1
+            try:
+                try:
+                    data, reported_total = _fetch_range(current, offset, end, headers, proxy)
+                except _RangeHTTPError as exc:
+                    # 媒体侧对不同流允许的最大分块不同：视频流能给 8MB，音频流
+                    # 往往 512KB 就被拒。403 时先把块减半再试，比直接判失败有效。
+                    if exc.code == 403 and block > _RANGE_MIN_BLOCK:
+                        block = max(block // 2, _RANGE_MIN_BLOCK)
+                        if log:
+                            log(f"媒体分块被拒，块大小调整为 {block // 1024} KB 后重试。")
+                        continue
+                    raise
+                if reported_total:
+                    total = reported_total
+            except _RangeDownloadUnavailable:
+                raise
+            except Exception:  # noqa: BLE001 - 单块重试
+                failures += 1
+                if failures >= _RANGE_BLOCK_ATTEMPTS:
+                    if refresh is not None and not refreshed:
+                        refreshed = True
+                        fresh = refresh()
+                        if fresh and fresh != current:
+                            current = fresh
+                            failures = 0
+                            block = max(_RANGE_MIN_BLOCK, block // 4)
+                            if log:
+                                log("媒体地址已刷新，改用更小分块继续下载。")
+                            continue
+                    raise
+                time.sleep(min(2 ** (failures - 1), 4))
+                continue
+            failures = 0
+            if not data:
+                break
+            handle.write(data)
+            offset += len(data)
+            if progress and total:
+                progress(min(1.0, offset / total))
+            if total and offset >= total:
+                break
+            if len(data) < requested:
+                break
+    part.replace(destination)
+    return offset
+
+
+def _range_prefix_enabled() -> bool:
+    """Range 前缀下载默认开启：它只用「从头对齐」的有限 Range，实测 CDN 会放行。"""
+    value = os.environ.get("YBLOCALIZER_RANGE_PREFIX", "").strip().lower()
+    return value not in {"0", "false", "no"}
+
+
+def _download_prefix_with_ranges(
+    ydl,
+    url: str,
+    work_dir: Path,
+    seconds: int,
+    *,
+    proxy: str | None = None,
+    check: Callable[[], None],
+    progress: Callable[[float], None] | None = None,
+    log: Callable[[str], None] | None = None,
+) -> dict:
+    """Download only the leading N seconds with ranged reads, then cut locally.
+
+    yt-dlp 的 ``download_ranges`` 依赖 ffmpeg 直接读远端 URL，而 ffmpeg 发的是整文件
+    GET（必然 403）。改为先按「每字节范围」把前缀拉下来，再用本地 ffmpeg 截断。
+    """
+    info = ydl.extract_info(url, download=False)
+    selected = ydl.process_video_result(info, download=False)
+    streams = selected.get("requested_formats") or [selected]
+    duration = float(selected.get("duration") or info.get("duration") or 0) or 0.0
+    video_id = str(selected.get("id") or "media")
+    if duration <= 0:
+        raise _RangeDownloadUnavailable("缺少视频总时长，无法估算前缀长度")
+    ratio = min(1.0, max(0.02, float(seconds) / duration))
+    files: list[Path] = []
+    try:
+        for stream in streams:
+            if not isinstance(stream, dict) or not stream.get("url"):
+                raise _RangeDownloadUnavailable("该格式没有可直接下载的媒体地址")
+            format_id = str(stream.get("format_id") or "0")
+            extension = str(stream.get("ext") or "bin")
+            size = stream.get("filesize") or stream.get("filesize_approx")
+            if not size:
+                raise _RangeDownloadUnavailable("缺少文件大小，无法估算前缀长度")
+            # 多下 25% 余量，保证截断点落在已下载区域内。
+            stop_at = int(int(size) * ratio * 1.25) + 1_000_000
+            destination = work_dir / f"{video_id}.p{format_id}.{extension}"
+            _range_download(
+                str(stream["url"]),
+                destination,
+                headers={"User-Agent": _DEFAULT_MEDIA_UA},
+                initial_block=_RANGE_MIN_BLOCK * 4,
+                proxy=proxy,
+                expected_size=int(size),
+                stop_at=min(stop_at, int(size)),
+                check=check,
+                progress=progress,
+                log=log,
+            )
+            files.append(destination)
+    except Exception:
+        _cleanup_range_artifacts(work_dir, video_id)
+        raise
+
+    if not files:
+        raise _RangeDownloadUnavailable("没有可下载的媒体流")
+    final = work_dir / f"{video_id}.mp4"
+    ffmpeg = require_command("ffmpeg")
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+    for item in files:
+        command += ["-i", str(item)]
+    command += ["-t", str(int(seconds))]
+    if len(files) >= 2:
+        command += ["-map", "0:v:0", "-map", "1:a:0"]
+    command += ["-c", "copy", str(final)]
+    completed = subprocess.run(command, capture_output=True, text=True,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if completed.returncode != 0 or not final.is_file() or final.stat().st_size < 1024:
+        for item in files:
+            item.unlink(missing_ok=True)
+        raise _RangeDownloadUnavailable(
+            f"前缀下载完成但本地截断失败：{(completed.stderr or '').strip()[:160]}"
+        )
+    for item in files:
+        item.unlink(missing_ok=True)
+    selected = dict(selected)
+    selected["requested_downloads"] = [{"filepath": str(final), "_range_prefix": True}]
+    return selected
+
+
+def _cleanup_range_artifacts(work_dir: Path, video_id: str) -> None:
+    for pattern in (f"{video_id}.f*.part", f"{video_id}.f*.mp4", f"{video_id}.f*.m4a",
+                    f"{video_id}.f*.webm", f"{video_id}.f*.mkv",
+                    f"{video_id}.p*.part", f"{video_id}.p*.mp4", f"{video_id}.p*.m4a",
+                    f"{video_id}.p*.webm", f"{video_id}.p*.mkv"):
+        for path in work_dir.glob(pattern):
+            path.unlink(missing_ok=True)
+
+
+def _download_with_ranges(
+    ydl,
+    url: str,
+    work_dir: Path,
+    *,
+    proxy: str | None = None,
+    check: Callable[[], None],
+    progress: Callable[[float], None] | None = None,
+    log: Callable[[str], None] | None = None,
+) -> dict:
+    """Replace yt-dlp's whole-file GET with ranged block downloads."""
+    info = ydl.extract_info(url, download=False)
+    # 必须让 yt-dlp 完成格式选择：直接拿 info["url"] 会得到未按 format 串选中的
+    # 流（常常正是被 CDN 拒绝的那一路），requested_formats 才是要下载的列表。
+    selected = ydl.process_video_result(info, download=False)
+    streams = selected.get("requested_formats") or [selected]
+    video_id = str(selected.get("id") or "media")
+    files: list[Path] = []
+    try:
+        for stream in streams:
+            if not isinstance(stream, dict) or not stream.get("url"):
+                raise _RangeDownloadUnavailable("该格式没有可直接下载的媒体地址")
+            format_id = str(stream.get("format_id") or "0")
+            extension = str(stream.get("ext") or "bin")
+            destination = work_dir / f"{video_id}.f{format_id}.{extension}"
+            # 固定用桌面 Chrome UA：android_vr 签发的 URL 用 Android UA 发
+            # Range 请求会被 CDN 403，桌面 UA 才被当作播放器请求放行。
+            headers = {"User-Agent": _DEFAULT_MEDIA_UA}
+
+            def refresh(target_format: str = format_id) -> str | None:
+                fresh = ydl.extract_info(url, download=False)
+                fresh_selected = ydl.process_video_result(fresh, download=False)
+                for item in (fresh_selected.get("requested_formats") or [fresh_selected]):
+                    if str(item.get("format_id")) == target_format:
+                        return item.get("url")
+                return None
+
+            size = stream.get("filesize") or stream.get("filesize_approx")
+            # 视频流允许 8MB 分块，纯音频流 512KB 就会被拒，所以按 vcodec 分档。
+            initial_block = _RANGE_MIN_BLOCK * 2 if stream.get("vcodec") == "none" else _RANGE_BLOCK_SIZE
+            _range_download(
+                str(stream["url"]),
+                destination,
+                headers=headers,
+                initial_block=initial_block,
+                expected_size=int(size) if size else None,
+                check=check,
+                proxy=proxy,
+                progress=progress,
+                log=log,
+                refresh=refresh,
+            )
+            files.append(destination)
+    except Exception:
+        _cleanup_range_artifacts(work_dir, video_id)
+        raise
+
+    if not files:
+        raise _RangeDownloadUnavailable("没有可下载的媒体流")
+    if len(files) == 1:
+        final = work_dir / f"{video_id}.{files[0].suffix.lstrip('.')}"
+        if final != files[0]:
+            files[0].replace(final)
+    else:
+        final = work_dir / f"{video_id}.mp4"
+        ffmpeg = require_command("ffmpeg")
+        command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+        for path in files:
+            command += ["-i", str(path)]
+        maps = ["-map", "0:v:0", "-map", "1:a:0"] if len(files) >= 2 else []
+        for index in range(2, len(files)):
+            maps += ["-map", f"{index}:0"]
+        command += maps + ["-c", "copy", str(final)]
+        completed = subprocess.run(command, capture_output=True, text=True,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if completed.returncode != 0 or not final.is_file():
+            for path in files:
+                path.unlink(missing_ok=True)
+            raise _RangeDownloadUnavailable(
+                f"分块下载完成但 ffmpeg 合流失败：{(completed.stderr or '').strip()[:160]}"
+            )
+        for path in files:
+            path.unlink(missing_ok=True)
+
+    selected = dict(selected)
+    selected["requested_downloads"] = [{"filepath": str(final), "_range_downloaded": True}]
+    return selected
 
 
 @dataclass(slots=True)
@@ -875,30 +1376,131 @@ def download_with_ytdlp(
         opts["cookiesfrombrowser"] = (cookies_from_browser,)
 
     partial_snapshots: list[_PartialSnapshot] = []
+    quarantined_once = False
+
+    def _prepare_once() -> None:
+        nonlocal quarantined_once
+        if minimum_resolution is None or quarantined_once:
+            return
+        quarantined_once = True
+        quarantined = _quarantine_below_resolution(work_dir, minimum_resolution)
+        if quarantined and log:
+            log(
+                f"发现 {len(quarantined)} 个不符合已确认分辨率的旧缓存，已保留到隔离目录；"
+                "本次只会选择达到已确认画质的流。"
+            )
+
+    def _extract_once(trial_opts: dict) -> dict:
+        check()
+        _prepare_once()
+        with yt_dlp.YoutubeDL(trial_opts) as ydl:
+            # The common path performs a single extraction per client.  A
+            # metadata-only preflight is retained solely when the user explicitly
+            # requires YouTube's CC/reuse flag before any media is downloaded.
+            if require_reuse_allowed:
+                license_info = ydl.extract_info(url, download=False)
+                license_text = license_info.get("license") or ""
+                if "reuse allowed" not in license_text.lower():
+                    raise RuntimeError(
+                        "该视频未被 YouTube 标记为“可转载”（reuse allowed，yt-dlp 元数据中许可证为空或未知）。\n"
+                        "如果你确认已获得处理或转载授权，请在素材页取消勾选「仅接受 CC reuse allowed」后重新开始任务。"
+                    )
+            if (
+                _needs_po_token(_selected_player_client(trial_opts))
+                and hasattr(ydl, "process_video_result")
+            ):
+                # 需要令牌的客户端偶尔会返回"高清流缺少地址"的清单（令牌未被接受）。
+                # 先探一次元数据，缺地址就立刻重取一次以重新 mint，再走正常下载。
+                probe = ydl.extract_info(url, download=False)
+                if _hd_formats_missing_url(probe):
+                    check()
+                    if log:
+                        log("高清流缺少下载地址（令牌可能未生效），重新获取一次。")
+                    probe = ydl.extract_info(url, download=False)
+                    if _hd_formats_missing_url(probe) and log:
+                        log("重新获取后高清流仍缺地址，按当前可用格式继续。")
+                return ydl.process_video_result(probe)
+            if (
+                max_seconds
+                and _range_prefix_enabled()
+                and hasattr(ydl, "process_video_result")
+            ):
+                # 截取开头：ffmpeg 直读远端必然 403，改成先拉前缀再本地截断。
+                try:
+                    return _download_prefix_with_ranges(
+                        ydl,
+                        url,
+                        work_dir,
+                        int(max_seconds),
+                        proxy=proxy,
+                        check=check,
+                        progress=(
+                            (lambda ratio: download_progress({
+                                "status": "downloading",
+                                "downloaded_bytes": int(ratio * 1000),
+                                "total_bytes": 1000,
+                            }))
+                            if progress
+                            else None
+                        ),
+                        log=log,
+                    )
+                except _RangeDownloadUnavailable as exc:
+                    if log:
+                        log(f"前缀分块下载不可用，改用 yt-dlp 截取：{exc}")
+                except CancellationRequested:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - 回退路径要足够宽
+                    if log:
+                        log(f"前缀分块下载失败，改用 yt-dlp 截取：{_safe_diagnostic_text(str(exc))[:160]}")
+            if (
+                not max_seconds
+                and _range_streaming_enabled()
+                and hasattr(ydl, "process_video_result")
+            ):
+                # 整片下载优先走有限 Range 分块：YouTube 只放行带明确首尾字节的
+                # Range 请求，yt-dlp 的整文件 GET 会被 403。任何异常都回退到
+                # yt-dlp 自己的下载器，保证行为不退化。
+                try:
+                    return _download_with_ranges(
+                        ydl,
+                        url,
+                        work_dir,
+                        proxy=proxy,
+                        check=check,
+                        progress=(
+                            (lambda ratio: download_progress({
+                                "status": "downloading",
+                                "downloaded_bytes": int(ratio * 1000),
+                                "total_bytes": 1000,
+                            }))
+                            if progress
+                            else None
+                        ),
+                        log=log,
+                    )
+                except _RangeDownloadUnavailable as exc:
+                    if log:
+                        log(f"Range 分块下载不可用，改用 yt-dlp 下载器：{exc}")
+                except CancellationRequested:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - 回退路径要足够宽
+                    if log:
+                        log(f"Range 分块下载失败，改用 yt-dlp 下载器：{_safe_diagnostic_text(str(exc))[:160]}")
+            return ydl.extract_info(url, download=True)
+
     try:
         check()
         partial_snapshots = _snapshot_existing_partials(work_dir, log)
         with _cancellable_external_ffmpeg(check, profile):
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                # The common path performs a single extraction.  A metadata-only
-                # preflight is retained solely when the user explicitly requires
-                # YouTube's CC/reuse flag before any media is downloaded.
-                if require_reuse_allowed:
-                    info = ydl.extract_info(url, download=False)
-                    license_text = info.get("license") or ""
-                    if "reuse allowed" not in license_text.lower():
-                        raise RuntimeError(
-                            "该视频未被 YouTube 标记为“可转载”（reuse allowed，yt-dlp 元数据中许可证为空或未知）。\n"
-                            "如果你确认已获得处理或转载授权，请在素材页取消勾选「仅接受 CC reuse allowed」后重新开始任务。"
-                        )
-                if minimum_resolution is not None:
-                    quarantined = _quarantine_below_resolution(work_dir, minimum_resolution)
-                    if quarantined and log:
-                        log(
-                            f"发现 {len(quarantined)} 个不符合已确认分辨率的旧缓存，已保留到隔离目录；"
-                            "本次只会选择达到已确认画质的流。"
-                        )
-                info = ydl.extract_info(url, download=True)
+            info = _extract_with_client_chain(
+                opts=opts,
+                url=url,
+                proxy=proxy,
+                po_token_mode=po_token_mode,
+                log=log,
+                extract=_extract_once,
+            )
         check()
     except Exception as exc:
         _restore_changed_partials(partial_snapshots, log)
@@ -1115,10 +1717,16 @@ def _raise_with_youtube_hint(
         if str(po_token_mode).lower() == "off":
             action = "在设置中开启“自动浏览器验证（推荐）”后重试。"
         else:
-            action = "先确认 Chrome/Edge 可访问 YouTube；随后检查代理出口，必要时更新 yt-dlp 与验证组件。"
+            action = (
+                "已自动换用 android_vr / tv_simply / mweb / web 四种播放客户端重取流仍被拒。"
+                "先用 Chrome/Edge 打开同一链接：若页面能播但进度条不动、或出现“confirm you're not a bot”，"
+                "是当前网络出口被 YouTube 限制，需要更换网络或代理出口；"
+                "若浏览器能正常播放，再检查 Cookies 与所选画质。"
+            )
         raise YouTubeAccessError(
             "youtube_forbidden",
-            "YouTube 拒绝了媒体请求（HTTP 403）。可能是本次媒体令牌失效、网络出口受限，或视频需要登录；不能仅凭 403 判定为 Cookies 问题。",
+            "YouTube 拒绝了媒体请求（HTTP 403）。可能是本次媒体令牌失效、网络出口受限，或视频需要登录；"
+            "不能仅凭 403 判定为 Cookies 问题。已自动尝试 android_vr / tv_simply / mweb / web 四种取流方式。",
             action,
         ) from exc
     if _is_stale_partial_download_error(exc):

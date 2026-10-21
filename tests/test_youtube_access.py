@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,10 +12,17 @@ from yblocalizer.download import (
     DownloadResolutionMismatch,
     YouTubeAccessError,
     _cancellable_external_ffmpeg,
+    _download_prefix_with_ranges,
+    _download_with_ranges,
+    _find_chromium_browser,
+    _hd_formats_missing_url,
     _format_for_quality,
+    _js_runtime_opts,
     _quarantine_below_resolution,
     _quality_proposal,
     _raise_with_youtube_hint,
+    _range_download,
+    _RangeDownloadUnavailable,
     _youtube_access_opts,
     download_with_ytdlp,
 )
@@ -35,7 +42,7 @@ def test_po_token_auto_uses_mweb_provider_and_same_proxy(monkeypatch: pytest.Mon
     assert options["proxy"] == "http://127.0.0.1:7890"
     assert options["extractor_args"]["youtube"] == {
         "player_client": ["mweb"],
-        "fetch_pot": ["auto"],
+        "fetch_pot": ["always"],
     }
     assert options["extractor_args"]["youtubepot-wpc"]["browser_path"] == [
         "C:/Browser/chrome.exe"
@@ -478,3 +485,289 @@ def test_job_snapshot_and_history_never_echo_proxy_credentials() -> None:
     assert public["youtube_proxy"] == ""
     assert public["youtube_proxy_configured"] is True
     assert "secret" not in repr(public)
+
+
+def test_media_403_cycles_to_the_next_player_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A rejected stream must be re-extracted with another client, not retried."""
+    seen: list[list[str]] = []
+    logs: list[str] = []
+    monkeypatch.setattr("yblocalizer.download._probe_video_dimensions", lambda _path: (1280, 720))
+    monkeypatch.setattr(
+        "yblocalizer.download.po_token_provider_status",
+        lambda: {"available": False, "browser_path": None},
+    )
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def extract_info(self, _url: str, download: bool):
+            clients = (self.options.get("extractor_args") or {}).get("youtube", {}).get("player_client")
+            seen.append(list(clients or []))
+            if len(seen) == 1:
+                raise RuntimeError(
+                    "ERROR: unable to download video data: HTTP Error 403: Forbidden"
+                )
+            (tmp_path / "demo.mp4").write_bytes(b"video")
+            return {"id": "demo", "title": "Demo", "formats": []}
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
+
+    job = download_with_ytdlp("https://example.test/video", tmp_path, log=logs.append)
+
+    assert [clients[0] for clients in seen] == ["android_vr", "mweb"]
+    assert job.raw_video == tmp_path / "demo.mp4"
+    assert any("mweb" in line for line in logs)
+
+
+def test_private_video_does_not_burn_the_client_chain(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Non-403 failures must fail fast instead of being retried four times."""
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        "yblocalizer.download.po_token_provider_status",
+        lambda: {"available": False, "browser_path": None},
+    )
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def extract_info(self, _url: str, download: bool):
+            calls.append(download)
+            raise RuntimeError("ERROR: [youtube] demo: Private video. Sign in if you've been granted access")
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
+
+    with pytest.raises(RuntimeError, match="Private video"):
+        download_with_ytdlp("https://example.test/video", tmp_path)
+
+    assert calls == [True]
+
+
+def test_po_token_off_keeps_a_single_extraction(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        "yblocalizer.download.po_token_provider_status",
+        lambda: {"available": False, "browser_path": None},
+    )
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def extract_info(self, _url: str, download: bool):
+            calls.append(download)
+            raise RuntimeError("ERROR: unable to download video data: HTTP Error 403: Forbidden")
+
+    monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
+
+    with pytest.raises(RuntimeError, match="403"):
+        download_with_ytdlp("https://example.test/video", tmp_path, po_token_mode="off")
+
+    assert calls == [True]
+
+
+def test_dependency_center_node_is_visible_to_ytdlp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A portable Node installed by the dependency center must reach yt-dlp."""
+    exe = tmp_path / "node" / "158f7685b44d" / "node-v24.21.0-win-x64" / "node.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_bytes(b"MZ" + b"0" * 4096)
+    monkeypatch.setenv("YBLOCALIZER_TOOLS_DIR", str(tmp_path))
+    monkeypatch.setattr("yblocalizer.download.resolve_command", lambda *_a, **_k: None)
+    monkeypatch.setenv("ProgramFiles", "")
+    monkeypatch.setenv("ProgramFiles(x86)", "")
+    monkeypatch.setenv("LOCALAPPDATA", "")
+
+    options = _js_runtime_opts()
+
+    assert options["js_runtimes"]["node"]["path"] == str(exe)
+    assert options["remote_components"] == ["ejs:github"]
+
+
+def test_managed_playwright_chromium_can_mint_po_tokens(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Machines without system Chrome/Edge can still run the PO Token provider."""
+    chrome = tmp_path / "browsers" / "ms-playwright" / "chromium-1234" / "chrome-win" / "chrome.exe"
+    chrome.parent.mkdir(parents=True)
+    chrome.write_bytes(b"MZ" + b"0" * 4096)
+    monkeypatch.setattr("yblocalizer.download.default_user_data_root", lambda: tmp_path)
+    monkeypatch.setattr("yblocalizer.download.resolve_command", lambda *_a, **_k: None)
+    monkeypatch.delenv("YBLOCALIZER_PO_BROWSER", raising=False)
+    for root in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        monkeypatch.setenv(root, "")
+
+    assert _find_chromium_browser() == str(chrome.resolve())
+
+
+def test_range_download_stitches_bounded_blocks(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """分块读取必须把每块按顺序拼接，并删掉 .part。"""
+    payload = b"abcdefghijklmnopqrstuvwxyz"
+    calls: list[tuple[int, int]] = []
+
+    def fake_fetch(url, start, end, headers, proxy=None):
+        calls.append((start, end))
+        return payload[start:end + 1], len(payload)
+
+    monkeypatch.setattr("yblocalizer.download._fetch_range", fake_fetch)
+    monkeypatch.setattr("yblocalizer.download._RANGE_BLOCK_SIZE", 10)
+    monkeypatch.setattr("yblocalizer.download._RANGE_MIN_BLOCK", 1)
+
+    dest = tmp_path / "media.m4a"
+    written = _range_download(
+        "https://example.test/media", dest, headers={}, expected_size=len(payload),
+        check=lambda: None,
+    )
+
+    assert written == len(payload)
+    assert dest.read_bytes() == payload
+    assert not dest.with_name(dest.name + ".part").exists()
+    assert calls == [(0, 9), (10, 19), (20, 25)]
+
+
+def test_range_download_retries_a_block_before_failing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """单块失败应退避重试，而不是整次下载作废。"""
+    payload = b"0123456789"
+    attempts: list[int] = []
+
+    def flaky_fetch(url, start, end, headers, proxy=None):
+        attempts.append(start)
+        if len(attempts) == 1:
+            raise RuntimeError("connection reset")
+        return payload[start:end + 1], len(payload)
+
+    monkeypatch.setattr("yblocalizer.download._fetch_range", flaky_fetch)
+    monkeypatch.setattr("yblocalizer.download._RANGE_BLOCK_SIZE", 10)
+    monkeypatch.setattr("yblocalizer.download.time.sleep", lambda _s: None)
+
+    dest = tmp_path / "retry.m4a"
+    written = _range_download(
+        "https://example.test/media", dest, headers={}, expected_size=len(payload),
+        check=lambda: None,
+    )
+
+    assert written == len(payload)
+    assert dest.read_bytes() == payload
+    assert attempts.count(0) == 2
+
+
+def test_range_download_reports_unavailable_when_server_ignores_range(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """服务端返回整文件（忽略 Range）时应交给 yt-dlp，而不是把整文件写坏。"""
+
+    def whole_file(url, start, end, headers, proxy=None):
+        raise _RangeDownloadUnavailable("服务端忽略了 Range，返回整文件")
+
+    monkeypatch.setattr("yblocalizer.download._fetch_range", whole_file)
+
+    dest = tmp_path / "media.mp4"
+    with pytest.raises(_RangeDownloadUnavailable):
+        _range_download("https://example.test/media", dest, headers={}, expected_size=None,
+                        check=lambda: None)
+
+
+def test_download_with_ranges_rejects_streams_without_direct_url(tmp_path: Path) -> None:
+    """没有直链的格式必须回退，不能静默产出空文件。"""
+
+    class FakeYdl:
+        def extract_info(self, _url, download):
+            return {"id": "demo", "formats": [{"format_id": "1"}]}
+
+        def process_video_result(self, info, download):
+            return {"id": "demo", "requested_formats": [{"format_id": "1", "ext": "mp4"}]}
+
+    with pytest.raises(_RangeDownloadUnavailable):
+        _download_with_ranges(FakeYdl(), "https://example.test/v", tmp_path, check=lambda: None)
+
+
+def test_hd_formats_missing_url_flags_rejected_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """所有 >=720p 视频流都缺 URL 时，判定为本次令牌未被接受。"""
+    rejected = {
+        "formats": [
+            {"format_id": "399", "height": 1080, "vcodec": "av01", "url": None},
+            {"format_id": "136", "height": 720, "vcodec": "avc1", "url": None},
+            {"format_id": "18", "height": 360, "vcodec": "avc1", "url": "https://x/18"},
+        ]
+    }
+    assert _hd_formats_missing_url(rejected) is True
+
+    fine = {
+        "formats": [
+            {"format_id": "399", "height": 1080, "vcodec": "av01", "url": "https://x/399"},
+            {"format_id": "18", "height": 360, "vcodec": "avc1", "url": "https://x/18"},
+        ]
+    }
+    assert _hd_formats_missing_url(fine) is False
+
+    low_only = {"formats": [{"format_id": "18", "height": 360, "vcodec": "avc1", "url": None}]}
+    assert _hd_formats_missing_url(low_only) is False
+
+
+def test_range_download_honours_byte_limit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """前缀下载必须在字节上限处停下，而不是把整片拉下来。"""
+    payload = bytes(range(64))
+    calls: list[tuple[int, int]] = []
+
+    def fake_fetch(url, start, end, headers, proxy=None):
+        calls.append((start, end))
+        return payload[start:end + 1], len(payload)
+
+    monkeypatch.setattr("yblocalizer.download._fetch_range", fake_fetch)
+    monkeypatch.setattr("yblocalizer.download._RANGE_BLOCK_SIZE", 16)
+    monkeypatch.setattr("yblocalizer.download._RANGE_MIN_BLOCK", 1)
+
+    dest = tmp_path / "prefix.m4a"
+    written = _range_download(
+        "https://example.test/media", dest, headers={}, expected_size=len(payload),
+        stop_at=20, check=lambda: None,
+    )
+
+    assert written == 20
+    assert dest.read_bytes() == payload[:20]
+    assert calls == [(0, 15), (16, 19)]
+
+
+def test_prefix_download_requires_duration(tmp_path: Path) -> None:
+    """缺少总时长时无法估算前缀长度，必须回退而不是猜。"""
+
+    class FakeYdl:
+        def extract_info(self, _url, download):
+            return {"id": "demo", "requested_formats": [
+                {"format_id": "399", "ext": "mp4", "url": "https://x/399", "filesize": 1000},
+            ]}
+
+        def process_video_result(self, info, download):
+            return info
+
+    with pytest.raises(_RangeDownloadUnavailable):
+        _download_prefix_with_ranges(FakeYdl(), "https://example.test/v", tmp_path, 10,
+                                     check=lambda: None)

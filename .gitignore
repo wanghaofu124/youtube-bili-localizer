@@ -34,3 +34,7 @@ Thumbs.db
 frontend/node_modules/
 frontend/dist/
 frontend/.preview.png
+# Microsoft Store local identity and generated package staging
+packaging/msix/store-identity.json
+releases/msix/
+.msix-staging/

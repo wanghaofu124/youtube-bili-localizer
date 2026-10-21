@@ -808,7 +808,7 @@ function App() {
   const [device, setDevice] = useState("cuda");
   const [computeType, setComputeType] = useState("float16");
   const [options, setOptions] = useState<Options>(defaults);
-  const [appVersion, setAppVersion] = useState("0.2.6");
+  const [appVersion, setAppVersion] = useState("");
   const [demoPreview, setDemoPreview] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
   const jobRef = useRef<Job | null>(job);
@@ -5641,7 +5641,7 @@ function App() {
           <b>
             YouTube Bili
             <br />
-            Localizer <small>v{appVersion}</small>
+            Localizer <small>v{appVersion || "—"}</small>
           </b>
         </a>
         <div className="project-name">
