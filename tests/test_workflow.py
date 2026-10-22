@@ -28,7 +28,7 @@ from yblocalizer.workflow import (
     validate_srt,
 )
 from yblocalizer.runtime import PipelineContext
-from yblocalizer.workbench_api import WorkbenchJobs, _restored_created_at
+from yblocalizer.workbench_api import DemoJob, WorkbenchJobs, _restored_created_at
 
 
 def test_asr_evidence_artifact_round_trips_without_raw_path_loss() -> None:
@@ -323,7 +323,7 @@ def test_platform_subtitles_skip_audio_extraction_and_whisper(
     )
     monkeypatch.setattr("yblocalizer.workflow.validate_media", lambda *_args: True)
     monkeypatch.setattr(
-        "yblocalizer.workflow._extract_audio",
+        "yblocalizer.workflow.extract_audio",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("audio extraction must be skipped")),
     )
     monkeypatch.setattr(
@@ -829,14 +829,14 @@ def test_extract_always_refreshes_cached_audio(tmp_path: Path, monkeypatch: pyte
     stale.write_bytes(b"stale")
     refreshed: list[Path] = []
 
-    def fake_extract(video: Path, output: Path, ctx: object) -> Path:
-        del video, ctx
+    def fake_extract(video: Path, output: Path, **_kwargs) -> Path:
+        del video
         refreshed.append(output)
         output.write_bytes(b"fresh")
         return output
 
     monkeypatch.setattr("yblocalizer.workflow.validate_media", lambda *_args: True)
-    monkeypatch.setattr("yblocalizer.workflow._extract_audio", fake_extract)
+    monkeypatch.setattr("yblocalizer.workflow.extract_audio", fake_extract)
     monkeypatch.setattr(
         "yblocalizer.workflow.transcribe_audio",
         lambda audio, **_kwargs: (_ for _ in ()).throw(AssertionError(f"stop-after-audio:{audio}")),

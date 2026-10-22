@@ -26,7 +26,7 @@ def _probe_video_size(path: Path) -> tuple[int, int] | None:
                 str(ffprobe), "-v", "error", "-select_streams", "v:0",
                 "-show_entries", "stream=width,height", "-of", "json", str(path),
             ],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         stream = ((json.loads(completed.stdout).get("streams") or [{}])[0])
@@ -78,7 +78,7 @@ def _probe_video_duration(path: Path) -> float | None:
     try:
         completed = subprocess.run(
             [str(ffprobe), "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         duration = float((json.loads(completed.stdout).get("format") or {}).get("duration") or 0)

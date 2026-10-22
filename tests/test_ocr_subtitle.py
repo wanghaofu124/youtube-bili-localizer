@@ -227,7 +227,7 @@ def test_ocr_fallback_is_recorded_and_explained(monkeypatch: pytest.MonkeyPatch,
     monkeypatch.setattr("yblocalizer.workflow.validate_media", lambda *_args: True)
     monkeypatch.setattr("yblocalizer.workflow.extract_ocr_subtitles", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("no caption")))
 
-    def fake_audio(_video, output, _ctx):
+    def fake_audio(_video, output, **_kwargs):
         output.write_bytes(b"audio")
         return output
 
@@ -237,7 +237,7 @@ def test_ocr_fallback_is_recorded_and_explained(monkeypatch: pytest.MonkeyPatch,
         write_srt(kwargs["srt_path"], segments, display_mode="source")
         return segments
 
-    monkeypatch.setattr("yblocalizer.workflow._extract_audio", fake_audio)
+    monkeypatch.setattr("yblocalizer.workflow.extract_audio", fake_audio)
     monkeypatch.setattr("yblocalizer.workflow.transcribe_audio", fake_transcribe)
     logs: list[str] = []
 
@@ -260,7 +260,7 @@ def test_ocr_cancellation_never_starts_audio_fallback(monkeypatch: pytest.Monkey
         lambda *_args, **_kwargs: (_ for _ in ()).throw(CancellationRequested("stop")),
     )
     monkeypatch.setattr(
-        "yblocalizer.workflow._extract_audio",
+        "yblocalizer.workflow.extract_audio",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("fallback must not start")),
     )
 

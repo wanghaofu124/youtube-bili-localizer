@@ -725,7 +725,10 @@ def _range_download(
                 break
             if len(data) < requested:
                 break
-    expected = min(total, stop_at) if total and stop_at else (stop_at or total)
+    if total and stop_at:
+        expected = min(total, stop_at)
+    else:
+        expected = stop_at or total
     if expected and offset != expected:
         raise RuntimeError(f"分块下载不完整：得到 {offset} 字节，期望 {expected} 字节")
     part.replace(destination)
@@ -1063,6 +1066,7 @@ def _probe_video_dimensions(path: Path) -> tuple[int, int] | None:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=20,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )

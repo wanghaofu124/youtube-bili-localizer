@@ -634,7 +634,7 @@ def _probe_media(path: Path) -> tuple[float | None, int | None, int | None]:
         "-show_entries", "format=duration:stream=width,height", "-of", "json", str(path),
     ]
     try:
-        completed = subprocess.run(command, capture_output=True, text=True, check=True, timeout=15)
+        completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", check=True, timeout=15)
         data = json.loads(completed.stdout)
         stream = (data.get("streams") or [{}])[0]
         duration = float((data.get("format") or {}).get("duration"))
@@ -2022,7 +2022,7 @@ class WorkbenchJobs:
                         "llm_usage_total": job.artifacts.llm_usage_total,
                     })
                 except Exception:
-                    LOGGER.warning("Could not persist cumulative LLM usage for %s", job.id)
+                    LOGGER.warning("Could not persist cumulative LLM usage for %s", job.id, exc_info=True)
 
         with self._lock:
             if job.llm_run_token == token:
@@ -2039,7 +2039,7 @@ class WorkbenchJobs:
                     try:
                         self._persist(job)
                     except Exception:
-                        LOGGER.warning("Could not persist LLM usage pointer for job %s", job.id)
+                        LOGGER.warning("Could not persist LLM usage pointer for job %s", job.id, exc_info=True)
 
     def _start_stage_sequence(self, job: DemoJob, stages: list[str], *, auto_run: bool) -> DemoJob:
         self._require_quality_consent(job, stages)
