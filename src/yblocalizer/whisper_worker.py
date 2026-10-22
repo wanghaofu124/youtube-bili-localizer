@@ -49,6 +49,7 @@ def main(argv: list[str] | None = None) -> int:
             beam_size=request["beam_size"],
             resource_profile=request["resource_profile"],
             evidence_path=Path(request["evidence_path"]) if request.get("evidence_path") else None,
+            vad_mode=str(request.get("vad_mode") or "standard"),
             log=log,
         )
     except Exception as exc:

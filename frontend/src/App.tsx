@@ -194,6 +194,8 @@ type Options = {
   source_language: string;
   audio_channel: "mix" | "left" | "right";
   beam_size: number;
+  asr_hint: string;
+  asr_vad_mode: "standard" | "sensitive";
   ocr_interval: number;
   ocr_crop_ratio: number;
   ocr_min_chars: number;
@@ -362,6 +364,8 @@ const defaults: Options = {
   source_language: "",
   audio_channel: "mix",
   beam_size: 5,
+  asr_hint: "",
+  asr_vad_mode: "standard",
   ocr_interval: 0.5,
   ocr_crop_ratio: 0.3,
   ocr_min_chars: 3,
@@ -601,6 +605,31 @@ const fileIconName = (kind: string, name = ""): NavIconName => {
 
 function FieldGuide({ summary, detail, badges = [] }: { summary: string; detail: string; badges?: string[] }) {
   return <span className="field-guide"><small>{summary}</small><span className="guide-badges">{badges.map((badge) => <i key={badge}>{badge}</i>)}</span><details><summary>？ 选择建议与影响</summary><p>{detail}</p></details></span>;
+}
+
+function AsrRecognitionFields({ options, onHint, onVad, hintError }: {
+  options: Options;
+  onHint: (value: string) => void;
+  onVad: (value: Options["asr_vad_mode"]) => void;
+  hintError?: string;
+}) {
+  const ocrOnly = options.subtitle_source === "ocr";
+  return <>
+    <label>
+      人声检测
+      <select value={options.asr_vad_mode || "standard"} disabled={ocrOnly} onChange={(event) => onVad(event.target.value as Options["asr_vad_mode"])}>
+        <option value="standard">标准</option>
+        <option value="sensitive">敏感（户外噪声）</option>
+      </select>
+      <FieldGuide summary="标准去掉长静音后再补回像有人声、但还没识别到的区间。" detail="敏感会更早把风声、水声里的说话当成语音，并在句首多留一点。风声和水声也可能被收进来。纯 OCR 不用这项。改完后需要重新提取字幕。" badges={options.asr_vad_mode === "sensitive" ? ["可能多收噪声"] : ["当前行为"]} />
+    </label>
+    <label className="settings-span-2">
+      识别提示
+      <input value={options.asr_hint || ""} disabled={ocrOnly} maxLength={240} placeholder="可选，例如 tarpon, ballyhoo, pompano jig" onChange={(event) => onHint(event.target.value)} />
+      {hintError && <small className="field-error">{hintError}</small>}
+      <FieldGuide summary="留空时，只从标题、简介和标签里取专名，不用先听片。" detail="手写词会追加在自动专名后面，用来偏向鱼名、地名这类听不清就猜错的词。使用平台字幕时不会发给 Whisper。改完后需要重新提取字幕。" badges={["可选"]} />
+    </label>
+  </>;
 }
 
 function ActivityBars() {
@@ -1701,6 +1730,7 @@ function App() {
     if (options.title.length > 200) errors.title = "标题不能超过 200 个字符。";
     if ((description ?? "").length > 5000) errors.description = "简介不能超过 5000 个字符。";
     if (options.whisper_model_size.length > 128) errors.whisper_model_size = "模型名不能超过 128 个字符。";
+    if ((options.asr_hint || "").length > 240) errors.asr_hint = "识别提示不能超过 240 个字符。";
     if (options.translate_model.length > 128) errors.translate_model = "模型名不能超过 128 个字符。";
     if (options.font_name.length > 100) errors.font_name = "字体名不能超过 100 个字符。";
     if (options.target_lang.length > 32) errors.target_lang = "目标语言不能超过 32 个字符。";
@@ -1833,7 +1863,7 @@ function App() {
   const applyRecommended = () => {
     setDevice("cpu");
     setComputeType("int8");
-    setOptions((current) => ({ ...current, download_quality: "1080p", render_encoder: "auto", resource_profile: "balanced", subtitle_source: "audio", prefer_platform_subtitles: true, whisper_model_size: "small", source_language: "", audio_channel: "mix", translator: "deepseek", translate_model: "", deepseek_thinking: "disabled", target_lang: "zh-Hans", smart_translation: true, smart_subtitle_layout: true, font_name: "Microsoft YaHei", font_size: 24, subtitle_display_mode: "translated", subtitle_color: "白色", subtitle_outline_color: "黑色", subtitle_effect: "描边" }));
+    setOptions((current) => ({ ...current, download_quality: "1080p", render_encoder: "auto", resource_profile: "balanced", subtitle_source: "audio", prefer_platform_subtitles: true, whisper_model_size: "small", source_language: "", audio_channel: "mix", asr_hint: "", asr_vad_mode: "standard", translator: "deepseek", translate_model: "", deepseek_thinking: "disabled", target_lang: "zh-Hans", smart_translation: true, smart_subtitle_layout: true, font_name: "Microsoft YaHei", font_size: 24, subtitle_display_mode: "translated", subtitle_color: "白色", subtitle_outline_color: "黑色", subtitle_effect: "描边" }));
     setIncludeSourceLink(true);
     setMessage("已应用推荐设置：最高 1080p、自动优先 NVIDIA 渲染、CPU int8 转写与中文硬字幕。");
   };
@@ -3900,6 +3930,7 @@ function App() {
               {sourceLanguageOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
             </select>
           </label>
+          <AsrRecognitionFields options={options} hintError={fieldErrors.asr_hint} onHint={(value) => updateOptions("asr_hint", value)} onVad={(value) => updateOptions("asr_vad_mode", value)} />
            {(job?.material.source_url || (!job && sourceUrl.trim())) && ["auto", "merged"].includes(options.subtitle_source) && <label className="check settings-check">
              <input type="checkbox" checked={options.prefer_platform_subtitles} onChange={(event) => updateOptions("prefer_platform_subtitles", event.target.checked)} />
              优先使用 YouTube 字幕（更快；没有时自动转写）
@@ -4109,7 +4140,8 @@ function App() {
             <option value="right">右声道（仅双声道）</option>
           </select>
           <FieldGuide summary="默认保留混合声道；左右声道只适用于明确的双声道音频。" detail="系统不会根据音量自动判断哪一侧有人声，也不会静默丢弃另一声道。" />
-        </label>
+          </label>
+          <AsrRecognitionFields options={options} hintError={fieldErrors.asr_hint} onHint={(value) => updateOptions("asr_hint", value)} onVad={(value) => updateOptions("asr_vad_mode", value)} />
          {(job?.material.source_url || (!job && sourceUrl.trim())) && ["auto", "merged"].includes(options.subtitle_source) && <label className="check settings-check">
            <input type="checkbox" checked={options.prefer_platform_subtitles} onChange={(event) => updateOptions("prefer_platform_subtitles", event.target.checked)} />
            优先使用 YouTube 字幕（更快；没有时自动转写）

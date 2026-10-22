@@ -15,6 +15,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from . import dependencies
+from .asr_prompt import build_initial_prompt
 from .asr_review import prepare_session, resolve_review_language, session_path
 from .download import download_with_ytdlp, import_local_video
 from .media import extract_audio
@@ -58,7 +59,7 @@ STAGE_LABELS = {
 STAGE_PROGRESS = {"acquire": 8, "extract": 28, "translate": 62, "render": 84, "publish": 96}
 CONFIG_INVALIDATION: tuple[tuple[frozenset[str], str], ...] = (
     (frozenset({"source", "source_kind", "output_dir", "cookies_from_browser", "cookies_file", "youtube_po_token_mode", "youtube_proxy", "download_quality", "max_seconds", "require_reuse_allowed", "prefer_platform_subtitles"}), "acquire"),
-    (frozenset({"subtitle_source", "ocr_fallback_to_audio", "whisper_model_size", "source_language", "beam_size", "device", "compute_type", "ocr_interval", "ocr_crop_ratio", "ocr_min_chars", "ocr_language", "audio_channel"}), "extract"),
+    (frozenset({"subtitle_source", "ocr_fallback_to_audio", "whisper_model_size", "source_language", "beam_size", "device", "compute_type", "ocr_interval", "ocr_crop_ratio", "ocr_min_chars", "ocr_language", "audio_channel", "asr_hint", "asr_vad_mode"}), "extract"),
     (frozenset({"translator", "target_lang", "translate_model", "batch_size", "smart_translation", "smart_subtitle_layout"}), "translate"),
     (frozenset({"font_name", "font_size", "subtitle_display_mode", "subtitle_color", "subtitle_outline_color", "subtitle_outline", "subtitle_shadow", "subtitle_margin_ratio", "render_crf", "render_encoder"}), "render"),
     (frozenset({"title", "description", "tags", "publish_to_bilibili", "include_source_link", "bilibili_browser", "close_after_fill"}), "publish"),
@@ -597,13 +598,26 @@ def run_extract(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx:
             return copied
         source_audio = ensure_audio()
         evidence_path = target_json.with_name(target_json.stem + ".asr-evidence.json")
+        vad_mode = str(getattr(options, "asr_vad_mode", "standard") or "standard")
+        initial_prompt = build_initial_prompt(
+            getattr(options, "title", None),
+            getattr(options, "description", None),
+            getattr(options, "tags", None),
+            getattr(options, "asr_hint", None),
+        )
+        if initial_prompt:
+            log(f"识别提示：{initial_prompt}")
+        else:
+            log("识别提示：未使用。标题、简介和标签里没有可用专名，也没有手写提示。")
+        log("人声检测：敏感。更早保留风声和水声里的说话，句首多留一点。" if vad_mode == "sensitive" else "人声检测：标准。")
         result = transcribe_audio(
             source_audio, segments_json=target_json, srt_path=target_srt,
             model_size=options.whisper_model_size, language=options.source_language,
-            device=options.device, compute_type=options.compute_type, initial_prompt=None,
+            device=options.device, compute_type=options.compute_type, initial_prompt=initial_prompt,
             beam_size=options.beam_size, log=log, cancel_check=ctx.check_cancelled,
             resource_profile=options.resource_profile,
             evidence_path=evidence_path,
+            vad_mode=vad_mode,
         )
         artifacts.asr_evidence = str(evidence_path)
         try:

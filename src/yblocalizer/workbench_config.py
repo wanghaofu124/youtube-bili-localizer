@@ -28,6 +28,7 @@ MAX_FONT_NAME_LENGTH = 100
 MAX_TARGET_LANGUAGE_LENGTH = 32
 MAX_TAGS = 20
 MAX_TAG_LENGTH = 30
+MAX_ASR_HINT_LENGTH = 240
 
 
 class InputValidationError(ValueError):
@@ -157,6 +158,7 @@ def _validate_strict_source(source: dict[str, Any]) -> None:
         "font_name": MAX_FONT_NAME_LENGTH,
         "target_lang": MAX_TARGET_LANGUAGE_LENGTH,
         "source_language": MAX_TARGET_LANGUAGE_LENGTH,
+        "asr_hint": MAX_ASR_HINT_LENGTH,
     }
     for field, maximum in text_fields.items():
         if field in source and source[field] is not None:
@@ -215,7 +217,7 @@ def default_options(output_dir: str = "outputs/workbench_demo") -> dict[str, Any
         "resource_profile": "balanced",
         "subtitle_source": "audio", "prefer_platform_subtitles": True,
         "whisper_model_size": "small", "source_language": "", "audio_channel": "mix",
-        "beam_size": 5, "ocr_interval": 0.5, "ocr_crop_ratio": 0.30, "ocr_min_chars": 3,
+        "beam_size": 5, "asr_hint": "", "asr_vad_mode": "standard", "ocr_interval": 0.5, "ocr_crop_ratio": 0.30, "ocr_min_chars": 3,
         "ocr_language": "eng",
         "subtitle_margin_ratio": 0.055, "render_crf": 20,
         "translator": "deepseek", "target_lang": "zh-Hans", "translate_model": "",
@@ -279,6 +281,11 @@ def normalize_options(value: Any, output_dir: str, *, strict: bool = True) -> di
     audio_channel = str(raw.get("audio_channel") or "mix").strip().lower()
     if audio_channel not in {"mix", "left", "right"}:
         raise InputValidationError("声道必须是 mix、left 或 right。", code="invalid_choice", field="audio_channel")
+    asr_vad_mode = str(raw.get("asr_vad_mode") or "standard").strip().lower()
+    if asr_vad_mode not in {"standard", "sensitive"}:
+        if strict:
+            raise InputValidationError("人声检测必须是 standard 或 sensitive。", code="invalid_choice", field="asr_vad_mode")
+        asr_vad_mode = "standard"
     subtitle_source = str(raw["subtitle_source"])
     if subtitle_source not in {"auto", "audio", "ocr", "merged"}:
         raise InputValidationError("字幕来源选项无效。", code="invalid_choice", field="subtitle_source")
@@ -335,6 +342,8 @@ def normalize_options(value: Any, output_dir: str, *, strict: bool = True) -> di
         "source_language": _text(raw["source_language"]) or None,
         "audio_channel": audio_channel,
         "beam_size": int(raw["beam_size"]) if strict else max(1, min(10, int(raw["beam_size"]))),
+        "asr_hint": _text(raw.get("asr_hint")),
+        "asr_vad_mode": asr_vad_mode,
         "ocr_interval": float(raw["ocr_interval"]) if strict else max(0.2, min(60.0, float(raw["ocr_interval"]))),
         "ocr_crop_ratio": float(raw["ocr_crop_ratio"]) if strict else max(0.05, min(1.0, float(raw["ocr_crop_ratio"]))),
         "ocr_min_chars": int(raw["ocr_min_chars"]) if strict else max(1, min(100, int(raw["ocr_min_chars"]))),

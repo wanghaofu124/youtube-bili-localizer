@@ -68,15 +68,18 @@ def transcribe_audio(
     cancel_check: Callable[[], None] | None = None,
     resource_profile: str = "balanced",
     evidence_path: Path | None = None,
+    vad_mode: str = "standard",
 ) -> list[Segment]:
     if (getattr(sys, "frozen", False) or os.environ.get("YBLOCALIZER_FORCE_WHISPER_WORKER") == "1") and os.environ.get("YBLOCALIZER_WHISPER_WORKER") != "1":
         return _transcribe_audio_isolated(
             audio_path, segments_json, srt_path, model_size, language, device,
             compute_type, initial_prompt, beam_size, log, cancel_check, resource_profile, evidence_path,
+            vad_mode,
         )
     return _transcribe_audio_in_process(
         audio_path, segments_json, srt_path, model_size, language, device,
         compute_type, initial_prompt, beam_size, log, cancel_check, resource_profile, evidence_path,
+        vad_mode,
     )
 
 
@@ -94,6 +97,7 @@ def _transcribe_audio_in_process(
     cancel_check: Callable[[], None] | None = None,
     resource_profile: str = "balanced",
     evidence_path: Path | None = None,
+    vad_mode: str = "standard",
 ) -> list[Segment]:
     check = cancel_check or legacy_check_cancelled
     check()
@@ -122,6 +126,13 @@ def _transcribe_audio_in_process(
             )
             # word_timestamps=True：用词级起止覆盖 VAD 粗块。只读 segment.start/end
             # 时，有 BGM/空镜的视频会把一句台词拖到下一段说话前（实测可超过 50 秒）。
+            vad_profile = _vad_profile(vad_mode)
+            vad_parameters = {
+                "min_silence_duration_ms": vad_profile["min_silence_duration_ms"],
+                "speech_pad_ms": vad_profile["speech_pad_ms"],
+            }
+            if vad_profile["threshold"] is not None:
+                vad_parameters["threshold"] = vad_profile["threshold"]
             transcribe_kwargs = {
                 "language": language,
                 "initial_prompt": _clean_initial_prompt(initial_prompt),
@@ -136,7 +147,7 @@ def _transcribe_audio_in_process(
                     str(audio_path),
                     # The previous 120 ms pad clipped quiet leading words at
                     # speech onsets (verified at 07:17 in the current video).
-                    vad_parameters={"min_silence_duration_ms": 400, "speech_pad_ms": 400},
+                    vad_parameters=vad_parameters,
                     **transcribe_kwargs,
                 )
             except TypeError:
@@ -161,6 +172,7 @@ def _transcribe_audio_in_process(
                     normalization_stats=normalization_stats,
                     retry_language=language or detected_language,
                     recovery_audit=recovery_audit,
+                    vad_profile=vad_profile,
                 )
                 save_words(words_path_for_segments(segments_json), all_words)
                 segments = pack_cues_from_words(all_words)
@@ -199,6 +211,8 @@ def _transcribe_audio_in_process(
                 transcription_audit=audit,
                 normalization_stats=normalization_stats,
                 recovery_audit=recovery_audit,
+                initial_prompt=transcribe_kwargs.get("initial_prompt"),
+                vad_mode=str(vad_profile["mode"]),
             )
             break
         except Exception as exc:
@@ -279,16 +293,23 @@ def _recover_vad_speech_gaps(
     normalization_stats: dict[str, int] | None = None,
     retry_language: str | None = None,
     recovery_audit: dict[str, object] | None = None,
+    vad_profile: dict[str, object] | None = None,
 ) -> list[TimedWord]:
     """Recheck only sustained uncovered speech; never invent word timings."""
     from faster_whisper.audio import decode_audio
     from faster_whisper.vad import VadOptions, get_speech_timestamps
 
+    profile = vad_profile or _vad_profile("standard")
+    recovery_threshold = float(profile["recovery_threshold"])
     check()
     audio = decode_audio(str(audio_path), sampling_rate=16000)
     speech = get_speech_timestamps(
         audio,
-        VadOptions(threshold=0.35, min_silence_duration_ms=400, speech_pad_ms=400),
+        VadOptions(
+            threshold=recovery_threshold,
+            min_silence_duration_ms=int(profile["recovery_silence_ms"]),
+            speech_pad_ms=int(profile["recovery_pad_ms"]),
+        ),
         sampling_rate=16000,
     )
     intervals = [(entry["start"] / 16000, entry["end"] / 16000) for entry in speech]
@@ -296,7 +317,7 @@ def _recover_vad_speech_gaps(
     windows = _recovery_windows(candidates)
     audit = recovery_audit if recovery_audit is not None else {}
     audit.update({
-        "vad_threshold": 0.35,
+        "vad_threshold": recovery_threshold,
         "candidate_count": len(candidates),
         "candidate_total_seconds": round(sum(end - start for start, end in candidates), 3),
         "window_count": len(windows),
@@ -321,7 +342,7 @@ def _recover_vad_speech_gaps(
         return words
     logger(
         f"人声漏检复核：发现 {len(candidates)} 个待复核区间，"
-        f"拆分为 {len(windows)} 个窗口；使用敏感复核阈值 0.35（不是本片实测最优值）。"
+        f"拆分为 {len(windows)} 个窗口；使用复核阈值 {recovery_threshold}（不是本片实测最优值）。"
     )
     recovered: list[TimedWord] = []
     max_windows = 24
@@ -432,6 +453,7 @@ def _transcribe_audio_isolated(
     cancel_check: Callable[[], None] | None,
     resource_profile: str,
     evidence_path: Path | None = None,
+    vad_mode: str = "standard",
 ) -> list[Segment]:
     logger = log or (lambda _message: None)
     check = cancel_check or legacy_check_cancelled
@@ -449,6 +471,7 @@ def _transcribe_audio_isolated(
                 worker_result = _run_whisper_worker(
                     control_dir, audio_path, model_size, language, attempt_device,
                     attempt_compute, initial_prompt, beam_size, logger, check, resource_profile,
+                    vad_mode,
                 )
                 items, temporary_json, temporary_srt = worker_result[:3]
                 temporary_evidence = worker_result[3] if len(worker_result) > 3 else control_dir / "missing-evidence.json"
@@ -489,6 +512,7 @@ def _run_whisper_worker(
     logger: LogFn,
     check: Callable[[], None],
     resource_profile: str,
+    vad_mode: str = "standard",
 ) -> tuple[list[Segment], Path, Path, Path]:
     request_path = control_dir / f"request-{device}.json"
     result_path = control_dir / f"result-{device}.json"
@@ -510,6 +534,7 @@ def _run_whisper_worker(
         "initial_prompt": initial_prompt,
         "beam_size": beam_size,
         "resource_profile": resource_profile,
+        "vad_mode": vad_mode,
         "evidence_path": str(temporary_evidence),
     }, ensure_ascii=False), encoding="utf-8")
     if getattr(sys, "frozen", False):
@@ -570,6 +595,8 @@ def _write_asr_evidence(
     transcription_audit: dict[str, object] | None = None,
     normalization_stats: dict[str, int] | None = None,
     recovery_audit: dict[str, object] | None = None,
+    initial_prompt: object = None,
+    vad_mode: str = "standard",
 ) -> None:
     if not path:
         return
@@ -587,6 +614,8 @@ def _write_asr_evidence(
         "requested_language": requested_language or None,
         "detected_language": language,
         "language_probability": probability,
+        "initial_prompt": initial_prompt or None,
+        "vad_mode": vad_mode,
         "suspect_intervals": suspect_intervals or [],
         "transcription_audit": transcription_audit or {},
         "normalization_stats": normalization_stats or {},
@@ -714,6 +743,29 @@ def _forward_worker_events(path: Path, offset: int, logger: LogFn) -> int:
             if message:
                 logger(str(message))
         return handle.tell()
+
+
+def _vad_profile(mode: str | None) -> dict[str, object]:
+    """Standard keeps the current VAD. Sensitive keeps more noisy outdoor speech."""
+    if str(mode or "").strip().lower() == "sensitive":
+        return {
+            "mode": "sensitive",
+            "threshold": 0.35,
+            "min_silence_duration_ms": 400,
+            "speech_pad_ms": 500,
+            "recovery_threshold": 0.30,
+            "recovery_silence_ms": 400,
+            "recovery_pad_ms": 500,
+        }
+    return {
+        "mode": "standard",
+        "threshold": None,
+        "min_silence_duration_ms": 400,
+        "speech_pad_ms": 400,
+        "recovery_threshold": 0.35,
+        "recovery_silence_ms": 400,
+        "recovery_pad_ms": 400,
+    }
 
 
 def _clean_initial_prompt(initial_prompt: str | None) -> str | None:

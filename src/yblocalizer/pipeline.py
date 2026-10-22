@@ -68,6 +68,8 @@ class PipelineOptions:
     whisper_model_size: str = "small"
     source_language: str | None = None
     beam_size: int = 5
+    asr_hint: str = ""
+    asr_vad_mode: str = "standard"
     ocr_interval: float = 0.5
     ocr_crop_ratio: float = 0.30
     ocr_min_chars: int = 3
