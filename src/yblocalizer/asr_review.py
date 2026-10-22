@@ -18,6 +18,7 @@ import wave
 from typing import Any, Callable
 
 from .performance import ReviewResourceBusy, cpu_thread_limit, normalize_resource_profile, review_cuda_memory
+from .util import read_json
 
 
 SESSION_VERSION = 1
@@ -93,10 +94,7 @@ def resolve_review_language(requested: Any, evidence_path: Path | None = None, *
 
 
 def _words_from_json(path: Path) -> list[dict[str, Any]]:
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
+    raw = read_json(path, [])
     if not isinstance(raw, list):
         return []
     words: list[dict[str, Any]] = []
@@ -172,11 +170,7 @@ def subtitle_commit_path(work_dir: Path, revision: int, commit_id: str | None = 
 
 
 def read_session(work_dir: Path) -> dict[str, Any] | None:
-    path = session_path(work_dir)
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+    value = read_json(session_path(work_dir), None)
     return value if isinstance(value, dict) else None
 
 
