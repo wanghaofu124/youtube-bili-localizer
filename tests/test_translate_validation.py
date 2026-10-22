@@ -81,6 +81,11 @@ def test_checkpoint_with_empty_batch_item_is_not_reused(monkeypatch: pytest.Monk
 from yblocalizer.validation import validate_target_language
 
 
+class FakeHttpxClient:
+    def __init__(self, **options: object) -> None:
+        self.options = options
+
+
 def test_translation_client_uses_bounded_retry_count(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: list[dict[str, object]] = []
 
@@ -90,10 +95,6 @@ def test_translation_client_uses_bounded_retry_count(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.delenv("YB_LLM_MAX_RETRIES", raising=False)
-    class FakeHttpxClient:
-        def __init__(self, **options: object) -> None:
-            self.options = options
-
     monkeypatch.setitem(
         sys.modules, "openai",
         SimpleNamespace(OpenAI=FakeOpenAI, DefaultHttpxClient=FakeHttpxClient),
@@ -219,7 +220,7 @@ def test_ollama_client_is_pinned_to_loopback_and_bypasses_proxy(monkeypatch: pyt
             captured["sdk_options"] = kwargs
 
     monkeypatch.setitem(sys.modules, "httpx", FakeHTTPX)
-    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI, DefaultHttpxClient=object))
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI, DefaultHttpxClient=FakeHttpxClient))
     _chat_client("YBLOCALIZER_OLLAMA", "https://ignored.example/v1")
     assert captured["http_options"]["trust_env"] is False
     assert captured["timeout"] == ((600.0,), {"connect": 5.0})
