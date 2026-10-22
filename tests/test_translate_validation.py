@@ -81,6 +81,11 @@ def test_checkpoint_with_empty_batch_item_is_not_reused(monkeypatch: pytest.Monk
 from yblocalizer.validation import validate_target_language
 
 
+class FakeHttpxClient:
+    def __init__(self, **options: object) -> None:
+        self.options = options
+
+
 def test_translation_client_uses_bounded_retry_count(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: list[dict[str, object]] = []
 
@@ -90,11 +95,21 @@ def test_translation_client_uses_bounded_retry_count(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
     monkeypatch.delenv("YB_LLM_MAX_RETRIES", raising=False)
-    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+    monkeypatch.setitem(
+        sys.modules, "openai",
+        SimpleNamespace(OpenAI=FakeOpenAI, DefaultHttpxClient=FakeHttpxClient),
+    )
 
     _chat_client("DEEPSEEK_API_KEY", "https://example.test/v1")
 
-    assert captured == [{"api_key": "test-key", "timeout": 90.0, "max_retries": 2, "base_url": "https://example.test/v1"}]
+    assert len(captured) == 1
+    options = captured[0]
+    assert options["api_key"] == "test-key"
+    assert options["timeout"] == 90.0
+    assert options["max_retries"] == 2
+    assert options["base_url"] == "https://example.test/v1"
+    assert isinstance(options["http_client"], FakeHttpxClient)
+    assert options["http_client"].options["timeout"] == 90.0
 
 
 def test_ollama_translation_dispatches_without_online_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -163,6 +178,30 @@ def test_translategemma_uses_one_isolated_request_per_subtitle(monkeypatch: pyte
     assert [item.translated_text for item in result] == ["你好", "你好吗？"]
 
 
+def test_translategemma_first_cue_uses_the_model_argument(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TranslateGemma 的第一条字幕必须用函数参数 model，不能因未定义的 selected_model 中断。"""
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="你好"))])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    monkeypatch.setattr("yblocalizer.translate._chat_client", lambda **_kwargs: fake_client)
+    monkeypatch.setattr("yblocalizer.translate._require_ollama_model", lambda model: model)
+    monkeypatch.delenv("YB_TRANSLATION_REVIEW", raising=False)
+
+    result = translate_segments(
+        [Segment(0, 1, "Hello.")],
+        provider="ollama", target_lang="zh-Hans", model="translategemma:12b", source_lang="en",
+    )
+
+    assert result[0].translated_text == "你好"
+    assert captured["model"] == "translategemma:12b"
+
+
 def test_ollama_client_is_pinned_to_loopback_and_bypasses_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
@@ -181,7 +220,7 @@ def test_ollama_client_is_pinned_to_loopback_and_bypasses_proxy(monkeypatch: pyt
             captured["sdk_options"] = kwargs
 
     monkeypatch.setitem(sys.modules, "httpx", FakeHTTPX)
-    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI, DefaultHttpxClient=FakeHttpxClient))
     _chat_client("YBLOCALIZER_OLLAMA", "https://ignored.example/v1")
     assert captured["http_options"]["trust_env"] is False
     assert captured["timeout"] == ((600.0,), {"connect": 5.0})

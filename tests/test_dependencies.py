@@ -180,7 +180,7 @@ def test_start_ollama_reports_cli_exit_with_log_detail(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     manager = DependencyManager(tmp_path)
-    monkeypatch.setattr("yblocalizer.dependencies.dependency_statuses", lambda _root=None: [
+    monkeypatch.setattr("yblocalizer.dependencies.dependency_statuses", lambda _root=None, _ocr_language="eng": [
         {"id": "ollama-runtime", "available": False, "required": False, "message": "stopped"},
     ])
     monkeypatch.setattr("yblocalizer.dependencies.ollama_local_status", lambda: {
@@ -233,7 +233,7 @@ def test_dependency_install_requires_confirmation(tmp_path: Path) -> None:
 
 def test_dependency_manager_serializes_install_tasks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     rows = [_row("ffmpeg"), _row("node")]
-    monkeypatch.setattr("yblocalizer.dependencies.dependency_statuses", lambda root=None: rows)
+    monkeypatch.setattr("yblocalizer.dependencies.dependency_statuses", lambda root=None, ocr_language="eng": rows)
     monkeypatch.setattr("yblocalizer.dependencies.threading.Thread.start", lambda self: None)
     manager = DependencyManager(tmp_path)
     first = manager.start("ffmpeg", confirmed=True)
@@ -245,6 +245,10 @@ def test_dependency_manager_serializes_install_tasks(tmp_path: Path, monkeypatch
 def test_dependency_failure_is_retryable_and_keeps_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager = DependencyManager(tmp_path)
     job = InstallJob("job", "ffmpeg")
+    monkeypatch.setattr(
+        "yblocalizer.dependencies.resolve_command",
+        lambda name, tools_root=None: Path("winget") if name == "winget" else None,
+    )
     monkeypatch.setattr(manager, "_install_winget", lambda current, dependency_id: (_ for _ in ()).throw(RuntimeError("network unavailable")))
     manager._run(job, next(spec for spec in SPECS if spec.id == "ffmpeg"))
     assert job.status == "failed"
@@ -253,7 +257,7 @@ def test_dependency_failure_is_retryable_and_keeps_error(tmp_path: Path, monkeyp
 
 
 def test_installed_dependency_returns_completed_without_thread(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("yblocalizer.dependencies.dependency_statuses", lambda root=None: [_row("ffmpeg", available=True, installable=False)])
+    monkeypatch.setattr("yblocalizer.dependencies.dependency_statuses", lambda root=None, ocr_language="eng": [_row("ffmpeg", available=True, installable=False)])
     job = DependencyManager(tmp_path).start("ffmpeg", confirmed=True)
     assert job.status == "completed"
     assert job.progress == 100

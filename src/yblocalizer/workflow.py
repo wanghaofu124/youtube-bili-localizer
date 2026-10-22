@@ -1450,7 +1450,7 @@ def validate_media(path: Path, kind: str = "video") -> bool:
     try:
         result = subprocess.run(
             [str(ffprobe), "-v", "error", "-select_streams", selector, "-show_entries", "stream=index", "-of", "json", str(path)],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
         )
         return result.returncode == 0 and bool((json.loads(result.stdout).get("streams") or []))
     except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):

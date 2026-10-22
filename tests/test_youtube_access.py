@@ -21,6 +21,7 @@ from yblocalizer.download import (
     _quarantine_below_resolution,
     _quality_proposal,
     _raise_with_youtube_hint,
+    _fetch_range,
     _range_download,
     _RangeDownloadUnavailable,
     _youtube_access_opts,
@@ -761,6 +762,47 @@ def test_hd_formats_missing_url_flags_rejected_token(
 
     low_only = {"formats": [{"format_id": "18", "height": 360, "vcodec": "avc1", "url": None}]}
     assert _hd_formats_missing_url(low_only) is False
+
+
+def test_fetch_range_rejects_curl_failure_with_partial_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """curl 超时或失败时，已经落下的半截响应不能当作成功的 Range 块。"""
+
+    def fake_run(command, **_kwargs):
+        Path(command[command.index("-o") + 1]).write_bytes(b"partial-bytes")
+        header = (
+            "HTTP/1.1 206 Partial Content\r\n"
+            "Content-Range: bytes 0-99/1000\r\n"
+            "\r\n"
+        ).encode()
+        return SimpleNamespace(returncode=28, stdout=header, stderr=b"Operation timed out")
+
+    monkeypatch.setattr("yblocalizer.download.shutil.which", lambda _name: "curl")
+    monkeypatch.setattr("yblocalizer.download.subprocess.run", fake_run)
+
+    with pytest.raises(RuntimeError, match="退出码 28"):
+        _fetch_range("https://example.test/media", 0, 99, {})
+
+
+def test_range_download_rejects_short_file_when_total_is_known(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """已知总长度时，短于期望的分块结果必须报错，不能把 .part 改名为成品。"""
+
+    def short_fetch(url, start, end, headers, proxy=None):
+        return b"abc", 1000
+
+    monkeypatch.setattr("yblocalizer.download._fetch_range", short_fetch)
+    monkeypatch.setattr("yblocalizer.download._RANGE_BLOCK_SIZE", 100)
+    monkeypatch.setattr("yblocalizer.download._RANGE_MIN_BLOCK", 1)
+
+    dest = tmp_path / "media.mp4"
+    with pytest.raises(RuntimeError, match="分块下载不完整"):
+        _range_download(
+            "https://example.test/media", dest, headers={}, expected_size=1000,
+            check=lambda: None,
+        )
+
+    assert not dest.exists()
 
 
 def test_range_download_honours_byte_limit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

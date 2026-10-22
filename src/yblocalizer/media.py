@@ -14,7 +14,7 @@ def audio_stream_channels(video_path: Path) -> int | None:
     try:
         completed = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=channels", "-of", "json", str(video_path.resolve())],
-            capture_output=True, text=True, check=True,
+            capture_output=True, text=True, encoding="utf-8", check=True,
         )
         streams = json.loads(completed.stdout).get("streams", [])
         value = streams[0].get("channels") if streams else None

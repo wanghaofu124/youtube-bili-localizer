@@ -626,6 +626,8 @@ def _fetch_range(
     try:
         completed = subprocess.run(command, capture_output=True, timeout=180,
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if completed.returncode != 0:
+            raise RuntimeError(f"curl 分块读取失败（退出码 {completed.returncode}）")
         header_text = (completed.stdout or b"").decode("utf-8", "replace")
         statuses = re.findall(r"HTTP/\d(?:\.\d)? (\d{3})", header_text)
         status = int(statuses[-1]) if statuses else 0
@@ -723,6 +725,12 @@ def _range_download(
                 break
             if len(data) < requested:
                 break
+    if total and stop_at:
+        expected = min(total, stop_at)
+    else:
+        expected = stop_at or total
+    if expected and offset != expected:
+        raise RuntimeError(f"分块下载不完整：得到 {offset} 字节，期望 {expected} 字节")
     part.replace(destination)
     return offset
 
@@ -1058,6 +1066,7 @@ def _probe_video_dimensions(path: Path) -> tuple[int, int] | None:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=20,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )

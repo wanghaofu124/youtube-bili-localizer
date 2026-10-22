@@ -210,7 +210,7 @@ def prepare_session(*, work_dir: Path, job_id: str, audio_path: Path, baseline_w
         try:
             with wave.open(str(audio_path), "rb") as stream:
                 duration = stream.getnframes() / max(1, stream.getframerate())
-        except (OSError, wave.Error):
+        except (OSError, EOFError, wave.Error):
             duration = None
     session = ReviewSession(
         version=SESSION_VERSION, job_id=job_id, status="pending", audio_path=str(audio_path),
