@@ -163,6 +163,30 @@ def test_translategemma_uses_one_isolated_request_per_subtitle(monkeypatch: pyte
     assert [item.translated_text for item in result] == ["你好", "你好吗？"]
 
 
+def test_translategemma_first_cue_uses_the_model_argument(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TranslateGemma 的第一条字幕必须用函数参数 model，不能因未定义的 selected_model 中断。"""
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        @staticmethod
+        def create(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="你好"))])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    monkeypatch.setattr("yblocalizer.translate._chat_client", lambda **_kwargs: fake_client)
+    monkeypatch.setattr("yblocalizer.translate._require_ollama_model", lambda model: model)
+    monkeypatch.delenv("YB_TRANSLATION_REVIEW", raising=False)
+
+    result = translate_segments(
+        [Segment(0, 1, "Hello.")],
+        provider="ollama", target_lang="zh-Hans", model="translategemma:12b", source_lang="en",
+    )
+
+    assert result[0].translated_text == "你好"
+    assert captured["model"] == "translategemma:12b"
+
+
 def test_ollama_client_is_pinned_to_loopback_and_bypasses_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 

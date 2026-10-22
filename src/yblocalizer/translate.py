@@ -1242,7 +1242,7 @@ def _translate_chat_provider(
                         kind="single_translation", provider=provider_name, model=model,
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0.1,
-                        **_deepseek_request_options(provider_name, deepseek_thinking, selected_model),
+                        **_deepseek_request_options(provider_name, deepseek_thinking, model),
                     )
                     text = response.choices[0].message.content or ""
                     translated = _parse_translategemma_single_cue(text)
