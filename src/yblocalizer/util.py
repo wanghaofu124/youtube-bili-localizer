@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 import os
 from pathlib import Path
 import re
@@ -9,7 +10,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Callable
+from typing import Any, Callable
 
 from .cancellation import CancellationRequested
 from .dependencies import resolve_command
@@ -33,6 +34,14 @@ def _discover_windows_command(name: str) -> Path | None:
         return None
     matches = sorted(winget_packages.rglob(executable), key=lambda path: path.stat().st_mtime, reverse=True)
     return matches[0] if matches else None
+
+
+def read_json(path: Path, default: Any) -> Any:
+    """Read UTF-8 JSON. Return default when the file is missing, unreadable, or invalid."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
 
 
 def _safe_console_print(message: str) -> None:

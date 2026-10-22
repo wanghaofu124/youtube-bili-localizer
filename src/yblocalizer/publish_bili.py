@@ -14,6 +14,29 @@ DESCRIPTION_KEYWORDS = ["简介", "介绍", "描述", "稿件简介", "descripti
 TAG_KEYWORDS = ["标签", "稿件标签", "tag", "tags", "回车"]
 
 
+def _page_url(page):
+    """Return page.url, or "" when the page cannot be read."""
+    try:
+        return page.url
+    except Exception:
+        return ""
+
+
+def _with_selector(page, selectors, action=None, *, state: str = "visible", timeout_ms: int = 800, last: bool = False) -> bool:
+    """Try each selector. Stop when action finishes; an error or False tries the next one."""
+    for selector in selectors:
+        try:
+            found = page.locator(selector)
+            locator = found.last if last else found.first
+            locator.wait_for(state=state, timeout=timeout_ms)
+            if action is not None and action(locator, selector) is False:
+                continue
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def open_upload_page(
     profile_dir: Path | None = None,
     browser: str = "chromium",
@@ -177,11 +200,7 @@ def _wait_for_upload_input(page, logger: LogFn):
             logger(f"已找到上传控件（{_elapsed(started)}）。")
             return file_input
         except Exception:
-            current_url = ""
-            try:
-                current_url = page.url
-            except Exception:
-                pass
+            current_url = _page_url(page)
             now = time.monotonic()
             if current_url and current_url != last_url:
                 logger(f"等待上传控件（{_elapsed(started)}）。当前页面：{current_url}")
@@ -236,10 +255,8 @@ def _launch_bilibili_context(playwright, profile_dir: Path, browser: str, headle
 
 def _page_blocker_status(page) -> str | None:
     """Return a coarse page state used for progress and early failure hints."""
-    try:
-        url = (page.url or "").lower()
-    except Exception:
-        url = ""
+    page_url = _page_url(page)
+    url = page_url.lower() if isinstance(page_url, str) else ""
     try:
         text = page.locator("body").inner_text(timeout=1_000)
     except Exception:
@@ -291,34 +308,30 @@ def _select_video_file(page, video_path: Path, logger: LogFn) -> bool:
         ".bcc-upload-wrapper",
         "text=上传视频",
     ]
-    for selector in click_candidates:
-        try:
-            locator = page.locator(selector).first
-            locator.wait_for(state="visible", timeout=1_500)
-            with page.expect_file_chooser(timeout=4_000) as chooser_info:
-                locator.click(timeout=2_000)
-            chooser_info.value.set_files(str(video_path))
-            logger(f"已通过文件选择器选择成片（{_elapsed(started)}）：{selector}")
-            return True
-        except Exception:
-            continue
+
+    def choose_file(locator, selector) -> None:
+        with page.expect_file_chooser(timeout=4_000) as chooser_info:
+            locator.click(timeout=2_000)
+        chooser_info.value.set_files(str(video_path))
+        logger(f"已通过文件选择器选择成片（{_elapsed(started)}）：{selector}")
+
+    if _with_selector(page, click_candidates, choose_file, timeout_ms=1_500):
+        return True
 
     input_candidates = [
         "input[type='file'][name='buploader']",
         ".bcc-upload-wrapper input[type='file']",
         "input[type='file'][accept*='.mp4']",
     ]
-    for selector in input_candidates:
-        try:
-            locator = page.locator(selector).first
-            locator.wait_for(state="attached", timeout=1_500)
-            if not _locator_is_video_upload_input(locator):
-                continue
-            locator.set_input_files(str(video_path))
-            logger(f"已通过控件选择成片（{_elapsed(started)}）：{selector}")
-            return True
-        except Exception:
-            continue
+
+    def assign_input(locator, selector):
+        if not _locator_is_video_upload_input(locator):
+            return False
+        locator.set_input_files(str(video_path))
+        logger(f"已通过控件选择成片（{_elapsed(started)}）：{selector}")
+
+    if _with_selector(page, input_candidates, assign_input, state="attached", timeout_ms=1_500):
+        return True
     logger(f"点击选择成片未成功（{_elapsed(started)}），改为等待隐藏文件控件。")
     return False
 
@@ -409,17 +422,16 @@ def _try_open_upload_entry(page) -> None:
         "text=投稿",
         "a[href*='/platform/upload/video']",
     ]
-    for selector in candidates:
-        try:
-            locator = page.locator(selector).first
-            locator.wait_for(state="visible", timeout=800)
-            locator.click()
-            return
-        except Exception:
-            continue
+    _with_selector(page, candidates, lambda locator, _selector: locator.click(), timeout_ms=800)
 
 
 def _dismiss_existing_draft_prompt(page, logger: LogFn | None = None, wait_seconds: float = 0) -> bool:
+    def discard(locator, _selector) -> None:
+        locator.click(timeout=2_000)
+        time.sleep(1)
+        if logger:
+            logger("Dismissed existing unsubmitted Bilibili draft prompt before starting a new upload.")
+
     deadline = time.monotonic() + max(0, wait_seconds)
     while True:
         try:
@@ -427,22 +439,18 @@ def _dismiss_existing_draft_prompt(page, logger: LogFn | None = None, wait_secon
         except Exception:
             body = ""
         if "未提交的视频" in body or "继续编辑" in body or "不用了" in body:
-            for selector in [
-                "button:has-text('不用了')",
-                "text=不用了",
-                "button:has-text('放弃')",
-                "text=放弃",
-            ]:
-                try:
-                    locator = page.locator(selector).first
-                    locator.wait_for(state="visible", timeout=800)
-                    locator.click(timeout=2_000)
-                    time.sleep(1)
-                    if logger:
-                        logger("Dismissed existing unsubmitted Bilibili draft prompt before starting a new upload.")
-                    return True
-                except Exception:
-                    continue
+            if _with_selector(
+                page,
+                [
+                    "button:has-text('不用了')",
+                    "text=不用了",
+                    "button:has-text('放弃')",
+                    "text=放弃",
+                ],
+                discard,
+                timeout_ms=800,
+            ):
+                return True
             try:
                 clicked = bool(
                     page.evaluate(
@@ -556,11 +564,7 @@ def _wait_for_publish_form(page, logger: LogFn, timeout_seconds: int = 180) -> N
         if _publish_form_markers_present(page):
             logger(f"发布表单已就绪（{_elapsed(started)}）。")
             return
-        current_url = ""
-        try:
-            current_url = page.url
-        except Exception:
-            pass
+        current_url = _page_url(page)
         now = time.monotonic()
         state = _read_upload_state(page)
         state_text = _format_upload_state(state)
@@ -732,15 +736,12 @@ def _fill_first_available(
 
 
 def _try_fill_selectors(page, selectors: list[str], value: str, timeout_ms: int) -> bool:
-    for selector in selectors:
-        locator = page.locator(selector).first
-        try:
-            locator.wait_for(state="visible", timeout=timeout_ms)
-            _fill_locator(page, locator, value)
-            return True
-        except Exception:
-            continue
-    return False
+    return _with_selector(
+        page,
+        selectors,
+        lambda locator, _selector: _fill_locator(page, locator, value),
+        timeout_ms=timeout_ms,
+    )
 
 
 def _fill_tags(page, tags: list[str], logger: LogFn | None = None) -> bool:
@@ -748,27 +749,24 @@ def _fill_tags(page, tags: list[str], logger: LogFn | None = None) -> bool:
     if not cleaned_tags:
         return True
     joined_tags = " ".join(cleaned_tags)
+
+    def type_tags(locator, _selector) -> None:
+        locator.scroll_into_view_if_needed(timeout=2_000)
+        locator.click()
+        _clear_existing_tags(page)
+        for tag in cleaned_tags:
+            page.keyboard.type(tag, delay=30)
+            page.keyboard.press("Enter")
+            time.sleep(0.3)
+
     for scroll_y in [600, 1000, 1400, 1800, 2200]:
         try:
             page.evaluate("(y) => window.scrollTo(0, y)", scroll_y)
             time.sleep(0.4)
         except Exception:
             pass
-        for selector in _tag_selectors():
-            locator = page.locator(selector).first
-            try:
-                locator.wait_for(state="visible", timeout=250)
-                locator.scroll_into_view_if_needed(timeout=2_000)
-                locator.click()
-                _clear_existing_tags(page)
-                for tag in cleaned_tags:
-                    page.keyboard.type(tag, delay=30)
-                    page.keyboard.press("Enter")
-                    time.sleep(0.3)
-                return True
-            except Exception as exc:
-                _ = exc
-                continue
+        if _with_selector(page, _tag_selectors(), type_tags, timeout_ms=250):
+            return True
     if _fill_tag_input_by_keywords(page, cleaned_tags, logger=logger):
         return True
     return _fill_first_available(
@@ -868,15 +866,13 @@ def _click_cover_entry(page) -> bool:
         "span:has-text('封面设置')",
         "[class*='cover']:has-text('封面')",
     ]
-    for selector in selectors:
-        try:
-            locator = page.locator(selector).first
-            locator.wait_for(state="visible", timeout=250)
-            locator.scroll_into_view_if_needed(timeout=1_000)
-            locator.click(timeout=1_000)
-            return True
-        except Exception:
-            continue
+
+    def click_cover(locator, _selector) -> None:
+        locator.scroll_into_view_if_needed(timeout=1_000)
+        locator.click(timeout=1_000)
+
+    if _with_selector(page, selectors, click_cover, timeout_ms=250):
+        return True
     try:
         return bool(
             page.evaluate(
@@ -904,35 +900,29 @@ def _click_cover_entry(page) -> bool:
 def _confirm_cover_dialog(page, logger: LogFn | None = None) -> None:
     for _ in range(8):
         time.sleep(0.5)
-        for selector in [
-            "button:has-text('完成')",
-            "button:has-text('确认')",
-            "button:has-text('确定')",
-            "button:has-text('保存')",
-            "text=完成",
-            "text=确认",
-            "text=确定",
-            "text=保存",
-        ]:
-            try:
-                locator = page.locator(selector).last
-                locator.wait_for(state="visible", timeout=150)
-                locator.click(timeout=1_000)
-                return
-            except Exception:
-                continue
+        if _with_selector(
+            page,
+            [
+                "button:has-text('完成')",
+                "button:has-text('确认')",
+                "button:has-text('确定')",
+                "button:has-text('保存')",
+                "text=完成",
+                "text=确认",
+                "text=确定",
+                "text=保存",
+            ],
+            lambda locator, _selector: locator.click(timeout=1_000),
+            timeout_ms=150,
+            last=True,
+        ):
+            return
     if logger:
         logger("Cover file was selected; if Bilibili opened a crop dialog, please confirm it manually.")
 
 
 def _first_visible(page, selectors: list[str], timeout_ms: int = 1_000) -> bool:
-    for selector in selectors:
-        try:
-            page.locator(selector).first.wait_for(state="visible", timeout=timeout_ms)
-            return True
-        except Exception:
-            continue
-    return False
+    return _with_selector(page, selectors, timeout_ms=timeout_ms)
 
 
 def _fill_locator(page, locator, value: str) -> None:
