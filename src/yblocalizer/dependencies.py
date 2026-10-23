@@ -26,6 +26,8 @@ import tempfile
 import zipfile
 from typing import Any, Callable
 
+from .diagnostics import log_frontend_error
+
 
 WEBVIEW2_DOWNLOAD_URL = "https://developer.microsoft.com/microsoft-edge/webview2/"
 WINGET_HELP_URL = "https://learn.microsoft.com/windows/package-manager/winget/"
@@ -920,6 +922,7 @@ class DependencyManager:
                 job.status, job.error, job.message = "cancelled", None, "安装已由用户取消。"
                 job.logs.append(job.message)
             else:
+                log_frontend_error("依赖安装失败，已显示在界面")
                 job.status, job.error, job.message = "failed", str(exc), "安装失败；修正网络或权限问题后可以重试。"
                 job.logs.append(str(exc))
         finally:

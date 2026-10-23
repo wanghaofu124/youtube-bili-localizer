@@ -726,6 +726,9 @@ details[open] > .studio-drawer-summary { border-bottom: 1px solid var(--line); }
 .settings-section-label .app-icon { width: 18px; height: 18px; flex: 0 0 auto; color: var(--amber-deep); }
 .settings-section-label span { margin-left: auto; color: var(--muted); font-size: 10px; }
 .settings-drawer > label, .settings-drawer > .drawer-note, .settings-drawer > .cookies-hint { flex: 0 0 auto; }
+.settings-diagnostics { flex: 0 0 auto; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; width: 100%; }
+.settings-diagnostics .settings-section-label, .settings-diagnostics .drawer-note { width: 100%; }
+.settings-diagnostics .drawer-note { overflow-wrap: anywhere; }
 .settings-drawer-footer { position: sticky; bottom: 0; flex: 0 0 auto; margin: 0 -22px; padding: 12px 22px 16px; border-top: 1px solid var(--line); background: var(--panel); }
 .settings-drawer-footer .primary { width: 100%; }
 

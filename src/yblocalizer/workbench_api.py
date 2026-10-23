@@ -25,7 +25,6 @@ import sys
 import tempfile
 import threading
 import time
-import traceback
 import uuid
 import wave
 import webbrowser
@@ -69,6 +68,7 @@ from .pipeline import (
     _shift_segments,
 )
 from . import __version__
+from .diagnostics import configure_logging, export_diagnostics_zip, install_excepthooks, log_frontend_error
 from .workbench_config import (
     InputValidationError,
     MAX_DESCRIPTION_LENGTH,
@@ -162,10 +162,8 @@ USER_DATA_ROOT = _DEFAULT_USER_DATA_ROOT
 LOG_ROOT = USER_DATA_ROOT / "logs"
 LOG_ROOT.mkdir(parents=True, exist_ok=True)
 if not logging.getLogger().handlers:
-    logging.basicConfig(
-        filename=LOG_ROOT / "workbench.log", level=logging.INFO, encoding="utf-8",
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure_logging(LOG_ROOT)
+install_excepthooks()
 DEMO_VIDEO = ASSET_ROOT / "demo" / "authorized-demo-10s.mp4"
 OUTPUT_ROOT = USER_DATA_ROOT / "outputs" / "workbench_demo"
 UPLOAD_ROOT = USER_DATA_ROOT / "outputs" / "workbench_uploads"
@@ -2193,7 +2191,7 @@ class WorkbenchJobs:
                 job.error, job.error_code, job.suggested_action = None, None, None
                 job.add_log("Current stage was cancelled; completed checkpoints were kept.")
         except Exception as exc:
-            traceback.print_exc()
+            log_frontend_error("工作流程失败，已显示在界面")
             with self._lock:
                 stage = job.current_stage
                 if stage:
@@ -2211,7 +2209,7 @@ class WorkbenchJobs:
                 job.finished_at, job.auto_run = time.time(), False
                 job.add_log(f"Stage failed: {exc}")
         except BaseException as exc:
-            traceback.print_exc()
+            log_frontend_error("工作线程异常终止，已显示在界面")
             stage = job.current_stage or (stages[0] if stages else None)
             detail = str(exc).strip()
             error = f"工作线程异常终止（{type(exc).__name__}）"
@@ -2232,7 +2230,6 @@ class WorkbenchJobs:
                 job.suggested_action = "已完成的阶段成果保留；查看错误详情后重试当前阶段。"
                 job.finished_at, job.auto_run = time.time(), False
                 job.add_log(f"工作线程异常终止：{type(exc).__name__}" + (f": {detail}" if detail else ""))
-            LOGGER.error("Workflow worker terminated unexpectedly for job %s", job.id, exc_info=(type(exc), exc, exc.__traceback__))
             raise
         finally:
             usage_context.__exit__(*sys.exc_info())
@@ -2852,6 +2849,7 @@ class WorkbenchJobs:
                     return
                 raise RuntimeError(detail or "语音复核子进程失败")
         except Exception as exc:
+            log_frontend_error("语音复核失败，已显示在界面")
             job.add_log(f"语音复核失败：{type(exc).__name__}: {exc}")
         finally:
             if process is not None and process.poll() is None:
@@ -3361,7 +3359,7 @@ class WorkbenchJobs:
                 job.finished_at = time.time()
                 job.add_log("Alignment cancelled; the previous rendered video was kept.")
         except Exception as exc:
-            traceback.print_exc()
+            log_frontend_error("对齐失败，已显示在界面")
             with self._lock:
                 job.status, job.stage, job.error = "failed", "对齐失败", str(exc)
                 job.finished_at = time.time()
@@ -3457,7 +3455,7 @@ class WorkbenchJobs:
                 job.finished_at = time.time()
                 job.add_log("Modify cancelled; the previous rendered video was kept.")
         except Exception as exc:
-            traceback.print_exc()
+            log_frontend_error("修改失败，已显示在界面")
             with self._lock:
                 job.status, job.stage, job.error = "failed", "修改失败", str(exc)
                 job.finished_at = time.time()
@@ -3750,7 +3748,7 @@ class WorkbenchJobs:
                 job.finished_at = time.time()
                 job.add_log("Trim cancelled; the previous rendered video was kept.")
         except Exception as exc:
-            traceback.print_exc()
+            log_frontend_error("裁剪失败，已显示在界面")
             with self._lock:
                 job.status, job.stage, job.error = "failed", "裁剪失败", str(exc)
                 job.finished_at = time.time()
@@ -3869,7 +3867,7 @@ class WorkbenchJobs:
                 job.finished_at = time.time()
                 job.add_log("Re-render cancelled; the previous rendered video was kept.")
         except Exception as exc:
-            traceback.print_exc()
+            log_frontend_error("重新渲染失败，已显示在界面")
             with self._lock:
                 job.status, job.stage, job.error = "failed", "重新渲染失败", str(exc)
                 job.finished_at = time.time()
@@ -4167,6 +4165,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             payload = self._payload()
         except PayloadReadError as exc:
             self._json(exc.payload(), exc.status); return
+        if path == "/api/diagnostics/export":
+            try:
+                archive = export_diagnostics_zip(USER_DATA_ROOT, LOG_ROOT)
+            except OSError as exc:
+                log_frontend_error("诊断包导出失败")
+                self._json({"error": "无法写入诊断包。"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            else:
+                self._json({"ok": True, "path": str(archive)})
+            return
         if path == "/api/tutorial-preferences":
             try:
                 _write_tutorial_preferences(payload)
@@ -4913,7 +4920,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             try:
                 open_upload_page(profile_dir=self._publish_profile_dir(browser), browser=browser, log=self.jobs._publish_log)
             except Exception as exc:
-                traceback.print_exc()
+                log_frontend_error("B 站登录检查失败，已显示在界面")
                 session.status, session.error, session.message = "failed", str(exc), f"打开登录检查页失败：{exc}"
             else:
                 session.status, session.message = "finished", "B 站登录检查页已关闭。"
@@ -5036,7 +5043,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                         log=self.jobs._publish_log,
                     )
                 except Exception as exc:
-                    traceback.print_exc()
+                    log_frontend_error("B 站投稿辅助失败，已显示在界面")
                     session.status, session.error = "failed", str(exc)
                     session.message = f"B 站投稿辅助失败：{exc}"
                 else:
@@ -5070,7 +5077,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                         wait_for_review=True, log=self.jobs._publish_log,
                     )
                 except Exception as exc:
-                    traceback.print_exc()
+                    log_frontend_error("抖音投稿辅助失败，已显示在界面")
                     session.status, session.error = "failed", str(exc)
                     session.message = f"抖音投稿辅助失败：{exc}"
                 else:
@@ -5394,6 +5401,10 @@ def build_server(frontend_dir: Path, host: str, port: int) -> ThreadingHTTPServe
                 super().process_request_thread(request, client_address)
             finally:
                 self._connection_slots.release()
+
+        def handle_error(self, request: Any, client_address: Any) -> None:
+            log_frontend_error("未处理的本地接口异常")
+            super().handle_error(request, client_address)
 
         def server_close(self) -> None:
             Handler.jobs.shutdown()
