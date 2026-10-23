@@ -888,6 +888,8 @@ function App() {
   const [apiKey, setApiKey] = useState("");
   const [savingSettings, setSavingSettings] = useState(false);
   const savingSettingsRef = useRef(false);
+  const [exportingDiagnostics, setExportingDiagnostics] = useState(false);
+  const [diagnosticsNote, setDiagnosticsNote] = useState("");
   const [message, setMessage] = useState("正在连接本地服务…");
   const [metadata, setMetadata] = useState<{
     duration: number | null;
@@ -2990,6 +2992,23 @@ function App() {
     } finally {
       savingSettingsRef.current = false;
       setSavingSettings(false);
+    }
+  };
+  const exportDiagnostics = async () => {
+    if (exportingDiagnostics) return;
+    setExportingDiagnostics(true);
+    setDiagnosticsNote("");
+    try {
+      const result = await api<{ path: string }>("/api/diagnostics/export", { method: "POST", body: "{}" });
+      const note = `诊断包已导出：${result.path}`;
+      setDiagnosticsNote(note);
+      setMessage(note);
+    } catch (error) {
+      const note = error instanceof Error ? error.message : "导出诊断包失败";
+      setDiagnosticsNote(note);
+      setMessage(note);
+    } finally {
+      setExportingDiagnostics(false);
     }
   };
   const chooseCookiesFile = async () => {
@@ -6043,6 +6062,14 @@ function App() {
               同一地址用于元数据、视频、封面和浏览器验证；只保存在本机设置，不会写入任务历史或日志。
             </small>
           </label>
+          <div className="settings-diagnostics">
+            <div className="settings-section-label"><NavIcon name="book" className="app-icon" /><b>关于</b><span>v{appVersion || "—"}</span></div>
+            <p className="drawer-note">诊断包包含最近日志、版本和已脱敏的本机设置，不含密钥、Cookies、登录状态或浏览器资料。</p>
+            <button type="button" className="settings-link-button" onClick={() => void exportDiagnostics()} disabled={exportingDiagnostics}>
+              {exportingDiagnostics ? "正在导出诊断包…" : "导出诊断包"}
+            </button>
+            {diagnosticsNote && <p className="drawer-note">{diagnosticsNote}</p>}
+          </div>
           <div className="settings-drawer-footer"><button className="primary" onClick={saveSettings} disabled={savingSettings} aria-busy={savingSettings}>
             {savingSettings ? "正在保存本地设置…" : "保存本地设置并应用本次访问参数"}
           </button></div>

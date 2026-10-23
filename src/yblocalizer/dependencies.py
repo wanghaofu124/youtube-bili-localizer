@@ -920,6 +920,8 @@ class DependencyManager:
                 job.status, job.error, job.message = "cancelled", None, "安装已由用户取消。"
                 job.logs.append(job.message)
             else:
+                from .diagnostics import log_frontend_error
+                log_frontend_error(f"依赖安装失败，已显示在界面：{exc}")
                 job.status, job.error, job.message = "failed", str(exc), "安装失败；修正网络或权限问题后可以重试。"
                 job.logs.append(str(exc))
         finally:
