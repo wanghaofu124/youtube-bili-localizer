@@ -29,7 +29,7 @@ _PROFILE_FILE = "profile-only-secret-marker"
 def _detach_log_handler() -> None:
     root = logging.getLogger()
     for handler in list(root.handlers):
-        if getattr(handler, "yblocalizer_log", False):
+        if isinstance(handler, RotatingFileHandler) and handler.baseFilename.endswith("workbench.log"):
             root.removeHandler(handler)
             handler.close()
 
@@ -56,10 +56,14 @@ def test_deliberate_exception_is_written_to_the_log(tmp_path: Path) -> None:
         except RuntimeError:
             log_frontend_error("界面可见的后端错误")
 
-        attached = [handler for handler in logging.getLogger().handlers if getattr(handler, "yblocalizer_log", False)]
+        target = str((tmp_path / "workbench.log").resolve())
+        attached = [
+            handler for handler in logging.getLogger().handlers
+            if isinstance(handler, RotatingFileHandler) and handler.baseFilename == target
+        ]
         assert len(attached) == 1
-        assert isinstance(attached[0], RotatingFileHandler)
         assert attached[0].backupCount == 3
+        assert attached[0].filters
         text = (tmp_path / "workbench.log").read_text(encoding="utf-8")
     finally:
         _detach_log_handler()
@@ -72,7 +76,19 @@ def test_deliberate_exception_is_written_to_the_log(tmp_path: Path) -> None:
     assert "未处理异常（线程 diagnostics-worker）" in text
 
 
-def test_diagnostics_zip_redacts_secrets_and_lists_versions(tmp_path: Path) -> None:
+_BEARER = "bearer-token-do-not-leak"
+_JSON_KEY = "json-api-key-secret"
+_ACCESS_KEY = "bili-access-key-value"
+_SIGN = "bili-sign-value"
+_QUERY_KEY = "bili-key-value"
+_CSRF = "bili-csrf-value"
+_ENCODED = "sess-encoded-secret-value"
+_GITHUB = "ghp_githubtokenvalue"
+_SHORT = "z9Q4"
+
+
+def test_diagnostics_zip_redacts_secrets_and_lists_versions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SHORT_API_KEY", _SHORT)
     data_root = tmp_path / "data"
     log_dir = data_root / "logs"
     log_dir.mkdir(parents=True)
@@ -94,9 +110,18 @@ def test_diagnostics_zip_redacts_secrets_and_lists_versions(tmp_path: Path) -> N
             f"SESSDATA={_LOGIN_STATE}",
             f"proxy {_PROXY}",
             "Cookie: LOGIN_INFO=youtube-login-cookie",
+            f"Authorization: Bearer {_BEARER}",
+            f'{{"api_key": "{_JSON_KEY}"}}',
+            f"https://api.bilibili.com/x?access_key={_ACCESS_KEY}&sign={_SIGN}&key={_QUERY_KEY}&csrf={_CSRF}&quality=1080p",
+            f"note SESSDATA%3D{_ENCODED} end",
+            f"token {_GITHUB}",
+            f"saved under {Path.home()}/YouTubeBiliLocalizer",
+            f"short {_SHORT}",
         ]) + "\n",
         encoding="utf-8",
     )
+    (log_dir / "workbench.log.1").write_text("rotation-kept\n", encoding="utf-8")
+    (log_dir / "job-123.log").write_text("job-only-secret-do-not-bundle\n", encoding="utf-8")
     profile = data_root / "data" / "bilibili-profile"
     profile.mkdir(parents=True)
     (profile / "Cookies").write_text(f"SESSDATA={_PROFILE_FILE}\n", encoding="utf-8")
@@ -114,6 +139,8 @@ def test_diagnostics_zip_redacts_secrets_and_lists_versions(tmp_path: Path) -> N
     assert "system.json" in names
     assert "config.env" in names
     assert "logs/workbench.log" in names
+    assert "logs/workbench.log.1" in names
+    assert "logs/job-123.log" not in names
     assert not any("bilibili-profile" in name or name.endswith("Cookies") or name.endswith("cookies.txt") for name in names)
     assert __version__ in system
     assert "app_version" in system
@@ -123,8 +150,16 @@ def test_diagnostics_zip_redacts_secrets_and_lists_versions(tmp_path: Path) -> N
     assert "deepseek-v4-flash" in config
     assert "https://api.openai.com/v1" in config
     assert "crash DEEPSEEK_API_KEY=" in log
-    for secret in (_API_KEY, _OPENAI_KEY, _PROXY, _LOGIN_STATE, _COOKIE_FILE, _PROFILE_FILE, "youtube-login-cookie", "user:password"):
+    for secret in (
+        _API_KEY, _OPENAI_KEY, _PROXY, _LOGIN_STATE, _COOKIE_FILE, _PROFILE_FILE,
+        "youtube-login-cookie", "user:password", _BEARER, _JSON_KEY, _ACCESS_KEY,
+        _SIGN, _QUERY_KEY, _CSRF, _ENCODED, _GITHUB, _SHORT, "job-only-secret-do-not-bundle",
+        str(Path.home()),
+    ):
         assert secret not in blob
+    assert "quality=1080p" in log
+    assert "~/YouTubeBiliLocalizer" in log
+    assert "rotation-kept" in blob
     assert "DEEPSEEK_API_KEY=[redacted]" in config
     assert "YBLOCALIZER_COOKIES_FILE=[redacted]" in config
     assert "YBLOCALIZER_YOUTUBE_PROXY=[redacted]" in config
@@ -153,3 +188,61 @@ def test_diagnostics_export_route_writes_a_redacted_zip(isolated_user_data: Path
         blob = "\n".join(archive.read(name).decode("utf-8") for name in archive.namelist())
     assert _API_KEY not in blob
     assert "logs/workbench.log" in zipfile.ZipFile(archive_path).namelist()
+
+
+def test_file_handler_redacts_secrets_before_they_hit_disk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("YBLOCALIZER_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-from-env-secret")
+    monkeypatch.setenv("SHORT_API_KEY", _SHORT)
+    configure_logging(tmp_path / "logs")
+    try:
+        logging.getLogger("yblocalizer.workbench").error("api key sk-from-env-secret and short %s", _SHORT)
+        try:
+            raise RuntimeError(f"Authorization: Bearer {_BEARER} SESSDATA=sess-in-traceback token {_GITHUB}")
+        except RuntimeError:
+            logging.getLogger("yblocalizer.workbench").exception("阶段失败")
+        text = (tmp_path / "logs" / "workbench.log").read_text(encoding="utf-8")
+    finally:
+        _detach_log_handler()
+
+    assert "sk-from-env-secret" not in text
+    assert _SHORT not in text
+    assert _BEARER not in text
+    assert "sess-in-traceback" not in text
+    assert _GITHUB not in text
+    assert "阶段失败" in text
+
+
+def test_excepthooks_call_the_previous_hook() -> None:
+    main_called: list[str] = []
+    thread_called: list[str] = []
+    old_main = sys.excepthook
+    old_thread = threading.excepthook
+
+    def previous_main(exc_type: type[BaseException], exc: BaseException, tb: object) -> None:
+        main_called.append(type(exc).__name__)
+
+    def previous_thread(args: threading.ExceptHookArgs) -> None:
+        thread_called.append(args.thread.name if args.thread is not None else "")
+
+    sys.excepthook = previous_main
+    threading.excepthook = previous_thread
+    install_excepthooks()
+    try:
+        try:
+            raise RuntimeError("main-chain")
+        except RuntimeError:
+            sys.excepthook(*sys.exc_info())
+
+        def boom() -> None:
+            raise RuntimeError("worker-chain")
+
+        worker = threading.Thread(target=boom, name="hook-chain")
+        worker.start()
+        worker.join()
+    finally:
+        sys.excepthook = old_main
+        threading.excepthook = old_thread
+
+    assert main_called == ["RuntimeError"]
+    assert thread_called == ["hook-chain"]

@@ -46,11 +46,9 @@ def isolated_user_data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("YBLOCALIZER_DATA_DIR", str(root))
 
     import yblocalizer.workbench_api as api
-    from yblocalizer.diagnostics import configure_logging
 
     monkeypatch.setattr(api, "USER_DATA_ROOT", root)
     monkeypatch.setattr(api, "LOG_ROOT", logs)
-    configure_logging(logs)
     monkeypatch.setattr(api, "OUTPUT_ROOT", output)
     monkeypatch.setattr(api, "UPLOAD_ROOT", root / "outputs" / "workbench_uploads")
     from yblocalizer import db as job_db

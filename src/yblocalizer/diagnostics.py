@@ -17,48 +17,54 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import zipfile
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from urllib.parse import unquote
 
 from . import __version__
 
 LOG_NAME = "workbench.log"
-_HANDLER_FLAG = "yblocalizer_log"
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 _MAX_BYTES = 1_048_576
 _BACKUP_COUNT = 3
-_RECENT_LOG_FILES = 8
 _RECENT_LOG_BYTES = 256 * 1024
-_SECRET_VALUE_MIN = 8
+_SECRET_VALUE_MIN = 4
 
 # Names whose values are credentials or login material.
 _SENSITIVE_NAME = re.compile(
-    r"(api[_-]?key|token|password|passwd|secret|cookie|sessdata|bili_jct|dedeuserid|login_info|authorization|proxy)",
+    r"(access_key|api[_-]?key|authorization|bili_jct|cookie|csrf|dedeuserid|"
+    r"login_info|passwd|password|proxy|secret|sessdata|sign|token|key)",
     re.IGNORECASE,
 )
+_BEARER = re.compile(r"(?i)(authorization\s*:\s*bearer\s+)\S+")
 _ASSIGNMENT = re.compile(
-    r"(?i)([\w.-]*(?:api[_-]?key|token|password|passwd|secret|cookie|sessdata|bili_jct|dedeuserid|login_info|authorization|proxy)[\w.-]*)"
-    r"(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|\S+)"
+    r"(?i)([\"']?)([\w.-]*(?:api[_-]?key|authorization|bili_jct|cookie|dedeuserid|"
+    r"login_info|passwd|password|proxy|secret|sessdata|token)[\w.-]*)([\"']?)"
+    r"(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^&\s]+)"
 )
+_QUERY_PARAM = re.compile(
+    r"(?i)([\"']?)(?<![\w])(access_key|csrf|sign|key)(?![\w])([\"']?)"
+    r"(\s*[=:]\s*)(\"[^\"]*\"|'[^']*'|[^&\s]+)"
+)
+_TOKEN_WORD = re.compile(r"(?i)((?<![\w])token\s+)(?!=)(\S+)")
 _URL_USERINFO = re.compile(r"([a-zA-Z][a-zA-Z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@")
-_APP_SECRET_KEYS = (
-    "DEEPSEEK_API_KEY",
-    "OPENAI_API_KEY",
-    "YBLOCALIZER_COOKIES_FILE",
-    "YBLOCALIZER_COOKIES_FROM_BROWSER",
-    "YBLOCALIZER_YOUTUBE_PROXY",
-)
 _PACKAGES = ("yt-dlp", "faster-whisper", "playwright", "pywebview")
-_PROFILE_MARKERS = (
-    "bilibili-profile",
-    "bilibili-edge-profile",
-    "douyin-profile",
-    "douyin-edge-profile",
-    "ms-playwright",
-)
 
-_hooks_installed = False
+
+class _RedactingFilter(logging.Filter):
+    """Strip secrets before a record is written to workbench.log."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        secrets = _secret_values(_env_path())
+        record.msg = redact_text(record.getMessage(), secrets)
+        record.args = None
+        if record.exc_info and record.exc_info[0] is not None:
+            record.exc_text = redact_text("".join(traceback.format_exception(*record.exc_info)), secrets)
+        elif isinstance(record.exc_text, str):
+            record.exc_text = redact_text(record.exc_text, secrets)
+        return True
 
 
 def configure_logging(log_dir: Path) -> None:
@@ -66,22 +72,17 @@ def configure_logging(log_dir: Path) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     path = str((log_dir / LOG_NAME).resolve())
     root = logging.getLogger()
-    for handler in list(root.handlers):
-        if not getattr(handler, _HANDLER_FLAG, False):
-            continue
-        if getattr(handler, "baseFilename", None) == path:
+    for handler in root.handlers:
+        if isinstance(handler, RotatingFileHandler) and handler.baseFilename == path:
             return
-        root.removeHandler(handler)
-        handler.close()
-    others = [item for item in root.handlers if not getattr(item, _HANDLER_FLAG, False)]
     handler = RotatingFileHandler(
         path, maxBytes=_MAX_BYTES, backupCount=_BACKUP_COUNT, encoding="utf-8",
     )
     handler.setFormatter(logging.Formatter(_LOG_FORMAT))
-    setattr(handler, _HANDLER_FLAG, True)
-    root.addHandler(handler)
-    if not others and (root.level == logging.NOTSET or root.level > logging.INFO):
+    handler.addFilter(_RedactingFilter())
+    if not root.handlers:
         root.setLevel(logging.INFO)
+    root.addHandler(handler)
 
 
 def log_unhandled(where: str, exc_type: type[BaseException], exc: BaseException, tb: object) -> None:
@@ -96,18 +97,13 @@ def log_frontend_error(summary: str) -> None:
 
 
 def install_excepthooks() -> None:
-    """Log unhandled exceptions from the main thread and worker threads."""
-    global _hooks_installed
-    if _hooks_installed and getattr(sys.excepthook, "_yblocalizer_crash", False):
-        return
+    """Log unhandled exceptions, then continue with the previous hook."""
     previous = sys.excepthook
 
     def hook(exc_type: type[BaseException], exc: BaseException, tb: object) -> None:
         log_unhandled("主线程", exc_type, exc, tb)
-        if previous is not hook and previous is not sys.__excepthook__:
-            previous(exc_type, exc, tb)
+        previous(exc_type, exc, tb)
 
-    hook._yblocalizer_crash = True  # type: ignore[attr-defined]
     sys.excepthook = hook
 
     previous_thread = threading.excepthook
@@ -115,12 +111,9 @@ def install_excepthooks() -> None:
     def thread_hook(args: threading.ExceptHookArgs) -> None:
         name = args.thread.name if args.thread is not None else ""
         log_unhandled(f"线程 {name}", args.exc_type, args.exc_value, args.exc_traceback)
-        if previous_thread is not thread_hook and previous_thread is not threading.__excepthook__:
-            previous_thread(args)
+        previous_thread(args)
 
-    thread_hook._yblocalizer_crash = True  # type: ignore[attr-defined]
     threading.excepthook = thread_hook
-    _hooks_installed = True
 
 
 def export_diagnostics_zip(data_root: Path, log_dir: Path, dest: Path | None = None) -> Path:
@@ -139,36 +132,54 @@ def export_diagnostics_zip(data_root: Path, log_dir: Path, dest: Path | None = N
         "python": sys.version,
         "dependencies": _dependency_versions(),
     }
-    files = [(path, _read_recent(path)) for path in _recent_logs(log_dir, archive_path)]
+    files = [(path, _read_recent(path)) for path in _recent_logs(log_dir)]
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("system.json", redact_text(json.dumps(system, ensure_ascii=False, indent=2), secrets))
         archive.writestr("config.env", redact_text(_sanitized_config(data_root / ".env"), secrets))
         for path, text in files:
-            archive.writestr(f"logs/{path.name}", redact_text(text, secrets))
+            archive.writestr(f"logs/{path.name}", _hide_home(redact_text(text, secrets)))
     return archive_path
 
 
 def redact_text(text: str, secrets: list[str]) -> str:
+    text = unquote(text)
     for secret in secrets:
         text = text.replace(secret, "[redacted]")
-    text = _ASSIGNMENT.sub(lambda match: f"{match.group(1)}{match.group(2)}[redacted]", text)
+    text = _BEARER.sub(r"\1[redacted]", text)
+    text = _ASSIGNMENT.sub(_redact_assignment, text)
+    text = _QUERY_PARAM.sub(_redact_assignment, text)
+    text = _TOKEN_WORD.sub(r"\1[redacted]", text)
     return _URL_USERINFO.sub(r"\1[redacted]@", text)
+
+
+def _redact_assignment(match: re.Match[str]) -> str:
+    return f"{match.group(1)}{match.group(2)}{match.group(3)}{match.group(4)}[redacted]"
+
+
+def _env_path() -> Path:
+    root = os.environ.get("YBLOCALIZER_DATA_DIR") or str(Path(os.environ.get("APPDATA") or Path.home()) / "YouTubeBiliLocalizer")
+    return Path(root) / ".env"
 
 
 def _secret_values(env_path: Path) -> list[str]:
     values: list[str] = []
-    keys = set(_APP_SECRET_KEYS)
     if env_path.is_file():
         for key, value in _parse_env(env_path):
-            if _SENSITIVE_NAME.search(key):
-                keys.add(key)
+            if value and _SENSITIVE_NAME.search(key):
                 values.append(value)
-    for key in keys:
-        value = os.environ.get(key, "")
-        if value:
+    for key, value in os.environ.items():
+        if value and _SENSITIVE_NAME.search(key):
             values.append(value)
     unique = {value for value in values if len(value) >= _SECRET_VALUE_MIN}
     return sorted(unique, key=len, reverse=True)
+
+
+def _hide_home(text: str) -> str:
+    home = Path.home()
+    for variant in sorted({str(home), home.as_posix()}, key=len, reverse=True):
+        if variant:
+            text = text.replace(variant, "~")
+    return text
 
 
 def _sanitized_config(env_path: Path) -> str:
@@ -199,23 +210,16 @@ def _parse_env(path: Path) -> list[tuple[str, str]]:
     return pairs
 
 
-def _recent_logs(log_dir: Path, archive_path: Path) -> list[Path]:
+def _recent_logs(log_dir: Path) -> list[Path]:
+    """Only the rotating workbench log, not per-job logs."""
     if not log_dir.is_dir():
         return []
-    skip = archive_path.resolve()
-    files: list[Path] = []
-    for path in log_dir.iterdir():
-        if not path.is_file():
-            continue
-        if path.resolve() == skip:
-            continue
-        name = path.name
-        if any(marker in name.lower() for marker in _PROFILE_MARKERS):
-            continue
-        if name == LOG_NAME or name.startswith(f"{LOG_NAME}.") or path.suffix == ".log":
-            files.append(path)
-    files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    return files[:_RECENT_LOG_FILES]
+    files = [
+        path for path in log_dir.iterdir()
+        if path.is_file() and (path.name == LOG_NAME or path.name.startswith(f"{LOG_NAME}."))
+    ]
+    files.sort(key=lambda path: path.name)
+    return files
 
 
 def _read_recent(path: Path) -> str:
