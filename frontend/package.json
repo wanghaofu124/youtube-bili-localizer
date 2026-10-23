@@ -1,7 +1,7 @@
 {
   "name": "yblocalizer-workbench",
   "private": true,
-  "version": "0.2.57",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",

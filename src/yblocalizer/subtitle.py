@@ -94,6 +94,31 @@ def format_segment_text(
     max_chars_per_line: int = 18,
     max_lines: int = 2,
 ) -> str:
+    return _format_segment_parts(segment, display_mode, smart_layout, max_chars_per_line, max_lines)[0]
+
+
+def cue_source_line_counts(
+    segments: list[Segment],
+    display_mode: str,
+    smart_layout: bool = True,
+    max_chars_per_line: int = 18,
+    max_lines: int = 2,
+) -> dict[int, int]:
+    """1-based cue index -> number of source-language lines in that bilingual cue."""
+    return {
+        index: _format_segment_parts(segment, display_mode, smart_layout, max_chars_per_line, max_lines)[1]
+        for index, segment in enumerate(segments, start=1)
+    }
+
+
+def _format_segment_parts(
+    segment: Segment,
+    display_mode: str,
+    smart_layout: bool,
+    max_chars_per_line: int,
+    max_lines: int,
+) -> tuple[str, int]:
+    """Return the cue text and how many of its lines are the bilingual source."""
     source = segment.text.strip()
     translated = segment.final_text.strip()
     bilingual = display_mode in {"bilingual-source-first", "bilingual-translation-first"}
@@ -123,16 +148,14 @@ def format_segment_text(
                 prefer_cjk=_has_cjk(source),
             )
     if display_mode == "source":
-        return source
+        return source, 0
+    two_parts = bool(source and translated and translated != source)
+    source_lines = len(source.splitlines()) if two_parts else 0
     if display_mode == "bilingual-source-first":
-        if not source:
-            return translated
-        return f"{source}\n{translated}" if translated and translated != source else source
+        return (f"{source}\n{translated}" if two_parts else source or translated), source_lines
     if display_mode == "bilingual-translation-first":
-        if not source:
-            return translated
-        return f"{translated}\n{source}" if translated and translated != source else translated
-    return translated
+        return (f"{translated}\n{source}" if two_parts else translated), source_lines
+    return translated, 0
 
 
 def translated_layout_issues(
@@ -196,7 +219,7 @@ def _layout_bilingual_pair(
                 source,
                 duration=duration,
                 max_chars_per_line=latin_one_line,
-                max_lines=1,
+                max_lines=2,
                 prefer_cjk=_has_cjk(source),
             ),
         )

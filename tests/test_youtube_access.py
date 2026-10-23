@@ -21,6 +21,7 @@ from yblocalizer.download import (
     _quarantine_below_resolution,
     _quality_proposal,
     _raise_with_youtube_hint,
+    _fetch_range,
     _range_download,
     _RangeDownloadUnavailable,
     _youtube_access_opts,
@@ -763,6 +764,47 @@ def test_hd_formats_missing_url_flags_rejected_token(
     assert _hd_formats_missing_url(low_only) is False
 
 
+def test_fetch_range_rejects_curl_failure_with_partial_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """curl 超时或失败时，已经落下的半截响应不能当作成功的 Range 块。"""
+
+    def fake_run(command, **_kwargs):
+        Path(command[command.index("-o") + 1]).write_bytes(b"partial-bytes")
+        header = (
+            "HTTP/1.1 206 Partial Content\r\n"
+            "Content-Range: bytes 0-99/1000\r\n"
+            "\r\n"
+        ).encode()
+        return SimpleNamespace(returncode=28, stdout=header, stderr=b"Operation timed out")
+
+    monkeypatch.setattr("yblocalizer.download.shutil.which", lambda _name: "curl")
+    monkeypatch.setattr("yblocalizer.download.subprocess.run", fake_run)
+
+    with pytest.raises(RuntimeError, match="退出码 28"):
+        _fetch_range("https://example.test/media", 0, 99, {})
+
+
+def test_range_download_rejects_short_file_when_total_is_known(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """已知总长度时，短于期望的分块结果必须报错，不能把 .part 改名为成品。"""
+
+    def short_fetch(url, start, end, headers, proxy=None):
+        return b"abc", 1000
+
+    monkeypatch.setattr("yblocalizer.download._fetch_range", short_fetch)
+    monkeypatch.setattr("yblocalizer.download._RANGE_BLOCK_SIZE", 100)
+    monkeypatch.setattr("yblocalizer.download._RANGE_MIN_BLOCK", 1)
+
+    dest = tmp_path / "media.mp4"
+    with pytest.raises(RuntimeError, match="分块下载不完整"):
+        _range_download(
+            "https://example.test/media", dest, headers={}, expected_size=1000,
+            check=lambda: None,
+        )
+
+    assert not dest.exists()
+
+
 def test_range_download_honours_byte_limit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """前缀下载必须在字节上限处停下，而不是把整片拉下来。"""
     payload = bytes(range(64))
@@ -802,3 +844,58 @@ def test_prefix_download_requires_duration(tmp_path: Path) -> None:
     with pytest.raises(_RangeDownloadUnavailable):
         _download_prefix_with_ranges(FakeYdl(), "https://example.test/v", tmp_path, 10,
                                      check=lambda: None)
+
+
+def test_prefix_download_muxes_with_resolved_ffmpeg_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """前缀分块下载要拿到 ffmpeg 的真实路径，而不是 require_command 的 None。"""
+
+    class FakeYdl:
+        def extract_info(self, _url, download):
+            return {"id": "demo", "duration": 100, "requested_formats": [
+                {"format_id": "399", "ext": "mp4", "url": "https://x/399", "filesize": 10_000_000},
+                {"format_id": "140", "ext": "m4a", "url": "https://x/140", "filesize": 1_000_000},
+            ]}
+
+        def process_video_result(self, info, download):
+            return info
+
+    ffmpeg = tmp_path / "ffmpeg.exe"
+    commands: list[list] = []
+
+    def fake_range(_url, destination, **_kwargs):
+        destination.write_bytes(b"x" * 4096)
+        return 4096
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        Path(command[-1]).write_bytes(b"x" * 4096)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("yblocalizer.download._range_download", fake_range)
+    monkeypatch.setattr("yblocalizer.download.resolve_command", lambda name: ffmpeg if name == "ffmpeg" else None)
+    monkeypatch.setattr("yblocalizer.download.subprocess.run", fake_run)
+
+    _download_prefix_with_ranges(FakeYdl(), "https://example.test/v", tmp_path, 10, check=lambda: None)
+
+    assert commands and commands[0][0] == ffmpeg
+
+
+def test_range_prefix_logs_success(tmp_path: Path, monkeypatch) -> None:
+    class FakeYdl:
+        def extract_info(self, _url, download):
+            return {"id": "demo", "duration": 100, "requested_formats": [
+                {"format_id": "140", "ext": "m4a", "url": "https://x/140", "filesize": 1_000_000}]}
+
+        def process_video_result(self, info, download):
+            return info
+
+    def fake_run(command, **_kwargs):
+        Path(command[-1]).write_bytes(b"x" * 4096)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("yblocalizer.download._range_download", lambda _url, destination, **_k: destination.write_bytes(b"x"))
+    monkeypatch.setattr("yblocalizer.download.resolve_command", lambda name: "ffmpeg")
+    monkeypatch.setattr("yblocalizer.download.subprocess.run", fake_run)
+    messages = []
+    _download_prefix_with_ranges(FakeYdl(), "https://example.test/v", tmp_path, 10, check=lambda: None, log=messages.append)
+    assert any("前缀分片下载完成" in m and "10" in m for m in messages)

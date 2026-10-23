@@ -15,6 +15,8 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from . import dependencies
+from .asr_prompt import build_initial_prompt
+from .glossary import load_glossary
 from .asr_review import prepare_session, resolve_review_language, session_path
 from .download import download_with_ytdlp, import_local_video
 from .media import extract_audio
@@ -25,7 +27,7 @@ from .publish_bili import assist_publish
 from .publish_text import ensure_source_link
 from .render import burn_subtitles, subtitle_line_capacity
 from .runtime import CancellationRequested, PipelineContext, PipelineStage
-from .subtitle import format_srt_timestamp, read_srt_segments, translated_layout_issues, write_srt
+from .subtitle import cue_source_line_counts, format_srt_timestamp, read_srt_segments, translated_layout_issues, write_srt
 from .subtitle_continuity import coalesce_incomplete_source_cues, segments_content_equal
 from .subtitle_merge import merge_audio_ocr_segments
 from .subtitle_resegment import resegment_source_segments
@@ -50,17 +52,20 @@ from .util import ensure_rights_confirmed
 
 
 WORKFLOW_VERSION = 2
-WORKFLOW_STAGES = ("acquire", "extract", "translate", "render", "publish")
+# Stages that must all complete for a finished job; dub and publish are optional.
+CORE_STAGES = ("acquire", "extract", "translate", "render")
+WORKFLOW_STAGES = (*CORE_STAGES, "dub", "publish")
 STAGE_LABELS = {
     "acquire": "获取素材", "extract": "字幕提取", "translate": "翻译",
-    "render": "渲染", "publish": "发布辅助",
+    "render": "渲染", "dub": "配音", "publish": "发布辅助",
 }
-STAGE_PROGRESS = {"acquire": 8, "extract": 28, "translate": 62, "render": 84, "publish": 96}
+STAGE_PROGRESS = {"acquire": 8, "extract": 28, "translate": 62, "render": 84, "dub": 90, "publish": 96}
 CONFIG_INVALIDATION: tuple[tuple[frozenset[str], str], ...] = (
     (frozenset({"source", "source_kind", "output_dir", "cookies_from_browser", "cookies_file", "youtube_po_token_mode", "youtube_proxy", "download_quality", "max_seconds", "require_reuse_allowed", "prefer_platform_subtitles"}), "acquire"),
-    (frozenset({"subtitle_source", "ocr_fallback_to_audio", "whisper_model_size", "source_language", "beam_size", "device", "compute_type", "ocr_interval", "ocr_crop_ratio", "ocr_min_chars", "ocr_language", "audio_channel"}), "extract"),
+    (frozenset({"subtitle_source", "ocr_fallback_to_audio", "whisper_model_size", "source_language", "beam_size", "device", "compute_type", "ocr_interval", "ocr_crop_ratio", "ocr_min_chars", "ocr_language", "audio_channel", "asr_hint", "asr_vad_mode"}), "extract"),
     (frozenset({"translator", "target_lang", "translate_model", "batch_size", "smart_translation", "smart_subtitle_layout"}), "translate"),
-    (frozenset({"font_name", "font_size", "subtitle_display_mode", "subtitle_color", "subtitle_outline_color", "subtitle_outline", "subtitle_shadow", "subtitle_margin_ratio", "render_crf", "render_encoder"}), "render"),
+    (frozenset({"font_name", "font_size", "subtitle_display_mode", "subtitle_color", "subtitle_outline_color", "subtitle_outline", "subtitle_shadow", "subtitle_margin_ratio", "subtitle_preset", "render_crf", "render_encoder"}), "render"),
+    (frozenset({"dub_enabled", "dub_mix"}), "dub"),
     (frozenset({"title", "description", "tags", "publish_to_bilibili", "include_source_link", "bilibili_browser", "close_after_fill"}), "publish"),
 )
 
@@ -84,6 +89,8 @@ class WorkflowArtifacts:
     llm_usage_index_path: str | None = None
     llm_usage_total: dict[str, Any] | None = None
     rendered_video: str | None = None
+    dub_video: str | None = None
+    dub_report: str | None = None
     title: str | None = None
     description: str = ""
     source: str = ""
@@ -116,7 +123,7 @@ class WorkflowArtifacts:
 
     def public_summary(self) -> dict[str, dict[str, Any]]:
         output: dict[str, dict[str, Any]] = {}
-        for name in ("original_video", "raw_video", "audio", "asr_evidence", "asr_review", "subtitle_commit", "platform_subtitles", "source_segments", "source_srt", "translated_segments", "translated_srt", "publish_metadata", "rendered_video", "thumbnail_path"):
+        for name in ("original_video", "raw_video", "audio", "asr_evidence", "asr_review", "subtitle_commit", "platform_subtitles", "source_segments", "source_srt", "translated_segments", "translated_srt", "publish_metadata", "rendered_video", "dub_video", "dub_report", "thumbnail_path"):
             path = self.path(name)
             output[name] = {
                 "available": bool(path and path.is_file()),
@@ -558,6 +565,7 @@ def run_extract(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx:
     raw_video = artifacts.path("raw_video")
     if not raw_video or not validate_media(raw_video, "video"):
         raise RuntimeError("原视频检查点无效，请先重新获取素材。")
+    glossary = load_glossary(work_dir)
     work_dir = _attempt_dir(work_dir, "extract")
     source_segments, source_srt = work_dir / "segments.source.json", work_dir / "source.srt"
     audio: Path | None = artifacts.path("audio")
@@ -597,13 +605,27 @@ def run_extract(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx:
             return copied
         source_audio = ensure_audio()
         evidence_path = target_json.with_name(target_json.stem + ".asr-evidence.json")
+        vad_mode = str(getattr(options, "asr_vad_mode", "standard") or "standard")
+        initial_prompt = build_initial_prompt(
+            getattr(options, "title", None),
+            getattr(options, "description", None),
+            getattr(options, "tags", None),
+            getattr(options, "asr_hint", None),
+            glossary=glossary,
+        )
+        if initial_prompt:
+            log(f"识别提示：{initial_prompt}")
+        else:
+            log("识别提示：未使用。标题、简介和标签里没有可用专名，也没有手写提示。")
+        log("人声检测：敏感。更早保留风声和水声里的说话，句首多留一点。" if vad_mode == "sensitive" else "人声检测：标准。")
         result = transcribe_audio(
             source_audio, segments_json=target_json, srt_path=target_srt,
             model_size=options.whisper_model_size, language=options.source_language,
-            device=options.device, compute_type=options.compute_type, initial_prompt=None,
+            device=options.device, compute_type=options.compute_type, initial_prompt=initial_prompt,
             beam_size=options.beam_size, log=log, cancel_check=ctx.check_cancelled,
             resource_profile=options.resource_profile,
             evidence_path=evidence_path,
+            vad_mode=vad_mode,
         )
         artifacts.asr_evidence = str(evidence_path)
         try:
@@ -742,6 +764,8 @@ def run_translate(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ct
     source_segments = artifacts.path("source_segments")
     if not source_segments or not validate_segments(source_segments):
         raise RuntimeError("源字幕检查点无效，请先重新提取字幕。")
+    glossary = load_glossary(work_dir)
+    log(f"术语表：{len(glossary)} 条。" if glossary else "术语表：未使用。")
     work_dir = _attempt_dir(work_dir, "translate")
     extracted_items = load_segments(source_segments)
     configured_source_language = str(options.source_language or "").strip() or None
@@ -823,6 +847,7 @@ def run_translate(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ct
                     checkpoint_path=_seed_attempt_checkpoint(work_dir, "source_correction_checkpoint.json"),
                     log=log,
                     deepseek_thinking=getattr(options, "deepseek_thinking", "disabled"),
+                    glossary=glossary,
                 )
             except CancellationRequested:
                 raise
@@ -951,6 +976,7 @@ def run_translate(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ct
                 checkpoint_path=_seed_attempt_checkpoint(work_dir, "source_correction_checkpoint.json"),
                 log=log,
                 deepseek_thinking=getattr(options, "deepseek_thinking", "disabled"),
+                glossary=glossary,
             )
             if corrected:
                 source_items = corrected
@@ -989,6 +1015,7 @@ def run_translate(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ct
         log=log,
         source_lang=effective_source_language,
         deepseek_thinking=getattr(options, "deepseek_thinking", "disabled"),
+        glossary=glossary,
     )
     dense_count = subtitle_density_overflow_count(translated_items)
     if dense_count:
@@ -1326,6 +1353,11 @@ def run_render(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx: 
             progress=encoding_progress,
             cue_font_sizes=cue_font_sizes,
             expected_cue_count=len(translated_items) if translated_items else None,
+            display_mode=options.subtitle_display_mode,
+            subtitle_preset=getattr(options, "subtitle_preset", "soft"),
+            cue_source_lines=cue_source_line_counts(
+                translated_items, options.subtitle_display_mode, options.smart_subtitle_layout,
+            ) if translated_items else None,
         )
         ctx.check_cancelled()
         log("编码完成，正在验证成片文件。")
@@ -1408,7 +1440,31 @@ def run_publish(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx:
     return artifacts
 
 
-STAGE_RUNNERS = {"acquire": run_acquire, "extract": run_extract, "translate": run_translate, "render": run_render, "publish": run_publish}
+def run_dub(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx: PipelineContext, log: Callable[[str], None], progress: Callable[[float], None] | None = None) -> WorkflowArtifacts:
+    """Optional VoxCPM dub after render; the subtitled render is left untouched."""
+    del progress
+    if not getattr(options, "dub_enabled", False):
+        log("配音未开启，阶段已跳过。")
+        return artifacts
+    from .dub import dub_video, llm_rewrite
+    status = dependencies.voxcpm_status(options.voxcpm_python, options.voxcpm_model_dir)
+    if not status["voxcpm_available"]:
+        raise RuntimeError(f"配音不可用：{status['voxcpm_reason']}")
+    rendered = artifacts.path("rendered_video")
+    segments_path = artifacts.path("translated_segments")
+    if not rendered or not segments_path:
+        raise RuntimeError("配音需要先完成翻译和渲染。")
+    ctx.check_cancelled(); _emit(ctx, PipelineStage.DUBBING, 90, "正在生成配音", log)
+    output, report = dub_video(
+        rendered, load_segments(segments_path), work_dir,
+        python=options.voxcpm_python, model_dir=options.voxcpm_model_dir, mix_mode=options.dub_mix,
+        log=log, cancel_check=ctx.is_cancelled, rewrite=llm_rewrite(options),
+    )
+    artifacts.dub_video, artifacts.dub_report = str(output) if output else None, str(report)
+    return artifacts
+
+
+STAGE_RUNNERS = {"acquire": run_acquire, "extract": run_extract, "translate": run_translate, "render": run_render, "dub": run_dub, "publish": run_publish}
 
 
 def run_stage(name: str, options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx: PipelineContext, log: Callable[[str], None], progress: Callable[[float], None] | None = None) -> WorkflowArtifacts:
@@ -1418,7 +1474,7 @@ def run_stage(name: str, options: Any, work_dir: Path, artifacts: WorkflowArtifa
         raise ValueError(f"Unknown workflow stage: {name}") from exc
     work_dir.mkdir(parents=True, exist_ok=True)
     result = runner(options, work_dir, artifacts, ctx, log, progress)
-    if name in WORKFLOW_STAGES[:4] and not validate_stage(name, result):
+    if name in CORE_STAGES and not validate_stage(name, result):
         raise RuntimeError(
             f"{STAGE_LABELS[name]}产物校验失败，未保存为完成检查点；"
             "已完成的其他阶段与原有文件均保留。"
@@ -1436,7 +1492,7 @@ def validate_media(path: Path, kind: str = "video") -> bool:
     try:
         result = subprocess.run(
             [str(ffprobe), "-v", "error", "-select_streams", selector, "-show_entries", "stream=index", "-of", "json", str(path)],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
         )
         return result.returncode == 0 and bool((json.loads(result.stdout).get("streams") or []))
     except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):

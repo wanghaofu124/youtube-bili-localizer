@@ -1,1 +1,0 @@
-sample_id,video_code,start_sec,end_sec,blind_system_id,source_condition,source_text,human_reference_translation,system_translation,fidelity_1to5,completeness_1to5,terminology_1to5,naturalness_1to5,error_type,severity,reviewer,adjudication,notes

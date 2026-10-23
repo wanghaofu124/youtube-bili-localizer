@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { publishStageButton, sameTaskOption, stageAvailability, workflowPrimaryLabel } from "./workflowState";
+import { publishStageButton, sameTaskOption, stageAvailability, workflowPrimaryLabel, type StageName } from "./workflowState";
 import { retainVisibleVideoLibrarySelection, selectableVideoLibraryIds, videoLibraryCategory, videoLibraryMatches, type VideoLibraryCategory } from "./videoLibrary";
 import { cueNeedsReview, replaceLiteral } from "./subtitleEditor";
 import { TutorialModal, type TutorialAction } from "./TutorialModal";
@@ -16,7 +16,7 @@ const readTutorialDismissed = () => {
     return false;
   }
 };
-type WorkflowStageName = "acquire" | "extract" | "translate" | "render" | "publish";
+type WorkflowStageName = StageName;
 type RecoveryAction = {
   id: "retry_extract_with_lower_resource";
   stage: WorkflowStageName;
@@ -148,6 +148,7 @@ type Job = {
     source_srt: string;
     translated_srt: string;
     rendered_video: string;
+    dub_video?: string;
   } | null;
   material: Material;
   device: string;
@@ -194,12 +195,16 @@ type Options = {
   source_language: string;
   audio_channel: "mix" | "left" | "right";
   beam_size: number;
+  asr_hint: string;
+  asr_vad_mode: "standard" | "sensitive";
   ocr_interval: number;
   ocr_crop_ratio: number;
   ocr_min_chars: number;
   ocr_language: string;
   subtitle_margin_ratio: number;
   render_crf: number;
+  dub_enabled?: boolean;
+  dub_mix?: "duck" | "dub_only";
   render_encoder: "auto" | "cpu" | "nvidia";
   resource_profile: "background" | "balanced" | "maximum";
   translator: string;
@@ -213,6 +218,7 @@ type Options = {
   font_name: string;
   font_size: number;
   subtitle_display_mode: string;
+  subtitle_preset: string;
   subtitle_color: string;
   subtitle_outline_color: string;
   subtitle_effect: string;
@@ -270,6 +276,8 @@ type HistoryJob = {
   rendered_video: string | null;
   output_exists: boolean;
   rendered_exists: boolean;
+  dub_video?: string | null;
+  dub_exists?: boolean;
   created_at: number | null;
   finished_at: number | null;
   llm_usage_total?: LlmUsage | null;
@@ -362,6 +370,8 @@ const defaults: Options = {
   source_language: "",
   audio_channel: "mix",
   beam_size: 5,
+  asr_hint: "",
+  asr_vad_mode: "standard",
   ocr_interval: 0.5,
   ocr_crop_ratio: 0.3,
   ocr_min_chars: 3,
@@ -381,6 +391,7 @@ const defaults: Options = {
   font_name: "Microsoft YaHei",
   font_size: 24,
   subtitle_display_mode: "translated",
+  subtitle_preset: "soft",
   subtitle_color: "白色",
   subtitle_outline_color: "黑色",
   subtitle_effect: "描边",
@@ -585,6 +596,9 @@ const workflowStageMeta: Array<[WorkflowStageName, string, string]> = [
   ["render", "渲染", "使用 FFmpeg 生成 SRT 与硬字幕成片。"],
   ["publish", "发布辅助", "可选；上传并填表，始终停在人工提交前。"],
 ];
+// 后端的 VoxCPM 刷新接口定下来后只改这里。
+const VOXCPM_CHECK_URL = "/api/dub/recheck";
+const dubStageMeta: [WorkflowStageName, string, string] = ["dub", "配音", "用 VoxCPM 生成中文配音，另存 *_dub.mp4；字幕版成片照常保留。"];
 const whisperModelOrder = ["tiny", "base", "small", "medium", "large-v3"] as const;
 const stageStatusLabel: Record<string, string> = {
   pending: "待执行", ready: "可执行", running: "运行中", completed: "已完成",
@@ -601,6 +615,31 @@ const fileIconName = (kind: string, name = ""): NavIconName => {
 
 function FieldGuide({ summary, detail, badges = [] }: { summary: string; detail: string; badges?: string[] }) {
   return <span className="field-guide"><small>{summary}</small><span className="guide-badges">{badges.map((badge) => <i key={badge}>{badge}</i>)}</span><details><summary>？ 选择建议与影响</summary><p>{detail}</p></details></span>;
+}
+
+function AsrRecognitionFields({ options, onHint, onVad, hintError }: {
+  options: Options;
+  onHint: (value: string) => void;
+  onVad: (value: Options["asr_vad_mode"]) => void;
+  hintError?: string;
+}) {
+  const ocrOnly = options.subtitle_source === "ocr";
+  return <>
+    <label>
+      人声检测
+      <select value={options.asr_vad_mode || "standard"} disabled={ocrOnly} onChange={(event) => onVad(event.target.value as Options["asr_vad_mode"])}>
+        <option value="standard">标准</option>
+        <option value="sensitive">敏感（户外噪声）</option>
+      </select>
+      <FieldGuide summary="标准去掉长静音后再补回像有人声、但还没识别到的区间。" detail="敏感会更早把风声、水声里的说话当成语音，并在句首多留一点。风声和水声也可能被收进来。纯 OCR 不用这项。改完后需要重新提取字幕。" badges={options.asr_vad_mode === "sensitive" ? ["可能多收噪声"] : ["当前行为"]} />
+    </label>
+    <label className="settings-span-2">
+      识别提示
+      <input value={options.asr_hint || ""} disabled={ocrOnly} maxLength={240} placeholder="可选，例如 tarpon, ballyhoo, pompano jig" onChange={(event) => onHint(event.target.value)} />
+      {hintError && <small className="field-error">{hintError}</small>}
+      <FieldGuide summary="留空时，只从标题、简介和标签里取专名，不用先听片。" detail="手写词会追加在自动专名后面，用来偏向鱼名、地名这类听不清就猜错的词。使用平台字幕时不会发给 Whisper。改完后需要重新提取字幕。" badges={["可选"]} />
+    </label>
+  </>;
 }
 
 function ActivityBars() {
@@ -681,6 +720,48 @@ function externalAiConfirmation(disclosure: ExternalAiDisclosure): boolean {
     "确认后仅允许当前请求发送；取消不会启动或修改任务。",
   ].join("\n"));
 }
+
+type BatchEntry = { url: string; title: string; duration?: number | null; error?: string; selected: boolean };
+type BatchItem = { id: string; url: string; title: string; job_id: string | null; status: "pending" | "running" | "done" | "failed" | "cancelled"; error: string | null; stage: string | null; progress: number | null };
+type BatchQueue = { items: BatchItem[]; active: boolean };
+
+type GlossaryEntry = { source: string; target: string; note: string; aliases: string[] };
+type GlossaryRow = { key: number; source: string; target: string; aliases: string; note: string; dirty: boolean; saved: boolean };
+let glossaryKey = 0;
+const toGlossaryRow = (entry: Partial<GlossaryEntry>, dirty = false): GlossaryRow => ({
+  key: ++glossaryKey, source: entry.source ?? "", target: entry.target ?? "", aliases: (entry.aliases ?? []).join(", "), note: entry.note ?? "", dirty, saved: !dirty,
+});
+const fromGlossaryRow = (row: GlossaryRow): GlossaryEntry => ({
+  source: row.source.trim(), target: row.target.trim(), note: row.note.trim(), aliases: row.aliases.split(/[,，]/).map((alias) => alias.trim()).filter(Boolean),
+});
+const glossaryMatchKey = (source: string) => source.trim().split(/\s+/).join(" ").toLowerCase();
+const parseCsvLine = (line: string) => {
+  const cells: string[] = [];
+  let cell = "", quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quoted && ch === '"' && line[i + 1] === '"') { cell += '"'; i++; }
+    else if (ch === '"') quoted = !quoted;
+    else if (ch === "," && !quoted) { cells.push(cell); cell = ""; }
+    else cell += ch;
+  }
+  return [...cells, cell];
+};
+const parseGlossaryCsv = (text: string): GlossaryEntry[] => {
+  const [head, ...rows] = text.trim().split(/\r?\n/).map(parseCsvLine);
+  const cell = (row: string[], name: string) => (row[head.indexOf(name)] ?? "").trim();
+  return rows.map((row) => ({ source: cell(row, "source"), target: cell(row, "target"), note: cell(row, "note"), aliases: cell(row, "aliases").split(";").map((alias) => alias.trim()).filter(Boolean) }));
+};
+const csvCell = (value: string) => /[",\r\n]/.test(value) ? `"${value.replaceAll('"', '""')}"` : value;
+const glossaryCsv = (entries: GlossaryEntry[]) => ["source,target,aliases,note", ...entries.map((entry) => [entry.source, entry.target, entry.aliases.join(";"), entry.note].map(csvCell).join(","))].join("\r\n");
+const downloadText = (name: string, text: string, type: string) => {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = name;
+  link.click();
+  URL.revokeObjectURL(url);
+};
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const form = options?.body instanceof FormData;
@@ -808,6 +889,25 @@ function App() {
   const [device, setDevice] = useState("cuda");
   const [computeType, setComputeType] = useState("float16");
   const [options, setOptions] = useState<Options>(defaults);
+  const [batchMode, setBatchMode] = useState(false);
+  const [batchText, setBatchText] = useState("");
+  const [batchEntries, setBatchEntries] = useState<BatchEntry[]>([]);
+  const [batchQualityConsent, setBatchQualityConsent] = useState(false);
+  const [batchDub, setBatchDub] = useState(false);
+  const [voxcpm, setVoxcpm] = useState<{ voxcpm_available?: boolean; voxcpm_reason?: string; voxcpm_help?: string }>({});
+  const [checkingVoxcpm, setCheckingVoxcpm] = useState(false);
+  const recheckVoxcpm = async () => {
+    setCheckingVoxcpm(true);
+    try {
+      const { voxcpm_available, voxcpm_reason, voxcpm_help } = await api<typeof voxcpm>(VOXCPM_CHECK_URL, { method: "POST" });
+      setVoxcpm({ voxcpm_available, voxcpm_reason, voxcpm_help });
+    } finally {
+      setCheckingVoxcpm(false);
+    }
+  };
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [batchQueue, setBatchQueue] = useState<BatchItem[]>([]);
+  const [batchSummaryDismissed, setBatchSummaryDismissed] = useState(false);
   const [appVersion, setAppVersion] = useState("");
   const [demoPreview, setDemoPreview] = useState(false);
   const [job, setJob] = useState<Job | null>(null);
@@ -842,12 +942,114 @@ function App() {
   const [compactionCandidates, setCompactionCandidates] = useState<CompactionCandidate[]>([]);
   const [retranslatingCueId, setRetranslatingCueId] = useState<number | null>(null);
   const [compactingCues, setCompactingCues] = useState(false);
-  const [preview, setPreview] = useState<"source" | "rendered">("source");
+  const [preview, setPreview] = useState<"source" | "rendered" | "dub">("source");
+  const dubSettings = (
+    <section className="settings-section dub-section">
+      <header className="settings-group-heading"><NavIcon name="voice" className="app-icon" /><span><b>配音</b><small>可选：渲染后用 VoxCPM 生成中文配音，另存 *_dub.mp4</small></span></header>
+      <div className={`settings-grid settings-fold-body compact ${voxcpm.voxcpm_available ? "" : "is-disabled"}`}>
+        <label className="check settings-check">
+          <input type="checkbox" checked={!!options.dub_enabled} disabled={!voxcpm.voxcpm_available} onChange={(event) => updateOptions("dub_enabled", event.target.checked)} />
+          生成配音版（*_dub.mp4）
+        </label>
+        <label>
+          混音模式
+          <select value={options.dub_mix ?? "duck"} disabled={!voxcpm.voxcpm_available} onChange={(event) => updateOptions("dub_mix", event.target.value as Options["dub_mix"])}>
+            <option value="duck">压低原声、保留背景（推荐）</option>
+            <option value="dub_only">只留配音</option>
+          </select>
+        </label>
+      {voxcpm.voxcpm_available
+        ? <small className="check-hint">字幕版成片照常保留，配音版单独输出。</small>
+        : <div className="dub-unavailable"><b>VoxCPM 不可用：</b>{voxcpm.voxcpm_reason || "未检测到 VoxCPM。"}{voxcpm.voxcpm_help && <span className="dub-help">{voxcpm.voxcpm_help}</span>}</div>}
+        <button type="button" className="settings-link-button" onClick={() => void recheckVoxcpm()} disabled={checkingVoxcpm}>{checkingVoxcpm ? "检测中…" : "重新检测"}</button>
+      </div>
+    </section>
+  );
   const [mediaNonce, setMediaNonce] = useState(0);
   const [mediaDuration, setMediaDuration] = useState<number | null>(null);
   const [online, setOnline] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [glossaryOpen, setGlossaryOpen] = useState(false);
+  const [glossaryRows, setGlossaryRows] = useState<GlossaryRow[]>([]);
+  const [glossaryRemoved, setGlossaryRemoved] = useState(0);
+  const [glossaryQuery, setGlossaryQuery] = useState("");
+  const [glossaryCount, setGlossaryCount] = useState<number | null>(null);
+  const [glossaryNote, setGlossaryNote] = useState("");
+  const glossaryFileRef = useRef<HTMLInputElement>(null);
+  useEffect(() => { api<{ entries: GlossaryEntry[] }>("/api/glossary").then((result) => setGlossaryCount(result.entries.length)).catch(() => undefined); }, []);
+  const glossaryUnsaved = glossaryRows.filter((row) => row.dirty).length + glossaryRemoved;
+  const glossaryDuplicates = new Set(glossaryRows.map((row) => glossaryMatchKey(row.source)).filter((key, index, keys) => key && keys.indexOf(key) !== index));
+  const loadGlossary = (entries: GlossaryEntry[]) => {
+    setGlossaryRows(entries.map((entry) => toGlossaryRow(entry)));
+    setGlossaryCount(entries.length);
+    setGlossaryRemoved(0);
+  };
+  const openGlossary = async () => {
+    loadGlossary((await api<{ entries: GlossaryEntry[] }>("/api/glossary")).entries);
+    setGlossaryQuery("");
+    setGlossaryNote("");
+    setGlossaryOpen(true);
+  };
+  const closeGlossary = () => {
+    if (glossaryUnsaved && !window.confirm("术语表有未保存的改动，确定放弃吗？")) return;
+    setGlossaryOpen(false);
+  };
+  const saveGlossary = async () => {
+    const entries = glossaryRows.map(fromGlossaryRow);
+    const clearing = !entries.some((entry) => entry.source.trim());
+    if (clearing && !window.confirm("确认清空术语表？此操作会删除全部术语。")) return;
+    loadGlossary((await api<{ entries: GlossaryEntry[] }>("/api/glossary", { method: "POST", body: JSON.stringify({ entries, ...(clearing ? { confirmed: true } : {}) }) })).entries);
+    setGlossaryNote(clearing ? "已清空术语表。" : "已保存。已完成翻译的任务再次载入时会提示重新翻译。");
+  };
+  const clearGlossary = async () => {
+    if (!window.confirm("确认清空术语表？此操作会删除全部术语。")) return;
+    loadGlossary((await api<{ entries: GlossaryEntry[] }>("/api/glossary", { method: "POST", body: JSON.stringify({ entries: [], confirmed: true }) })).entries);
+    setGlossaryNote("已清空术语表。");
+  };
+  const updateGlossaryRow = (key: number, patch: Partial<GlossaryRow>) => setGlossaryRows((rows) => rows.map((row) => row.key === key ? { ...row, ...patch, dirty: true } : row));
+  const removeGlossaryRow = (row: GlossaryRow) => {
+    setGlossaryRows((rows) => rows.filter((item) => item.key !== row.key));
+    if (row.saved) setGlossaryRemoved((count) => count + 1);
+  };
+  const importGlossary = async (file: File) => {
+    let entries: GlossaryEntry[];
+    try {
+      const text = (await file.text()).replace(/^\uFEFF/, "");
+      const data = file.name.toLowerCase().endsWith(".csv") ? parseGlossaryCsv(text) : JSON.parse(text);
+      entries = Array.isArray(data) ? data : data.entries;
+      if (!Array.isArray(entries)) throw new Error("缺少 entries 列表");
+    } catch (error) {
+      setGlossaryNote(`导入失败：${file.name} 不是有效的 JSON / CSV（${error}）`);
+      return;
+    }
+    const valid = entries.filter((entry) => String(entry.source ?? "").trim());
+    if (valid.length === 0) {
+      if (!window.confirm("导入内容为空，确认清空术语表？")) return;
+      loadGlossary((await api<{ entries: GlossaryEntry[] }>("/api/glossary", { method: "POST", body: JSON.stringify({ entries: [], confirmed: true }) })).entries);
+      setGlossaryNote(`已导入 ${file.name}：术语表已清空。`);
+      return;
+    }
+    const rows = [...glossaryRows];
+
+    let replaced = 0, added = 0;
+    for (const entry of entries) {
+      const key = glossaryMatchKey(String(entry.source ?? ""));
+      if (!key) continue;
+      const row = toGlossaryRow(fromGlossaryRow(toGlossaryRow(entry)), true);
+      const index = rows.findIndex((item) => glossaryMatchKey(item.source) === key);
+      if (index >= 0) { rows[index] = { ...row, key: rows[index].key, source: rows[index].source, saved: rows[index].saved }; replaced++; }
+      else { rows.push(row); added++; }
+    }
+    setGlossaryRows(rows);
+    setGlossaryQuery("");
+    setGlossaryNote(`已导入 ${file.name}：覆盖 ${replaced} 条，新增 ${added} 条。点「保存术语表」后才会生效。`);
+  };
+  const exportGlossary = (format: "json" | "csv") => {
+    const entries = glossaryRows.map(fromGlossaryRow).filter((entry) => entry.source);
+    if (format === "csv") downloadText("glossary.csv", "\uFEFF" + glossaryCsv(entries), "text/csv;charset=utf-8");
+    else downloadText("glossary.json", JSON.stringify(entries, null, 2), "application/json");
+  };
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
   const [tutorialOpen, setTutorialOpen] = useState(false);
   const [preferencesLoading, setPreferencesLoading] = useState(true);
@@ -859,6 +1061,8 @@ function App() {
   const [apiKey, setApiKey] = useState("");
   const [savingSettings, setSavingSettings] = useState(false);
   const savingSettingsRef = useRef(false);
+  const [exportingDiagnostics, setExportingDiagnostics] = useState(false);
+  const [diagnosticsNote, setDiagnosticsNote] = useState("");
   const [message, setMessage] = useState("正在连接本地服务…");
   const [metadata, setMetadata] = useState<{
     duration: number | null;
@@ -1021,7 +1225,7 @@ function App() {
   const previewSrc = demoPreview
     ? `/api/demo/rendered?v=${mediaNonce || "demo"}`
     : job
-    ? `/api/jobs/${job.id}/media/${preview === "rendered" && job.result ? "rendered" : "source"}?v=${mediaNonce || job.stages?.render?.finished_at || "0"}`
+    ? `/api/jobs/${job.id}/media/${preview === "dub" ? "dub" : preview === "rendered" && job.result ? "rendered" : "source"}?v=${mediaNonce || job.stages?.render?.finished_at || "0"}`
     : selected
       ? `/api/materials/${selected.id}/media`
       : "";
@@ -1146,7 +1350,11 @@ function App() {
       default_output_dir?: string;
       youtube_proxy_configured?: boolean;
       youtube_po_token?: { available: boolean; browser_path: string | null };
+      voxcpm_available?: boolean;
+      voxcpm_reason?: string;
+      voxcpm_help?: string;
     }>("/api/settings");
+    setVoxcpm(settings);
     const browser = settings.cookies_from_browser ?? "";
     if (["", "chrome", "edge", "firefox", "brave", "chromium"].includes(browser)) {
       updateOptions("cookies_from_browser", browser);
@@ -1239,6 +1447,80 @@ function App() {
       setMessage(error instanceof Error ? error.message : "载入任务失败");
     }
   };
+  const parseBatch = async () => {
+    setBatchBusy(true);
+    try {
+      const result = await api<{ entries: Omit<BatchEntry, "selected">[] }>("/api/batch/parse", { method: "POST", body: JSON.stringify({ text: batchText, options: taskOptions() }) });
+      setBatchEntries(result.entries.map((entry) => ({ ...entry, selected: !entry.error })));
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const startBatch = async () => {
+    if (!authorized) {
+      setRightsHint(true);
+      setMessage("请先确认拥有处理和转载授权。");
+      return;
+    }
+    setBatchBusy(true);
+    try {
+      const result = await api<BatchQueue>("/api/batch/start", {
+        method: "POST",
+        body: JSON.stringify({
+          entries: batchEntries.filter((entry) => entry.selected).map(({ url, title }) => ({ url, title })),
+          authorized, device, compute_type: computeType, options: { ...taskOptions(), dub_enabled: batchDub }, quality_consent: batchQualityConsent,
+        }),
+      });
+      setBatchQueue(result.items);
+      setBatchSummaryDismissed(false);
+      setBatchEntries([]);
+      setBatchText("");
+      setView("library");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const retryBatch = async (itemId?: string) => {
+    try {
+      const result = await api<BatchQueue>("/api/batch/retry", { method: "POST", body: JSON.stringify({ item_id: itemId ?? null }) });
+      setBatchQueue(result.items);
+      setBatchSummaryDismissed(false);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const cancelBatch = async () => {
+    try {
+      const result = await api<BatchQueue>("/api/batch/cancel", { method: "POST", body: "{}" });
+      setBatchQueue(result.items);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const cancelBatchItem = async (jobId: string) => {
+    try {
+      await api<Job>(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST", body: "{}" });
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  useEffect(() => {
+    if (view !== "library") return;
+    const load = () => { api<BatchQueue>("/api/batch").then((result) => { setBatchQueue(result.items); if (result.active) setBatchSummaryDismissed(false); }).catch(() => undefined); };
+    load();
+    const timer = window.setInterval(load, 3000);
+    return () => window.clearInterval(timer);
+  }, [view]);
+
   const loadJobHistory = async (append = false) => {
     const requestId = ++historyRequestSeq.current;
     if (append) setHistoryLoadingMore(true);
@@ -1701,6 +1983,7 @@ function App() {
     if (options.title.length > 200) errors.title = "标题不能超过 200 个字符。";
     if ((description ?? "").length > 5000) errors.description = "简介不能超过 5000 个字符。";
     if (options.whisper_model_size.length > 128) errors.whisper_model_size = "模型名不能超过 128 个字符。";
+    if ((options.asr_hint || "").length > 240) errors.asr_hint = "识别提示不能超过 240 个字符。";
     if (options.translate_model.length > 128) errors.translate_model = "模型名不能超过 128 个字符。";
     if (options.font_name.length > 100) errors.font_name = "字体名不能超过 100 个字符。";
     if (options.target_lang.length > 32) errors.target_lang = "目标语言不能超过 32 个字符。";
@@ -1833,7 +2116,7 @@ function App() {
   const applyRecommended = () => {
     setDevice("cpu");
     setComputeType("int8");
-    setOptions((current) => ({ ...current, download_quality: "1080p", render_encoder: "auto", resource_profile: "balanced", subtitle_source: "audio", prefer_platform_subtitles: true, whisper_model_size: "small", source_language: "", audio_channel: "mix", translator: "deepseek", translate_model: "", deepseek_thinking: "disabled", target_lang: "zh-Hans", smart_translation: true, smart_subtitle_layout: true, font_name: "Microsoft YaHei", font_size: 24, subtitle_display_mode: "translated", subtitle_color: "白色", subtitle_outline_color: "黑色", subtitle_effect: "描边" }));
+    setOptions((current) => ({ ...current, download_quality: "1080p", render_encoder: "auto", resource_profile: "balanced", subtitle_source: "audio", prefer_platform_subtitles: true, whisper_model_size: "small", source_language: "", audio_channel: "mix", asr_hint: "", asr_vad_mode: "standard", translator: "deepseek", translate_model: "", deepseek_thinking: "disabled", target_lang: "zh-Hans", smart_translation: true, smart_subtitle_layout: true, font_name: "Microsoft YaHei", font_size: 24, subtitle_display_mode: "translated", subtitle_preset: "soft", subtitle_color: "白色", subtitle_outline_color: "黑色", subtitle_effect: "描边" }));
     setIncludeSourceLink(true);
     setMessage("已应用推荐设置：最高 1080p、自动优先 NVIDIA 渲染、CPU int8 转写与中文硬字幕。");
   };
@@ -2201,7 +2484,7 @@ function App() {
         setMessage(successMessage);
       } else {
         const stale = updated.stale_stages ?? [];
-        setMessage(stale.length ? `方案已保存；${stale.map((name) => workflowStageMeta.find(([id]) => id === name)?.[1] ?? name).join("、")}需要重新执行。` : "方案已保存，请运行准备检查。 ");
+        setMessage(stale.length ? `方案已保存；${stale.map((name) => [...workflowStageMeta, dubStageMeta].find(([id]) => id === name)?.[1] ?? name).join("、")}需要重新执行。` : "方案已保存，请运行准备检查。 ");
       }
       return updated;
     } catch (error) {
@@ -2331,7 +2614,7 @@ function App() {
     if (stage === "render") {
       setMediaNonce(Date.now());
       setPreview("rendered");
-    } else setPreview("source");
+    } else setPreview(stage === "dub" ? "dub" : "source");
     if (["extract", "translate", "render"].includes(stage)) void loadCues(job.id);
     setView("subtitle");
   };
@@ -2381,7 +2664,7 @@ function App() {
     running, hasJob: Boolean(job), hasChecks: Boolean(job?.checks?.length),
     hasBlocking: (job?.checks ?? []).some((item) => item.status === "blocking"),
     canResume: Boolean(job?.can_resume), nextStage: job?.next_stage ?? null,
-    stageLabel: (stage) => workflowStageMeta.find(([id]) => id === stage)?.[1] ?? "下一阶段",
+    stageLabel: (stage) => [...workflowStageMeta, dubStageMeta].find(([id]) => id === stage)?.[1] ?? "下一阶段",
   });
   const cancel = async () => {
     if (!job) return;
@@ -2962,6 +3245,23 @@ function App() {
       setSavingSettings(false);
     }
   };
+  const exportDiagnostics = async () => {
+    if (exportingDiagnostics) return;
+    setExportingDiagnostics(true);
+    setDiagnosticsNote("");
+    try {
+      const result = await api<{ path: string }>("/api/diagnostics/export", { method: "POST", body: "{}" });
+      const note = `诊断包已导出：${result.path}`;
+      setDiagnosticsNote(note);
+      setMessage(note);
+    } catch (error) {
+      const note = error instanceof Error ? error.message : "导出诊断包失败";
+      setDiagnosticsNote(note);
+      setMessage(note);
+    } finally {
+      setExportingDiagnostics(false);
+    }
+  };
   const chooseCookiesFile = async () => {
     const bridge = window.pywebview?.api;
     if (!bridge) {
@@ -3410,6 +3710,8 @@ function App() {
       <div className="import-methods">
         {materialSourceTab === "url" && <section className="material-source material-url" id="material-url-panel" role="tabpanel" aria-label="视频链接导入">
           <p className="source-intro">粘贴 YouTube 或 B 站地址，读取标题与时长后再确认处理范围。</p>
+      <label className="check"><input type="checkbox" checked={batchMode} disabled={running} onChange={(event) => setBatchMode(event.target.checked)} />批量（每行一个链接，或粘贴播放列表链接）</label>
+      {!batchMode && (
       <div className="form-grid two">
         <label>
           视频链接
@@ -3449,6 +3751,54 @@ function App() {
           </button>
         </div>
       </div>
+      )}
+      {batchMode && (
+        <div className="form-grid">
+          <label>
+            视频链接（每行一个）
+            <textarea value={batchText} rows={5} maxLength={20000} placeholder="每行一个 YouTube / B 站链接，或一个播放列表链接" onChange={(event) => setBatchText(event.target.value)} />
+          </label>
+          <div className="inline-actions">
+            <button onClick={() => void parseBatch()} disabled={batchBusy || !batchText.trim()} aria-busy={batchBusy}>
+              {batchBusy ? <ActivityBars /> : <NavIcon name="link" className="app-icon" />}
+              {batchBusy ? "正在解析…" : "解析"}
+            </button>
+          </div>
+          {batchEntries.length > 0 && (
+            <div className="batch-parse">
+              <div className="batch-panel-head">
+                <h2>解析结果<small>已选 {batchEntries.filter((entry) => entry.selected).length} / {batchEntries.length}</small></h2>
+              </div>
+              {batchEntries.map((entry, index) => (
+                <label className={`video-library-row ${entry.error ? "attention" : ""}`} key={`${entry.url}-${index}`}>
+                  <input type="checkbox" checked={entry.selected} disabled={!!entry.error} onChange={(event) => setBatchEntries((current) => current.map((row, i) => i === index ? { ...row, selected: event.target.checked } : row))} />
+                  <div className="video-library-main">
+                    <div className="video-library-title"><b title={entry.url}>{entry.title || entry.url}</b></div>
+                    <div className="video-library-meta">
+                      {entry.error ? <><span className="library-status attention">解析失败</span><span>{entry.error}</span></> : entry.duration ? <span>时长 {Math.round(entry.duration)} 秒</span> : null}
+                    </div>
+                  </div>
+                  <span />
+                </label>
+              ))}
+              <div className="batch-parse-foot">
+                <label className="check">
+                  <input type="checkbox" checked={batchQualityConsent} onChange={(event) => setBatchQualityConsent(event.target.checked)} />
+                  可用画质低于所选上限时，按可用画质继续（整批共用）
+                </label>
+                {voxcpm.voxcpm_available && (
+                  <label className="check">
+                    <input type="checkbox" checked={batchDub} onChange={(event) => setBatchDub(event.target.checked)} />
+                    同时生成配音版（整批共用）
+                  </label>
+                )}
+                <button className="primary" onClick={() => void startBatch()} disabled={batchBusy || !batchEntries.some((entry) => entry.selected)}>加入批量并开始</button>
+              </div>
+            </div>
+          )}
+          {batchEntries.length > 0 && <small className="check-hint">批量沿用当前处理设置；只处理到压制字幕，不会自动投稿。</small>}
+        </div>
+      )}
       {metadataState !== "idle" && (
         <div className="metadata-notice-wrap">
           {metadataState === "error" && /ERROR:|WinError|Traceback|OSError|HTTP Error|FileNotFoundError/i.test(metadataNotice)
@@ -3714,9 +4064,9 @@ function App() {
         ) : <p className="empty-checks">保存当前方案后点击“检查准备”。检查不会下载视频，也不会自动安装任何组件。</p>}
       </section>
       <section className="stage-list">
-        {workflowStageMeta.map(([id, label, purpose], index) => {
+        {(job.stages?.dub ? [...workflowStageMeta.slice(0, 4), dubStageMeta, ...workflowStageMeta.slice(4)] : workflowStageMeta).map(([id, label, purpose], index) => {
           const state = job.stages?.[id];
-          const availability = stageAvailability(id, Object.fromEntries(workflowStageMeta.map(([name]) => [name, job.stages?.[name]?.status])), preparationReady && !schemeDirty, running, publishInPipeline);
+          const availability = stageAvailability(id, Object.fromEntries(Object.entries(job.stages ?? {}).map(([name, stage]) => [name, stage.status])), preparationReady && !schemeDirty, running, publishInPipeline);
           const publishButton = id === "publish"
             ? publishStageButton({
                 publishEnabled: publishInPipeline,
@@ -3738,7 +4088,9 @@ function App() {
                     ? "重新翻译"
                     : id === "render"
                       ? "重新渲染"
-                      : "打开结果"
+                      : id === "dub"
+                        ? "重新配音"
+                        : "打开结果"
                 : ["failed", "cancelled", "stale", "interrupted"].includes(state?.status ?? "")
                   ? "重试"
                   : "开始";
@@ -3755,7 +4107,7 @@ function App() {
             // re-render after external subtitle updates).
             if (
               state?.status === "completed" &&
-              (id === "extract" || id === "translate" || id === "render")
+              (id === "extract" || id === "translate" || id === "render" || id === "dub")
             ) {
               void runStage(id);
               return;
@@ -3768,9 +4120,9 @@ function App() {
                 !window.confirm("投稿辅助可能已经上传视频。请先在 B 站创作中心核对草稿，确认不会重复投稿后再重试。")) return;
             void runStage(id);
           };
-          const artifactKey = { acquire: "raw_video", extract: "source_srt", translate: "translated_srt", render: "rendered_video", publish: "" }[id];
+          const artifactKey = { acquire: "raw_video", extract: "source_srt", translate: "translated_srt", render: "rendered_video", dub: "dub_video", publish: "" }[id];
           const artifact = artifactKey ? job.artifacts?.[artifactKey] : null;
-          const stageIcon: NavIconName = id === "acquire" ? "download" : id === "extract" ? "voice" : id === "translate" ? "translate" : id === "render" ? "render" : "upload";
+          const stageIcon: NavIconName = id === "acquire" ? "download" : id === "extract" ? "voice" : id === "translate" ? "translate" : id === "render" ? "render" : id === "dub" ? "voice" : "upload";
           const statusIcon: NavIconName = state?.status === "completed" ? "check" : state?.status === "running" ? "running" : ["failed", "stale", "interrupted"].includes(state?.status ?? "") ? "error" : state?.status === "cancelled" ? "pause" : stageIcon;
           const elapsed = state?.started_at ? formatElapsed(Math.max(0, (state.finished_at ?? now / 1000) - state.started_at)) : null;
           return (
@@ -3900,6 +4252,7 @@ function App() {
               {sourceLanguageOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
             </select>
           </label>
+          <AsrRecognitionFields options={options} hintError={fieldErrors.asr_hint} onHint={(value) => updateOptions("asr_hint", value)} onVad={(value) => updateOptions("asr_vad_mode", value)} />
            {(job?.material.source_url || (!job && sourceUrl.trim())) && ["auto", "merged"].includes(options.subtitle_source) && <label className="check settings-check">
              <input type="checkbox" checked={options.prefer_platform_subtitles} onChange={(event) => updateOptions("prefer_platform_subtitles", event.target.checked)} />
              优先使用 YouTube 字幕（更快；没有时自动转写）
@@ -3946,6 +4299,7 @@ function App() {
            <div className="settings-entry-row">
              <button type="button" className="settings-inline-link" onClick={() => { setMode("advanced"); window.setTimeout(() => { document.getElementById("advanced-translation-settings")?.scrollIntoView({ behavior: "smooth", block: "start" }); }, 0); }}>模型与费用设置 →</button>
             {(["deepseek", "openai"].includes(options.translator)) && <button type="button" className="settings-link-button" onClick={() => setSettingsOpen(true)}><NavIcon name="link" className="app-icon" />打开接口设置与 API 密钥</button>}
+            <button type="button" className="settings-link-button" onClick={() => void openGlossary()}><NavIcon name="book" className="app-icon" />术语表{glossaryCount === null ? "" : `（${glossaryCount} 条）`} · 编辑</button>
            </div>
           </section>
           <section className="settings-section"><div className="settings-group-heading"><NavIcon name="download" className="app-icon" /><span><b>性能与转写</b><small>资源占用与处理负载</small></span></div>
@@ -3974,6 +4328,18 @@ function App() {
               <option value="translated">中文单语</option>
               <option value="bilingual-source-first">原文在上 + 中文在下</option>
               <option value="bilingual-translation-first">中文在上 + 原文在下</option>
+            </select>
+          </label>
+          <label>
+            双语样式
+            <select
+              value={options.subtitle_preset}
+              disabled={options.subtitle_display_mode === "translated"}
+              onChange={(event) => updateOptions("subtitle_preset", event.target.value)}
+            >
+              <option value="soft">弱化原文（小一号、浅灰）</option>
+              <option value="compact">小字原文（更小、更灰）</option>
+              <option value="equal">两行一致</option>
             </select>
           </label>
           <label>
@@ -4109,7 +4475,8 @@ function App() {
             <option value="right">右声道（仅双声道）</option>
           </select>
           <FieldGuide summary="默认保留混合声道；左右声道只适用于明确的双声道音频。" detail="系统不会根据音量自动判断哪一侧有人声，也不会静默丢弃另一声道。" />
-        </label>
+          </label>
+          <AsrRecognitionFields options={options} hintError={fieldErrors.asr_hint} onHint={(value) => updateOptions("asr_hint", value)} onVad={(value) => updateOptions("asr_vad_mode", value)} />
          {(job?.material.source_url || (!job && sourceUrl.trim())) && ["auto", "merged"].includes(options.subtitle_source) && <label className="check settings-check">
            <input type="checkbox" checked={options.prefer_platform_subtitles} onChange={(event) => updateOptions("prefer_platform_subtitles", event.target.checked)} />
            优先使用 YouTube 字幕（更快；没有时自动转写）
@@ -4195,6 +4562,7 @@ function App() {
           if (key === "llm_pricing_mode") updateOptions(key, value as Options["llm_pricing_mode"]);
           else updateOptions(key, value as Record<string, string>);
         }} />}
+        <button type="button" className="settings-link-button" onClick={() => void openGlossary()}><NavIcon name="book" className="app-icon" />术语表{glossaryCount === null ? "" : `（${glossaryCount} 条）`} · 编辑</button>
         {["deepseek", "openai"].includes(options.translator) && <button type="button" className="settings-link-button" onClick={() => setSettingsOpen(true)}><NavIcon name="link" className="app-icon" />打开接口设置与 API 密钥</button>}
         </div></section>
         <section className="settings-section"><header className="settings-group-heading"><NavIcon name="download" className="app-icon" /><span><b>性能与转写</b><small>资源、设备、精度与转写速度</small></span></header><div className="settings-grid settings-fold-body">
@@ -4273,6 +4641,18 @@ function App() {
             <option value="translated">中文单语</option>
             <option value="bilingual-source-first">原文在上 + 中文在下</option>
             <option value="bilingual-translation-first">中文在上 + 原文在下</option>
+          </select>
+        </label>
+        <label>
+          双语样式
+          <select
+            value={options.subtitle_preset}
+            disabled={options.subtitle_display_mode === "translated"}
+            onChange={(event) => updateOptions("subtitle_preset", event.target.value)}
+          >
+            <option value="soft">弱化原文（小一号、浅灰）</option>
+            <option value="compact">小字原文（更小、更灰）</option>
+            <option value="equal">两行一致</option>
           </select>
         </label>
         <label>
@@ -4372,6 +4752,7 @@ function App() {
         </div></section>
       </div>
       )}
+      {dubSettings}
       <section className="settings-section post-process-section">
         <header className="settings-group-heading"><NavIcon name="upload" className="app-icon" /><span><b>处理后操作</b><small>渲染完成后打开投稿辅助</small></span></header>
         <div className="settings-grid settings-fold-body compact publish-pipeline-settings">
@@ -4436,6 +4817,8 @@ function App() {
             <h1>
               {demoPreview
                 ? "授权演示成片（只读）"
+                : preview === "dub"
+                ? "中文配音版"
                 : preview === "rendered" && job?.result
                 ? "中文字幕成片"
                 : "原始视频"}
@@ -4458,6 +4841,12 @@ function App() {
             >
               成片
             </button>
+            {job?.artifacts?.dub_video?.available && (
+              <>
+                <button className={preview === "dub" ? "selected" : ""} onClick={() => { setMediaNonce(Date.now()); setPreview("dub"); }}>配音版</button>
+                <button onClick={() => void openHistoryPath(job.result?.dub_video || "")}>打开配音版</button>
+              </>
+            )}
           </div>
         </div>
         <video
@@ -4671,6 +5060,18 @@ function App() {
               <option value="bilingual-translation-first">
                 中文在上 + 原文在下
               </option>
+            </select>
+          </label>
+          <label>
+            双语样式
+            <select
+              value={options.subtitle_preset}
+              disabled={options.subtitle_display_mode === "translated"}
+              onChange={(event) => updateOptions("subtitle_preset", event.target.value)}
+            >
+              <option value="soft">弱化原文（小一号、浅灰）</option>
+              <option value="compact">小字原文（更小、更灰）</option>
+              <option value="equal">两行一致</option>
             </select>
           </label>
           <label>
@@ -5344,11 +5745,73 @@ function App() {
               setSelectedOutputTaskIds([]);
             }}
           >
-            {libraryBatchMode ? "退出批量" : "批量管理"}
+            {libraryBatchMode ? "退出多选" : "多选删除"}
           </button>
           <button className="primary" onClick={() => setView("material")}>添加视频</button>
         </div>
       </header>
+      {batchQueue.length > 0 && (!batchSummaryDismissed || batchQueue.some((item) => item.status === "pending" || item.status === "running")) && (
+        <div className="batch-panel" aria-label="批量处理" aria-live="polite">
+          {(() => {
+            const count = (status: BatchItem["status"]) => batchQueue.filter((item) => item.status === status).length;
+            const done = count("done"), failed = count("failed"), cancelled = count("cancelled");
+            const running = batchQueue.find((item) => item.status === "running");
+            const active = running || batchQueue.some((item) => item.status === "pending");
+            const total = batchQueue.length - cancelled;
+            const pct = Math.round(((done + failed + (running?.progress ?? 0) / 100) / total) * 100);
+            if (!active) return batchSummaryDismissed ? null : (
+              <div className="batch-summary">
+                <div><b>批量处理已结束：</b><b className="ok">完成 {done}</b> · <b className="bad">失败 {failed}</b> · 已停止 {cancelled}</div>
+                <div className="library-header-actions">
+                  {failed + cancelled > 0 && <button onClick={() => void retryBatch()}>重试失败项</button>}
+                  <button onClick={() => setBatchSummaryDismissed(true)}>关闭</button>
+                </div>
+              </div>
+            );
+            return (
+              <>
+                <div className="batch-panel-head">
+                  <div><h2>批量处理</h2><small>{batchQueue.length} 个视频 · 串行处理，不会自动投稿</small></div>
+                  <div className="library-header-actions"><button className="danger" onClick={() => void cancelBatch()}>停止批量</button></div>
+                </div>
+                <div className="library-summary">
+                  <div><b>{total}</b><span>总数</span></div>
+                  <div className="done"><b>{done}</b><span>已完成</span></div>
+                  <div><b>{running ? 1 : 0}</b><span>处理中</span></div>
+                  <div className="failed"><b>{failed}</b><span>失败</span></div>
+                </div>
+                <div className="batch-current">
+                  <div className="batch-current-line">
+                    <div>{running ? <><ActivityBars /> 正在处理：<b>{running.title || running.url}</b> <span>· {running.stage ?? "准备中"} {running.progress ?? 0}%</span></> : <span>排队中（等待其他任务）</span>}</div>
+                    <b className="pct">总进度 {pct}%</b>
+                  </div>
+                  <div className="batch-bar"><i style={{ width: `${pct}%` }} /></div>
+                </div>
+              </>
+            );
+          })()}
+          {batchQueue.map((item) => {
+            const category = item.status === "done" ? "completed" : item.status === "running" ? "active" : item.status === "failed" || item.status === "cancelled" ? "attention" : "";
+            const statusText = { pending: "排队中", running: "处理中", done: "待投稿", failed: "失败", cancelled: "已停止" }[item.status];
+            return (
+              <article className={`video-library-row ${category}`} key={item.id}>
+                <div className="video-library-main">
+                  <div className="video-library-title"><b title={item.url}>{item.title || item.url}</b></div>
+                  <div className="video-library-meta">
+                    <span className={`library-status ${category}`}>{statusText}</span>
+                    {item.status === "done" && <span>成片已完成，在下方任务列表载入后到发布页手动投稿</span>}
+                  </div>
+                  {item.error && <TaskErrorSummary message={item.error} />}
+                </div>
+                <div className="video-library-actions">
+                  {(item.status === "failed" || item.status === "cancelled") && <button onClick={() => void retryBatch(item.id)}>续跑</button>}
+                  {item.status === "running" && item.job_id && <button className="danger" onClick={() => void cancelBatchItem(item.job_id!)}>取消</button>}
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
       <div className="library-summary" aria-label="任务数量摘要">
         <button className={libraryFilter === "all" ? "selected" : ""} onClick={() => setLibraryFilter("all")}>
           <b>{librarySourceJobs.length}</b><span>全部</span>
@@ -5413,7 +5876,7 @@ function App() {
             {historyDeleteError && <small className="library-batch-error" role="alert">{historyDeleteError}</small>}
           </>
         ) : (
-          <small className="library-batch-hint">需要清理时再点右上角「批量管理」</small>
+          <small className="library-batch-hint">需要删除旧任务时，点右上角「多选删除」。</small>
         )}
       </div>
       <div className="video-library-list" aria-live="polite">
@@ -5487,6 +5950,7 @@ function App() {
                   <summary aria-label={`更多操作：${item.title}`} title="更多操作">⋯</summary>
                   <div>
                     <button onClick={() => void openHistoryPath(item.rendered_video || "")} disabled={!item.rendered_exists} title={item.rendered_exists ? "打开最终成片" : "尚未生成成片"}>打开成片</button>
+                    {item.dub_exists && <button onClick={() => void openHistoryPath(item.dub_video || "")}>打开配音版</button>}
                     <button onClick={() => void openHistoryPath(item.output_dir || "")} disabled={!item.output_exists} title={item.output_exists ? "打开该任务的输出目录" : "输出目录不存在"}>打开文件夹</button>
                   </div>
                 </details>
@@ -5899,6 +6363,45 @@ function App() {
           </aside>
         )}
       </section>
+      {glossaryOpen && <div className="modal-backdrop" role="presentation">
+        <section className="template-modal glossary-modal" role="dialog" aria-modal="true" aria-label="编辑术语表">
+          <header><div><p className="eyebrow">术语表 · 全局</p><h2>编辑术语表</h2></div><button onClick={closeGlossary} aria-label="关闭术语表">×</button></header>
+          <p className="settings-subfold-note">识别时用来纠正专有名词拼写，翻译时按「原文 = 译文」提示模型。保存后，已完成翻译的任务会提示重新翻译。原文为空的行保存时自动忽略；别名用逗号分隔。</p>
+          <div className="glossary-tools">
+            <input value={glossaryQuery} placeholder="搜索原文、译文或别名" onChange={(event) => setGlossaryQuery(event.target.value)} />
+            <small>共 {glossaryRows.length} 条</small>
+            <button onClick={() => { setGlossaryRows((rows) => [toGlossaryRow({}, true), ...rows]); setGlossaryQuery(""); }}>＋ 新增术语</button>
+            <button onClick={() => glossaryFileRef.current?.click()}>导入 JSON / CSV</button>
+            <button onClick={() => exportGlossary("json")}>导出 JSON</button>
+            <button onClick={() => exportGlossary("csv")}>导出 CSV</button>
+            <button className="danger" onClick={() => void clearGlossary()} disabled={!glossaryRows.length && !glossaryCount}>清空</button>
+            <input ref={glossaryFileRef} type="file" accept=".json,.csv" hidden onChange={(event) => { const file = event.target.files?.[0]; event.target.value = ""; if (file) void importGlossary(file); }} />
+          </div>
+          {glossaryNote && <p className="glossary-note">{glossaryNote}</p>}
+          <div className="llm-cost-table glossary-table"><table>
+            <thead><tr><th>原文</th><th>译文</th><th>别名</th><th>备注</th><th /></tr></thead>
+            <tbody>
+              {glossaryRows.filter((row) => [row.source, row.target, row.aliases].some((value) => value.toLowerCase().includes(glossaryQuery.trim().toLowerCase()))).map((row) => {
+                const duplicate = glossaryDuplicates.has(glossaryMatchKey(row.source));
+                return (
+                  <tr key={row.key} className={`${row.dirty ? "is-dirty" : ""} ${duplicate ? "is-duplicate" : ""}`}>
+                    <td><input value={row.source} placeholder="原文（必填）" onChange={(event) => updateGlossaryRow(row.key, { source: event.target.value })} />{duplicate && <small className="field-error">原文重复（不区分大小写）</small>}</td>
+                    <td><input value={row.target} placeholder="译文" onChange={(event) => updateGlossaryRow(row.key, { target: event.target.value })} /></td>
+                    <td><input value={row.aliases} placeholder="逗号分隔" onChange={(event) => updateGlossaryRow(row.key, { aliases: event.target.value })} /></td>
+                    <td><input value={row.note} placeholder="给翻译模型的说明" onChange={(event) => updateGlossaryRow(row.key, { note: event.target.value })} /></td>
+                    <td><button className="danger" onClick={() => removeGlossaryRow(row)}>删除</button></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table></div>
+          <footer>
+            <span className={glossaryUnsaved ? "glossary-unsaved" : "glossary-saved"}>{glossaryUnsaved ? `● ${glossaryUnsaved} 处未保存改动` : "没有未保存的改动"}{glossaryDuplicates.size > 0 && "，有重复原文，改掉后才能保存"}</span>
+            <button onClick={closeGlossary}>{glossaryUnsaved ? "放弃改动" : "关闭"}</button>
+            <button className="primary" onClick={() => void saveGlossary()} disabled={!glossaryUnsaved || glossaryDuplicates.size > 0}>保存术语表</button>
+          </footer>
+        </section>
+      </div>}
       {settingsOpen && (
         <div className="settings-backdrop" role="presentation" onClick={() => setSettingsOpen(false)}>
         <div className="settings-drawer" role="dialog" aria-modal="true" aria-label="接口与下载设置" onClick={(event) => event.stopPropagation()}>
@@ -6011,6 +6514,14 @@ function App() {
               同一地址用于元数据、视频、封面和浏览器验证；只保存在本机设置，不会写入任务历史或日志。
             </small>
           </label>
+          <div className="settings-diagnostics">
+            <div className="settings-section-label"><NavIcon name="book" className="app-icon" /><b>关于</b><span>v{appVersion || "—"}</span></div>
+            <p className="drawer-note">诊断包包含最近日志、版本和已脱敏的本机设置，不含密钥、Cookies、登录状态或浏览器资料。</p>
+            <button type="button" className="settings-link-button" onClick={() => void exportDiagnostics()} disabled={exportingDiagnostics}>
+              {exportingDiagnostics ? "正在导出诊断包…" : "导出诊断包"}
+            </button>
+            {diagnosticsNote && <p className="drawer-note">{diagnosticsNote}</p>}
+          </div>
           <div className="settings-drawer-footer"><button className="primary" onClick={saveSettings} disabled={savingSettings} aria-busy={savingSettings}>
             {savingSettings ? "正在保存本地设置…" : "保存本地设置并应用本次访问参数"}
           </button></div>

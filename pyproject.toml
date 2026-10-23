@@ -28,6 +28,9 @@ yblocalizer-gui = "yblocalizer.gui:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+yblocalizer = ["default_glossary.json"]
+
 [tool.setuptools.dynamic]
 version = {attr = "yblocalizer.__version__"}
 

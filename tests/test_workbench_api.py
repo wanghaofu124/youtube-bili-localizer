@@ -1,7 +1,9 @@
+import functools
 from pathlib import Path
 from http.client import HTTPConnection
 from http import HTTPStatus
 from io import BytesIO
+import hashlib
 import json
 import socket
 import threading
@@ -53,7 +55,7 @@ def test_cuda_failure_exposes_user_confirmed_recovery_in_snapshot() -> None:
 def test_dependency_refresh_query_clears_cached_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     handler = object.__new__(WorkbenchHandler)
     handler.path = "/api/dependencies?refresh=1"
-    handler.dependencies = SimpleNamespace(snapshot=lambda: {"dependencies": []})
+    handler.dependencies = SimpleNamespace(snapshot=lambda _ocr_language="eng": {"dependencies": []})
     result: dict[str, object] = {}
     handler._json = lambda payload, status=HTTPStatus.OK: result.update(payload=payload, status=status)  # type: ignore[method-assign]
     cleared: list[bool] = []
@@ -114,15 +116,16 @@ def test_workbench_public_path_is_relative_to_project(tmp_path: Path) -> None:
     assert public_path(tmp_path / "private.mp4") == "private.mp4"
 
 
-def test_workbench_creates_authorized_url_job(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_workbench_creates_authorized_url_job(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     jobs = WorkbenchJobs()
     monkeypatch.setattr("yblocalizer.workbench_api.threading.Thread.start", lambda self: None)
-    job = jobs.create_url("https://www.youtube.com/watch?v=demo", "cuda", "float16", authorized=True, options={"subtitle_source": "ocr", "font_size": 30, "output_dir": "outputs/custom"})
+    job = jobs.create_url("https://www.youtube.com/watch?v=demo", "cuda", "float16", authorized=True, options={"subtitle_source": "ocr", "font_size": 30, "output_dir": str(tmp_path / "custom")})
     assert job.material.source_url == "https://www.youtube.com/watch?v=demo"
     assert job.material.path is None
     assert job.options["subtitle_source"] == "ocr"
     assert job.options["font_size"] == 30
-    assert job.output_root == _resolve_output_root("outputs/custom")
+    assert job.output_root == _resolve_output_root(str(tmp_path / "custom"))
+    assert job.work_dir is None or job.work_dir.is_relative_to(tmp_path)
     pipeline_options = jobs._pipeline_options(job)
     assert pipeline_options.ocr_fallback_to_audio is False
     assert pipeline_options.prefer_platform_subtitles is False
@@ -563,6 +566,16 @@ def test_publish_copy_endpoint_reads_metadata(tmp_path: Path, monkeypatch: pytes
     assert responses[-1]["has_metadata"] is True
 
 
+def _subtitle_save_base(job, path: Path) -> dict[str, object]:
+    from yblocalizer.models import load_segments
+
+    return {
+        "base_revision": int(job.artifacts.revision),
+        "base_fingerprint": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "base_ids": list(range(len(load_segments(path)))),
+    }
+
+
 def test_subtitle_saves_keep_the_previous_valid_edit(tmp_path: Path) -> None:
     from yblocalizer.models import Segment, save_segments
 
@@ -575,13 +588,14 @@ def test_subtitle_saves_keep_the_previous_valid_edit(tmp_path: Path) -> None:
     job.artifacts.translated_segments = str(source)
     job.stages["translate"]["status"] = "completed"
 
-    jobs.save_cues(job.id, [{"start": 0, "end": 1, "translated": "第一次", "deleted": False}])
+    jobs.save_cues(job.id, [{"start": 0, "end": 1, "translated": "第一次", "deleted": False}], **_subtitle_save_base(job, source))
     first = Path(job.artifacts.translated_segments or "")
-    jobs.save_cues(job.id, [{"start": 0, "end": 1, "translated": "第二次", "deleted": False}])
+    jobs.save_cues(job.id, [{"start": 0, "end": 1, "translated": "第二次", "deleted": False}], **_subtitle_save_base(job, first))
     second = Path(job.artifacts.translated_segments or "")
 
-    assert first.name == "segments.translated.edited.r1.json"
-    assert second.name == "segments.translated.edited.r2.json"
+    assert first.name.startswith("segments.translated.edited.r1.")
+    assert second.name.startswith("segments.translated.edited.r2.")
+    assert first.suffix == ".json" and second.suffix == ".json"
     assert first.is_file() and second.is_file()
 
 
@@ -605,7 +619,7 @@ def test_subtitle_save_persists_source_and_manual_review_without_changing_raw_so
     jobs.save_cues(job.id, [{
         "start": 0, "end": 1, "source": "修正原文", "translated": "修正译文",
         "deleted": False, "needs_review": True,
-    }])
+    }], **_subtitle_save_base(job, original))
     saved = load_segments(Path(job.artifacts.translated_segments or ""))[0]
 
     assert saved.text == "修正原文"
@@ -752,11 +766,14 @@ def test_failed_subtitle_save_removes_inactive_candidate(tmp_path: Path, monkeyp
     monkeypatch.setattr("yblocalizer.workbench_api.write_srt", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")))
 
     with pytest.raises(OSError, match="disk full"):
-        jobs.save_cues(job.id, [{"start": 0, "end": 1, "translated": "新字幕", "deleted": False}])
+        jobs.save_cues(
+            job.id, [{"start": 0, "end": 1, "translated": "新字幕", "deleted": False}],
+            **_subtitle_save_base(job, source),
+        )
 
     assert job.artifacts.translated_segments == str(source)
-    assert not (job.work_dir / "segments.translated.edited.r1.json").exists()
-    assert not (job.work_dir / "zh.edited.r1.srt").exists()
+    assert not list(job.work_dir.glob("segments.translated.edited.r1.*.json"))
+    assert not list(job.work_dir.glob("zh.edited.r1.*.srt"))
 
 
 def test_shutdown_marks_unresponsive_stage_as_interrupted(tmp_path: Path) -> None:
@@ -1590,3 +1607,97 @@ def test_staged_job_api_creates_draft_prepares_then_runs_one_stage(
         connection.close()
         server.shutdown()
         server.server_close()
+
+
+def test_verify_checkpoints_points_to_pending_dub(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    jobs = WorkbenchJobs()
+    job = jobs.create("demo", "cpu", "int8", {
+        "translator": "none", "target_lang": "en", "output_dir": str(tmp_path / "out"), "dub_enabled": True,
+    })
+    monkeypatch.setattr("yblocalizer.workbench_api.validate_stage", lambda *args: True)
+    for stage in ("acquire", "extract", "translate", "render"):
+        job.stages[stage]["status"] = "completed"
+    job.stages["dub"]["status"] = "stale"
+    jobs._verify_checkpoints(job)
+    assert job.next_stage == "dub" and job.status != "completed"
+
+
+def test_dub_recheck_clears_voxcpm_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    @functools.cache
+    def fake_status():
+        calls.append(1)
+        return {"voxcpm_available": len(calls) > 1}
+
+    monkeypatch.setattr("yblocalizer.workbench_api.voxcpm_status", fake_status)
+    fake_status()
+    handler = object.__new__(WorkbenchHandler)
+    handler.path = "/api/dub/recheck"
+    handler._authorize_mutation = lambda _path: True  # type: ignore[method-assign]
+    sent = []
+    handler._json = lambda payload, *args, **kwargs: sent.append(payload)  # type: ignore[method-assign]
+    handler.do_POST()
+    assert len(calls) == 2 and sent[0]["voxcpm_available"] is True and sent[0]["default_dub_mix"] == "duck"
+
+
+def test_url_job_with_custom_output_dir_writes_nothing_into_repo(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    repo_custom = _resolve_output_root("outputs/custom")
+    before = set(repo_custom.iterdir()) if repo_custom.is_dir() else set()
+    jobs = WorkbenchJobs()
+    monkeypatch.setattr("yblocalizer.workbench_api.threading.Thread.start", lambda self: None)
+    job = jobs.create_url("https://www.youtube.com/watch?v=demo", "cuda", "float16", authorized=True,
+                          options={"subtitle_source": "ocr", "output_dir": str(tmp_path / "custom")})
+    after = set(repo_custom.iterdir()) if repo_custom.is_dir() else set()
+    assert after == before
+    assert job.output_root.is_relative_to(tmp_path)
+
+
+@pytest.mark.parametrize("payload", [{"foo": 1}, {"entries": "x"}, {"entries": [1]}, {"entries": None}])
+def test_glossary_post_rejects_invalid_entries(monkeypatch: pytest.MonkeyPatch, payload) -> None:
+    saved, sent = [], []
+    monkeypatch.setattr("yblocalizer.workbench_api.save_glossary", lambda path, entries: saved.append(entries) or entries)
+    handler = object.__new__(WorkbenchHandler)
+    handler.path = "/api/glossary"
+    handler._authorize_mutation = lambda _path: True  # type: ignore[method-assign]
+    handler._payload = lambda: payload  # type: ignore[method-assign]
+    handler._json = lambda body, status=None: sent.append((body, status))  # type: ignore[method-assign]
+    handler.do_POST()
+    assert saved == [] and sent[0][1] == HTTPStatus.BAD_REQUEST
+
+
+def test_glossary_post_rejects_clear_without_confirm(monkeypatch: pytest.MonkeyPatch) -> None:
+    saved, sent = [], []
+    monkeypatch.setattr("yblocalizer.workbench_api.save_glossary", lambda path, entries: saved.append(entries) or entries)
+    handler = object.__new__(WorkbenchHandler)
+    handler.path = "/api/glossary"
+    handler._authorize_mutation = lambda _path: True  # type: ignore[method-assign]
+    handler._payload = lambda: {"entries": []}  # type: ignore[method-assign]
+    handler._json = lambda body, status=None: sent.append((body, status))  # type: ignore[method-assign]
+    handler.do_POST()
+    assert saved == [] and sent[0][1] == HTTPStatus.BAD_REQUEST
+    assert "确认" in sent[0][0]["error"]
+
+
+def test_glossary_post_clears_with_confirm(monkeypatch: pytest.MonkeyPatch) -> None:
+    saved, sent = [], []
+    monkeypatch.setattr("yblocalizer.workbench_api.save_glossary", lambda path, entries: saved.append(entries) or entries)
+    handler = object.__new__(WorkbenchHandler)
+    handler.path = "/api/glossary"
+    handler._authorize_mutation = lambda _path: True  # type: ignore[method-assign]
+    handler._payload = lambda: {"entries": [{"source": "  "}], "confirmed": True}  # type: ignore[method-assign]
+    handler._json = lambda body, status=None: sent.append((body, status))  # type: ignore[method-assign]
+    handler.do_POST()
+    assert saved == [[{"source": "  "}]] and sent[0] == ({"entries": [{"source": "  "}]}, None)
+
+
+def test_glossary_post_accepts_empty_list_with_confirm(monkeypatch: pytest.MonkeyPatch) -> None:
+    saved, sent = [], []
+    monkeypatch.setattr("yblocalizer.workbench_api.save_glossary", lambda path, entries: saved.append(entries) or entries)
+    handler = object.__new__(WorkbenchHandler)
+    handler.path = "/api/glossary"
+    handler._authorize_mutation = lambda _path: True  # type: ignore[method-assign]
+    handler._payload = lambda: {"entries": [], "confirmed": True}  # type: ignore[method-assign]
+    handler._json = lambda body, status=None: sent.append((body, status))  # type: ignore[method-assign]
+    handler.do_POST()
+    assert saved == [[]] and sent[0] == ({"entries": []}, None)

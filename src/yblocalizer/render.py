@@ -3,9 +3,10 @@ from __future__ import annotations
 from copy import copy
 import json
 import math
+import re
 import subprocess
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 
 import pysubs2
 
@@ -26,7 +27,7 @@ def _probe_video_size(path: Path) -> tuple[int, int] | None:
                 str(ffprobe), "-v", "error", "-select_streams", "v:0",
                 "-show_entries", "stream=width,height", "-of", "json", str(path),
             ],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         stream = ((json.loads(completed.stdout).get("streams") or [{}])[0])
@@ -78,7 +79,7 @@ def _probe_video_duration(path: Path) -> float | None:
     try:
         completed = subprocess.run(
             [str(ffprobe), "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, encoding="utf-8", timeout=15,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         duration = float((json.loads(completed.stdout).get("format") or {}).get("duration") or 0)
@@ -134,6 +135,26 @@ def _ass_color(value: str) -> pysubs2.Color:
     return pysubs2.Color(red, green, blue, alpha)
 
 
+# Bilingual presets only style the source-language line; the translated line
+# keeps the Default style, so single-language output never changes.
+SUBTITLE_PRESETS: dict[str, dict[str, Any]] = {
+    "soft": {"scale": 0.85, "color": "&H00C8C8C8"},     # 弱化原文（默认）：小一号、浅灰
+    "compact": {"scale": 0.7, "color": "&H00A0A0A0"},   # 小字原文：更小、更灰
+    "equal": {"scale": 1.0, "color": None},             # 两行一致：与译文同字号同色
+}
+
+
+def _style_bilingual_source_lines(text: str, display_mode: str, source_lines: int) -> str:
+    """Switch the source lines of a bilingual cue to the Secondary style.
+
+    ``source_lines`` comes from subtitle.cue_source_line_counts; the source block
+    sits first or last depending on display_mode.
+    """
+    lines = text.split("\\N")
+    source = range(source_lines) if display_mode == "bilingual-source-first" else range(len(lines) - source_lines, len(lines))
+    return "\\N".join("{\\rSecondary}" + line + "{\\r}" if index in source else line for index, line in enumerate(lines))
+
+
 def _prepare_ass(
     subtitle_path: Path,
     *,
@@ -150,6 +171,9 @@ def _prepare_ass(
     cue_font_sizes: Mapping[int, int] | None = None,
     expected_cue_count: int | None = None,
     log: Callable[[str], None] | None = None,
+    display_mode: str = "translated",
+    subtitle_preset: str = "soft",
+    cue_source_lines: Mapping[int, int] | None = None,
 ) -> Path:
     subtitles = pysubs2.load(subtitle_path, encoding="utf-8-sig")
     width, height = size or (384, 288)
@@ -175,7 +199,16 @@ def _prepare_ass(
         alignment=pysubs2.Alignment.BOTTOM_CENTER,
         marginv=actual_margin,
     )
+    bilingual = display_mode in {"bilingual-source-first", "bilingual-translation-first"}
+    if bilingual:
+        preset = SUBTITLE_PRESETS[subtitle_preset]
+        secondary = copy(subtitles.styles["Default"])
+        secondary.fontsize = max(1, round(actual_font * preset["scale"]))
+        if preset["color"]:
+            secondary.primarycolor = _ass_color(preset["color"])
+        subtitles.styles["Secondary"] = secondary
     overrides = dict(cue_font_sizes or {})
+    source_lines = dict(cue_source_lines or {})
     if expected_cue_count is not None and len(subtitles.events) != expected_cue_count:
         if log:
             log(
@@ -183,6 +216,7 @@ def _prepare_ass(
                 f"预期 {expected_cue_count} 条；已取消逐条字号调整，继续渲染。"
             )
         overrides = {}
+        source_lines = {}
     elif any(
         not isinstance(index, int) or not 1 <= index <= len(subtitles.events)
         or not isinstance(size, int) or size < 1
@@ -192,6 +226,8 @@ def _prepare_ass(
             log("字幕样式提醒：逐条字号方案与字幕条目不一致；已使用默认字号继续渲染。")
         overrides = {}
     for index, event in enumerate(subtitles.events, start=1):
+        if bilingual:
+            event.text = _style_bilingual_source_lines(event.text, display_mode, source_lines.get(index, 0))
         requested_size = overrides.get(index)
         if requested_size is None:
             event.style = "Default"
@@ -229,6 +265,9 @@ def burn_subtitles(
     progress: Callable[[float], None] | None = None,
     cue_font_sizes: Mapping[int, int] | None = None,
     expected_cue_count: int | None = None,
+    display_mode: str = "translated",
+    subtitle_preset: str = "soft",
+    cue_source_lines: Mapping[int, int] | None = None,
 ) -> Path:
     require_command("ffmpeg")
     video_path = video_path.resolve()
@@ -255,6 +294,9 @@ def burn_subtitles(
         cue_font_sizes=cue_font_sizes,
         expected_cue_count=expected_cue_count,
         log=logger,
+        display_mode=display_mode,
+        subtitle_preset=subtitle_preset,
+        cue_source_lines=cue_source_lines,
     )
     filter_expr = f"ass={ass_path.name}"
     logger("正在检查可用视频编码器。")

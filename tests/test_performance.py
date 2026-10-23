@@ -184,9 +184,10 @@ def test_transcription_passes_profile_thread_limit_to_whisper(
     monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=FakeWhisperModel))
     monkeypatch.setattr(
         "yblocalizer.transcribe._recover_vad_speech_gaps",
-        lambda _audio_path, _model, words, _kwargs, _check, _logger: words,
+        lambda _audio_path, _model, words, _kwargs, _check, _logger, **_extra: words,
     )
     monkeypatch.setattr("yblocalizer.transcribe.require_whisper_model", lambda _size: tmp_path / "model")
+    monkeypatch.setenv("YBLOCALIZER_WHISPER_WORKER", "1")
 
     transcribe_audio(
         tmp_path / "audio.wav",

@@ -38,6 +38,8 @@ $Arguments += @(
     "--add-data", "frontend\dist;frontend\dist",
     "--add-data", "demo\authorized-demo-10s.mp4;demo",
     "--add-data", "demo\artifacts;demo\artifacts",
+    "--add-data", "$ProjectRoot\src\yblocalizer\default_glossary.json;yblocalizer",
+    "--add-data", "$ProjectRoot\src\yblocalizer\tts_worker.py;yblocalizer",
     "scripts\launch_workbench.py"
 )
 

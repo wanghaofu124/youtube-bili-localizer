@@ -1,0 +1,12 @@
+[
+  {"source": "Max Verstappen", "target": "马克斯·维斯塔潘", "note": "ASR may mishear it as 'Max for Stappin'", "aliases": ["Verstappen", "Max for Stappin"]},
+  {"source": "GT3 racecars on steroids", "target": "强化版GT3赛车", "note": "strengthened/upgraded GT3 race cars, not casual drug/slang phrasing", "aliases": ["GT3 race cars on steroids"]},
+  {"source": "Formula One", "target": "F1", "note": "", "aliases": ["Formula 1"]},
+  {"source": "Super GT", "target": "Super GT", "note": "", "aliases": []},
+  {"source": "GT300", "target": "GT300", "note": "", "aliases": ["GT 300"]},
+  {"source": "GT500", "target": "GT500", "note": "", "aliases": ["GT 500"]},
+  {"source": "aero", "target": "空气动力", "note": "'more arrow' is likely 'more aero'", "aliases": ["more arrow"]},
+  {"source": "downforce", "target": "下压力", "note": "'down horsepower' is likely 'downforce and horsepower'", "aliases": ["down horsepower"]},
+  {"source": "horsepower", "target": "马力", "note": "", "aliases": []},
+  {"source": "lap time", "target": "圈速", "note": "if context mentions a benchmark or lap challenge, 'attempt to beat...' likely means attempt to beat the benchmark lap time", "aliases": ["benchmark lap"]}
+]

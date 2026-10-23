@@ -68,6 +68,8 @@ class PipelineOptions:
     whisper_model_size: str = "small"
     source_language: str | None = None
     beam_size: int = 5
+    asr_hint: str = ""
+    asr_vad_mode: str = "standard"
     ocr_interval: float = 0.5
     ocr_crop_ratio: float = 0.30
     ocr_min_chars: int = 3
@@ -88,6 +90,7 @@ class PipelineOptions:
     font_name: str = "Microsoft YaHei"
     font_size: int = 24
     subtitle_display_mode: str = "translated"
+    subtitle_preset: str = "soft"
     subtitle_color: str = "&H00FFFFFF"
     subtitle_outline_color: str = "&H00000000"
     subtitle_outline: int = 1
@@ -98,6 +101,10 @@ class PipelineOptions:
     bilibili_browser: str = "chromium"
     bilibili_profile_dir: Path | None = None
     bilibili_wait_for_review: bool = True
+    dub_enabled: bool = False
+    dub_mix: str = "duck"
+    voxcpm_python: str = ""
+    voxcpm_model_dir: str = ""
 
 
 @dataclass(slots=True)
@@ -170,7 +177,7 @@ def run_pipeline(
     small scheduler here preserves the original one-command CLI without
     maintaining a second implementation of the media workflow.
     """
-    from .workflow import WorkflowArtifacts, artifacts_to_video_job, run_stage
+    from .workflow import CORE_STAGES, WorkflowArtifacts, artifacts_to_video_job, run_stage
 
     ctx = context or _legacy_context
     logger = log or (lambda message: print(message, flush=True))
@@ -198,7 +205,7 @@ def run_pipeline(
         if proposal.get("requires_consent"):
             raise RuntimeError("当前下载画质低于档位上限，需要先明确确认画质方案。")
         options.quality_proposal = proposal
-    stages = ["acquire", "extract", "translate", "render"]
+    stages = [*CORE_STAGES, "dub"]
     if options.publish_to_bilibili:
         stages.append("publish")
     try:

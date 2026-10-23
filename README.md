@@ -8,11 +8,11 @@
 
 面向**已获授权视频**的 Python 本地化工具：将本地文件或授权 URL 转为中文字幕硬字幕视频，并在人工确认前辅助填写 B 站投稿信息。
 
-## Windows 0.2.57 下载（推荐）
+## Windows 0.3.0 下载（推荐）
 
-- [便携 ZIP（YouTubeBiliLocalizer-v0.2.57-windows-x64.zip）](https://github.com/wanghaofu124/youtube-bili-localizer/releases/download/v0.2.57/YouTubeBiliLocalizer-v0.2.57-windows-x64.zip)：推荐下载。将 ZIP 解压到有写入权限的文件夹，再运行解压目录内的 `YouTubeBiliLocalizer.exe`，无需安装。
-- **安装包（备用）**：v0.2.57 本次发布便携 ZIP；需要安装向导时，可使用 [v0.2.55 安装包](https://github.com/wanghaofu124/youtube-bili-localizer/releases/download/v0.2.55/YouTubeBiliLocalizer-v0.2.55-setup.exe)。
-- [发布页与校验文件](https://github.com/wanghaofu124/youtube-bili-localizer/releases/tag/v0.2.57)：Windows x64。桌面窗口需要 WebView2；默认音频流程需要 FFmpeg/ffprobe 和所选 Whisper 模型，依赖中心可按需安装或下载；Ollama、CUDA、OCR、Node.js 和翻译模型按所选流程启用。
+- [便携 ZIP（YouTubeBiliLocalizer-v0.3.0-windows-x64.zip）](https://github.com/wanghaofu124/youtube-bili-localizer/releases/download/v0.3.0/YouTubeBiliLocalizer-v0.3.0-windows-x64.zip)：推荐下载。将 ZIP 解压到有写入权限的文件夹，再运行解压目录内的 `YouTubeBiliLocalizer.exe`，无需安装。
+- [安装包（YouTubeBiliLocalizer-v0.3.0-setup.exe）](https://github.com/wanghaofu124/youtube-bili-localizer/releases/download/v0.3.0/YouTubeBiliLocalizer-v0.3.0-setup.exe)。
+- [发布页与校验文件](https://github.com/wanghaofu124/youtube-bili-localizer/releases/tag/v0.3.0)：Windows x64。桌面窗口需要 WebView2；默认音频流程需要 FFmpeg/ffprobe 和所选 Whisper 模型，依赖中心可按需安装或下载；Ollama、CUDA、OCR、Node.js 和翻译模型按所选流程启用。
 
 当前公开 Windows 二进制未签名，Windows 仍可能显示 SmartScreen 或其他安全检查。运行前请在发布页核对对应的 SHA-256 校验文件；选择 ZIP 便携版不会取消系统安全检查。
 

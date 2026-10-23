@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import json
 import shutil
+
+from .util import read_json
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov"}
@@ -97,10 +98,7 @@ def resolve_task_title(directory: Path) -> str:
 def _read_json_object(path: Path) -> dict:
     if not path.is_file():
         return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    data = read_json(path, {})
     return data if isinstance(data, dict) else {}
 
 

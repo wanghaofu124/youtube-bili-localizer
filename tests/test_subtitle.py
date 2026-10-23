@@ -18,7 +18,7 @@ def test_bilingual_translation_first_and_cjk_layout() -> None:
     assert "\n" in text
 
 
-def test_bilingual_prefers_one_chinese_line_and_one_english_line() -> None:
+def test_bilingual_keeps_one_chinese_line_while_english_wraps() -> None:
     segment = Segment(
         0,
         6,
@@ -35,8 +35,26 @@ def test_bilingual_prefers_one_chinese_line_and_one_english_line() -> None:
     english = [line for line in lines if line not in chinese]
     assert chinese == ["你知道，我的设想是让潘多拉成为生态缸，而如今所有植物"]
     assert english == [
-        "You see, my idea was for Pandora to be an ecosystem vivarium, and with all its plants"
+        "You see, my idea was for Pandora to be an ecosystem vivarium,",
+        "and with all its plants",
     ]
+
+
+def test_bilingual_short_chinese_with_long_english_wraps_english_to_two_lines() -> None:
+    source = (
+        "When the reef finally recovered, the divers returned every single week to count the fish, "
+        "photograph the corals, and log the water temperature."
+    )
+    segment = Segment(0, 8, source, "珊瑚礁终于恢复了。")
+    text = format_segment_text(
+        segment,
+        display_mode="bilingual-translation-first",
+        max_chars_per_line=18,
+    )
+    lines = text.splitlines()
+    assert lines[0] == "珊瑚礁终于恢复了。"
+    assert len(lines[1:]) == 2
+    assert " ".join(lines[1:]) == source
 
 
 def test_bilingual_allows_two_rows_only_when_chinese_is_too_long() -> None:

@@ -7,7 +7,7 @@ account, cookie, or arbitrary URL is used by this demo.
 ## Run the real demo
 
 ```powershell
-cd D:\codex\youtube-bili-localizer
+cd <仓库目录>\youtube-bili-localizer
 powershell -ExecutionPolicy Bypass -File scripts\run_workbench_demo.ps1
 ```
 

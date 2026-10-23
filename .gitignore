@@ -38,3 +38,14 @@ frontend/.preview.png
 packaging/msix/store-identity.json
 releases/msix/
 .msix-staging/
+.store-preview-data/
+docs/graduation/
+docs/graduation-test-plan.md
+docs/graduation-*-template.csv
+docs/signing/
+docs/store/
+*.pfx
+*.p12
+*.pem
+*.key
+cookies*.txt

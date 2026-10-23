@@ -94,3 +94,56 @@ def test_invalid_cue_font_plan_warns_and_uses_default_style(
     generated = (tmp_path / "zh.ass").read_text(encoding="utf-8-sig")
     assert "YBCueFont" not in generated
     assert any("默认字号继续渲染" in line for line in logs)
+
+
+def test_style_bilingual_source_lines_uses_position_not_script() -> None:
+    from yblocalizer.render import _style_bilingual_source_lines
+
+    secondary = "{\\rSecondary}"
+    # Target language English: the source line is Chinese.
+    assert _style_bilingual_source_lines("你好世界\\NHello world", "bilingual-source-first", 1) == secondary + "你好世界{\\r}\\NHello world"
+    assert _style_bilingual_source_lines("Hello world\\N你好世界", "bilingual-translation-first", 1) == "Hello world\\N" + secondary + "你好世界{\\r}"
+    # Two lines per side.
+    assert _style_bilingual_source_lines("a\\Nb\\N中\\N文", "bilingual-translation-first", 2) == "a\\Nb\\N" + secondary + "中{\\r}\\N" + secondary + "文{\\r}"
+    assert _style_bilingual_source_lines("single", "bilingual-source-first", 0) == "single"
+
+
+def test_bilingual_source_style_follows_source_line_count_not_half() -> None:
+    from yblocalizer.render import _style_bilingual_source_lines
+
+    secondary = "{\\rSecondary}"
+    # One translated line + two source lines: halving would style the wrong line.
+    assert _style_bilingual_source_lines("译文\\NLine one\\NLine two", "bilingual-translation-first", 2) == (
+        "译文\\N" + secondary + "Line one{\\r}\\N" + secondary + "Line two{\\r}"
+    )
+    assert _style_bilingual_source_lines("Line one\\NLine two\\N译文", "bilingual-source-first", 2) == (
+        secondary + "Line one{\\r}\\N" + secondary + "Line two{\\r}\\N译文"
+    )
+
+
+def test_cue_source_line_counts_matches_bilingual_srt_layout() -> None:
+    from yblocalizer.models import Segment
+    from yblocalizer.subtitle import cue_source_line_counts, format_segment_text
+
+    segments = [
+        Segment(0, 2, "Line one\nLine two", "译文"),
+        Segment(2, 4, "same", "same"),
+        Segment(4, 6, "", "只有译文"),
+    ]
+    counts = cue_source_line_counts(segments, "bilingual-translation-first", smart_layout=False)
+    assert counts == {1: 2, 2: 0, 3: 0}
+    assert format_segment_text(segments[0], "bilingual-translation-first", smart_layout=False) == "译文\nLine one\nLine two"
+
+
+def test_prepare_ass_styles_only_source_lines_from_counts(tmp_path) -> None:
+    import pysubs2
+    from yblocalizer.render import _prepare_ass
+
+    srt = tmp_path / "sub.srt"
+    srt.write_text("1\n00:00:00,000 --> 00:00:01,000\n译文\nLine one\nLine two\n", encoding="utf-8")
+    path = _prepare_ass(srt, size=(1920, 1080), font_name="Microsoft YaHei", font_size=24, primary_color="&H00FFFFFF",
+                        outline_color="&H00000000", outline=2, shadow=0, margin_v=None, raised_margin=False,
+                        margin_ratio=0.05, display_mode="bilingual-translation-first", cue_source_lines={1: 2})
+    text = pysubs2.load(str(path)).events[0].text
+    assert text.startswith("译文\\N{\\rSecondary}Line one")
+    assert "{\\rSecondary}Line two" in text

@@ -6,7 +6,7 @@ from pathlib import Path
 import shutil
 from typing import Any, Callable
 
-from .dependencies import OLLAMA_MODEL_TAGS, dependency_capabilities, ollama_local_status
+from .dependencies import DEFAULT_VOXCPM_MODEL_DIR, DEFAULT_VOXCPM_PYTHON, OLLAMA_MODEL_TAGS, dependency_capabilities, ollama_local_status, voxcpm_status
 from .download import po_token_provider_status
 from .ocr_subtitle import _normalize_ocr_language, available_ocr_languages, ocr_language_ready
 from .render import render_encoder_status
@@ -28,6 +28,7 @@ MAX_FONT_NAME_LENGTH = 100
 MAX_TARGET_LANGUAGE_LENGTH = 32
 MAX_TAGS = 20
 MAX_TAG_LENGTH = 30
+MAX_ASR_HINT_LENGTH = 240
 
 
 class InputValidationError(ValueError):
@@ -127,6 +128,7 @@ def _validate_strict_source(source: dict[str, Any]) -> None:
     bool_fields = (
         "require_reuse_allowed", "smart_translation", "smart_subtitle_layout",
         "publish_to_bilibili", "include_source_link", "close_after_fill", "prefer_platform_subtitles",
+        "dub_enabled",
     )
     for field in bool_fields:
         if field in source:
@@ -157,6 +159,7 @@ def _validate_strict_source(source: dict[str, Any]) -> None:
         "font_name": MAX_FONT_NAME_LENGTH,
         "target_lang": MAX_TARGET_LANGUAGE_LENGTH,
         "source_language": MAX_TARGET_LANGUAGE_LENGTH,
+        "asr_hint": MAX_ASR_HINT_LENGTH,
     }
     for field, maximum in text_fields.items():
         if field in source and source[field] is not None:
@@ -215,7 +218,7 @@ def default_options(output_dir: str = "outputs/workbench_demo") -> dict[str, Any
         "resource_profile": "balanced",
         "subtitle_source": "audio", "prefer_platform_subtitles": True,
         "whisper_model_size": "small", "source_language": "", "audio_channel": "mix",
-        "beam_size": 5, "ocr_interval": 0.5, "ocr_crop_ratio": 0.30, "ocr_min_chars": 3,
+        "beam_size": 5, "asr_hint": "", "asr_vad_mode": "standard", "ocr_interval": 0.5, "ocr_crop_ratio": 0.30, "ocr_min_chars": 3,
         "ocr_language": "eng",
         "subtitle_margin_ratio": 0.055, "render_crf": 20,
         "translator": "deepseek", "target_lang": "zh-Hans", "translate_model": "",
@@ -223,11 +226,13 @@ def default_options(output_dir: str = "outputs/workbench_demo") -> dict[str, Any
         "llm_pricing_mode": "auto", "llm_custom_pricing": {},
         "smart_translation": True, "smart_subtitle_layout": True,
         "font_name": "Microsoft YaHei", "font_size": 24,
-        "subtitle_display_mode": "translated", "subtitle_color": "白色",
+        "subtitle_display_mode": "translated", "subtitle_preset": "soft", "subtitle_color": "白色",
         "subtitle_outline_color": "黑色", "subtitle_effect": "描边",
         "output_dir": output_dir, "description": "", "tags": [],
         "publish_to_bilibili": False, "include_source_link": True,
         "bilibili_browser": "chromium", "close_after_fill": False,
+        "dub_enabled": False, "dub_mix": "duck",
+        "voxcpm_python": DEFAULT_VOXCPM_PYTHON, "voxcpm_model_dir": DEFAULT_VOXCPM_MODEL_DIR,
     }
 
 
@@ -279,12 +284,22 @@ def normalize_options(value: Any, output_dir: str, *, strict: bool = True) -> di
     audio_channel = str(raw.get("audio_channel") or "mix").strip().lower()
     if audio_channel not in {"mix", "left", "right"}:
         raise InputValidationError("声道必须是 mix、left 或 right。", code="invalid_choice", field="audio_channel")
+    asr_vad_mode = str(raw.get("asr_vad_mode") or "standard").strip().lower()
+    if asr_vad_mode not in {"standard", "sensitive"}:
+        if strict:
+            raise InputValidationError("人声检测必须是 standard 或 sensitive。", code="invalid_choice", field="asr_vad_mode")
+        asr_vad_mode = "standard"
     subtitle_source = str(raw["subtitle_source"])
     if subtitle_source not in {"auto", "audio", "ocr", "merged"}:
         raise InputValidationError("字幕来源选项无效。", code="invalid_choice", field="subtitle_source")
     display_mode = str(raw["subtitle_display_mode"])
     if display_mode not in {"translated", "bilingual-source-first", "bilingual-translation-first"}:
         raise InputValidationError("字幕显示模式无效。", code="invalid_choice", field="subtitle_display_mode")
+    subtitle_preset = str(raw["subtitle_preset"])
+    if subtitle_preset not in {"soft", "compact", "equal"}:
+        if strict:
+            raise InputValidationError("双语样式预设无效。", code="invalid_choice", field="subtitle_preset")
+        subtitle_preset = "soft"
     effect = (
         str(source["subtitle_effect"])
         if "subtitle_effect" in source
@@ -335,6 +350,8 @@ def normalize_options(value: Any, output_dir: str, *, strict: bool = True) -> di
         "source_language": _text(raw["source_language"]) or None,
         "audio_channel": audio_channel,
         "beam_size": int(raw["beam_size"]) if strict else max(1, min(10, int(raw["beam_size"]))),
+        "asr_hint": _text(raw.get("asr_hint")),
+        "asr_vad_mode": asr_vad_mode,
         "ocr_interval": float(raw["ocr_interval"]) if strict else max(0.2, min(60.0, float(raw["ocr_interval"]))),
         "ocr_crop_ratio": float(raw["ocr_crop_ratio"]) if strict else max(0.05, min(1.0, float(raw["ocr_crop_ratio"]))),
         "ocr_min_chars": int(raw["ocr_min_chars"]) if strict else max(1, min(100, int(raw["ocr_min_chars"]))),
@@ -348,7 +365,7 @@ def normalize_options(value: Any, output_dir: str, *, strict: bool = True) -> di
         "smart_translation": raw["smart_translation"] if strict else bool(raw["smart_translation"]),
         "smart_subtitle_layout": raw["smart_subtitle_layout"] if strict else bool(raw["smart_subtitle_layout"]),
         "font_name": str(raw["font_name"]).strip() or "Microsoft YaHei", "font_size": font_size,
-        "subtitle_display_mode": display_mode,
+        "subtitle_display_mode": display_mode, "subtitle_preset": subtitle_preset,
         "subtitle_color": _color(raw["subtitle_color"], "&H00FFFFFF"),
         "subtitle_outline_color": _color(raw["subtitle_outline_color"], "&H00000000"),
         "subtitle_outline": 0 if effect in {"阴影", "无"} else 1,
@@ -359,6 +376,10 @@ def normalize_options(value: Any, output_dir: str, *, strict: bool = True) -> di
         "include_source_link": raw["include_source_link"] if strict else bool(raw["include_source_link"]),
         "bilibili_browser": "msedge" if str(raw["bilibili_browser"]).lower() in {"edge", "msedge"} else "chromium",
         "close_after_fill": raw["close_after_fill"] if strict else bool(raw["close_after_fill"]),
+        "dub_enabled": raw["dub_enabled"] if strict else bool(raw["dub_enabled"]),
+        "dub_mix": "dub_only" if raw["dub_mix"] == "dub_only" else "duck",
+        "voxcpm_python": str(raw["voxcpm_python"] or DEFAULT_VOXCPM_PYTHON),
+        "voxcpm_model_dir": str(raw["voxcpm_model_dir"] or DEFAULT_VOXCPM_MODEL_DIR),
     }
 
 
@@ -461,5 +482,8 @@ def preflight(
         ready, _ = ocr_language_ready(options["ocr_language"])
         if missing and not ready:
             add_block("ocr_language_missing", f"Tesseract 缺少语言包：{', '.join(missing)}。请安装语言数据或更改 OCR 语言。")
+    if needs("dub") and options["dub_enabled"]:
+        dub = voxcpm_status(options["voxcpm_python"], options["voxcpm_model_dir"])
+        if not dub["voxcpm_available"]: add_block("voxcpm_unavailable", f"已开启配音，但 VoxCPM 不可用：{dub['voxcpm_reason']}")
     if needs("publish") and options["publish_to_bilibili"] and profile_in_use and profile_in_use(options["bilibili_browser"]): add_block("bilibili_profile_busy", "B 站自动化浏览器正在使用中，请关闭后再开始全流程。")
     return {"ready": not blocking, "blocking": blocking, "warnings": warnings, "normalized_options": options}

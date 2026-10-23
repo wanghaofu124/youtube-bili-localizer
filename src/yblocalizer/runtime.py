@@ -41,6 +41,7 @@ class PipelineStage(str, Enum):
     OCR = "ocr"
     TRANSLATING = "translating"
     RENDERING = "rendering"
+    DUBBING = "dubbing"
     PUBLISHING = "publishing"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
@@ -56,6 +57,7 @@ STAGE_LABELS = {
     PipelineStage.OCR: "画面文字识别",
     PipelineStage.TRANSLATING: "翻译字幕",
     PipelineStage.RENDERING: "渲染成片",
+    PipelineStage.DUBBING: "生成配音",
     PipelineStage.PUBLISHING: "投稿辅助",
     PipelineStage.COMPLETED: "处理完成",
     PipelineStage.CANCELLED: "已取消",

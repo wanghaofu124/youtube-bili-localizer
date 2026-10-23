@@ -28,7 +28,7 @@ from yblocalizer.workflow import (
     validate_srt,
 )
 from yblocalizer.runtime import PipelineContext
-from yblocalizer.workbench_api import WorkbenchJobs, _restored_created_at
+from yblocalizer.workbench_api import DemoJob, WorkbenchJobs, _restored_created_at
 
 
 def test_asr_evidence_artifact_round_trips_without_raw_path_loss() -> None:
@@ -242,7 +242,7 @@ def test_downstream_invalidation_preserves_upstream_checkpoint() -> None:
     changed = invalidate_downstream(states, "translate")
     assert states["acquire"]["status"] == "completed"
     assert states["extract"]["status"] == "completed"
-    assert changed == ["translate", "render", "publish"]
+    assert changed == ["translate", "render", "dub", "publish"]
     assert all(states[name]["status"] == "stale" for name in changed)
 
 
@@ -323,7 +323,7 @@ def test_platform_subtitles_skip_audio_extraction_and_whisper(
     )
     monkeypatch.setattr("yblocalizer.workflow.validate_media", lambda *_args: True)
     monkeypatch.setattr(
-        "yblocalizer.workflow._extract_audio",
+        "yblocalizer.workflow.extract_audio",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("audio extraction must be skipped")),
     )
     monkeypatch.setattr(
@@ -455,7 +455,7 @@ def test_style_change_only_invalidates_render_and_publish(tmp_path: Path) -> Non
     assert updated.stages["acquire"]["status"] == "completed"
     assert updated.stages["extract"]["status"] == "completed"
     assert updated.stages["translate"]["status"] == "completed"
-    assert stale == ["render", "publish"]
+    assert stale == ["render", "dub", "publish"]
     assert updated.next_stage == "render"
     assert updated.checks == [{"id": "ffmpeg", "status": "passed"}]
     assert updated.status == "ready"
@@ -829,14 +829,14 @@ def test_extract_always_refreshes_cached_audio(tmp_path: Path, monkeypatch: pyte
     stale.write_bytes(b"stale")
     refreshed: list[Path] = []
 
-    def fake_extract(video: Path, output: Path, ctx: object) -> Path:
-        del video, ctx
+    def fake_extract(video: Path, output: Path, **_kwargs) -> Path:
+        del video
         refreshed.append(output)
         output.write_bytes(b"fresh")
         return output
 
     monkeypatch.setattr("yblocalizer.workflow.validate_media", lambda *_args: True)
-    monkeypatch.setattr("yblocalizer.workflow._extract_audio", fake_extract)
+    monkeypatch.setattr("yblocalizer.workflow.extract_audio", fake_extract)
     monkeypatch.setattr(
         "yblocalizer.workflow.transcribe_audio",
         lambda audio, **_kwargs: (_ for _ in ()).throw(AssertionError(f"stop-after-audio:{audio}")),
@@ -902,3 +902,18 @@ def test_rerunning_extract_marks_translate_and_render_stale(
     assert updated.stages["render"]["status"] == "stale"
     assert updated.next_stage == "extract"
     jobs._running_id = None
+
+
+def test_successful_stage_sequence_marks_checkpoints_verified(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "input.mp4"
+    source.write_bytes(b"video")
+    jobs = WorkbenchJobs()
+    material = jobs.add_local_file(source, authorized=True)
+    job = jobs.create(material.id, "cpu", "int8", {"translator": "none", "target_lang": "en", "output_dir": str(tmp_path / "out")})
+    job.checkpoint_validation = "invalid"
+    monkeypatch.setattr("yblocalizer.workbench_api.run_workflow_stage", lambda _stage, _options, _work_dir, artifacts, *_a, **_k: artifacts)
+
+    jobs._run_stage_sequence(job, ["extract", "translate", "render"], "token")
+
+    assert job.status == "completed"
+    assert job.checkpoint_validation == "verified"

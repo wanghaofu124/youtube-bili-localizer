@@ -678,6 +678,7 @@ details[open] > .studio-drawer-summary { border-bottom: 1px solid var(--line); }
 .process-view .settings-section > .settings-grid > label:not(.check) > select { height: 42px; min-height: 42px; }
 .basic-primary-section { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .basic-primary-section > .settings-group-heading { grid-column: 1 / -1; }
+.settings-fold-body > .settings-span-2,
 .basic-primary-section > .settings-span-2 { grid-column: 1 / -1; }
 .basic-primary-section > .settings-entry-row { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; min-width: 0; }
 .basic-primary-section .settings-entry-row .settings-link-button { justify-self: auto; }
@@ -725,6 +726,9 @@ details[open] > .studio-drawer-summary { border-bottom: 1px solid var(--line); }
 .settings-section-label .app-icon { width: 18px; height: 18px; flex: 0 0 auto; color: var(--amber-deep); }
 .settings-section-label span { margin-left: auto; color: var(--muted); font-size: 10px; }
 .settings-drawer > label, .settings-drawer > .drawer-note, .settings-drawer > .cookies-hint { flex: 0 0 auto; }
+.settings-diagnostics { flex: 0 0 auto; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; width: 100%; }
+.settings-diagnostics .settings-section-label, .settings-diagnostics .drawer-note { width: 100%; }
+.settings-diagnostics .drawer-note { overflow-wrap: anywhere; }
 .settings-drawer-footer { position: sticky; bottom: 0; flex: 0 0 auto; margin: 0 -22px; padding: 12px 22px 16px; border-top: 1px solid var(--line); background: var(--panel); }
 .settings-drawer-footer .primary { width: 100%; }
 
@@ -794,3 +798,47 @@ details[open] > .studio-drawer-summary { border-bottom: 1px solid var(--line); }
 @media (max-width:700px) { .tutorial-modal { width:calc(100vw - 24px); max-height:calc(100vh - 24px); }.tutorial-header { padding:16px; }.tutorial-layout { grid-template-columns:1fr; }.tutorial-chapters { padding:11px 14px; border-right:0; border-bottom:1px solid var(--line); }.tutorial-select-label { display:grid; }.tutorial-chapter-list { display:none; }.tutorial-content { padding:18px 16px 12px; }.tutorial-modal>footer { padding:10px 16px; }.tutorial-modal>footer span { max-width:60%; }.tutorial-header h2 { font-size:21px; }.tutorial-figure { margin-inline:0; }.tutorial-figure figcaption { display:grid; gap:3px; }.tutorial-image-scroll { max-height:calc(100vh - 255px); } }
 .tutorial-modal { min-height:0; }.tutorial-modal>.tutorial-header,.tutorial-modal>footer { flex-shrink:0; }.tutorial-layout { display:flex; flex:1; min-height:0; }.tutorial-content { flex:1; min-height:0; }.tutorial-image-layout .tutorial-content { display:flex; flex-direction:column; overflow:hidden; }.tutorial-image-viewer { flex:1; min-height:0; display:flex; flex-direction:column; }.tutorial-image-viewer-head,.tutorial-image-tools,.tutorial-image-caption,.tutorial-image-back { flex-shrink:0; }.tutorial-image-scroll { flex:1; min-height:0; max-height:none; }.tutorial-image-scroll:not(.original) img { width:100%; height:auto; max-height:100%; object-fit:contain; object-position:top; }.tutorial-image-scroll.original { overflow:auto; }.tutorial-image-scroll.original img { width:auto; max-width:none; height:auto; }
 .template-modal.tutorial-modal { display:flex; flex-direction:column; min-height:0; }.template-modal.tutorial-modal .tutorial-layout { flex:1; min-height:0; overflow:hidden; }.template-modal.tutorial-modal .tutorial-content { min-height:0; }.template-modal.tutorial-modal.tutorial-modal-image { max-height:calc(100vh - 48px); }
+/* Batch processing panel (library) and batch parse list (material). */
+.batch-panel { margin: var(--space-4) 20px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel); overflow: hidden; }
+.batch-panel-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--line); }
+.batch-panel-head h2 { display: inline; margin: 0; color: var(--ink); font-family: var(--font-ui); font-size: 15px; font-weight: 700; }
+.batch-panel-head small { margin-left: var(--space-2); color: var(--muted); font-size: 12px; }
+.batch-panel .library-summary > div { display: flex; align-items: baseline; justify-content: center; gap: var(--space-2); min-height: 58px; padding: 7px 10px; background: var(--panel); }
+.batch-panel .library-summary > div.done b { color: var(--green); }
+.batch-panel .library-summary > div.failed b { color: var(--danger); }
+.batch-current { display: grid; gap: var(--space-2); padding: var(--space-3) var(--space-4); border-bottom: 1px solid var(--line); }
+.batch-current-line { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); color: var(--ink); font-size: 13px; }
+.batch-current-line span { color: var(--muted); }
+.batch-current-line .pct { color: var(--amber-deep); font-size: 15px; white-space: nowrap; }
+.batch-bar { height: 8px; overflow: hidden; border-radius: 5px; background: var(--panel-soft); }
+.batch-bar i { display: block; height: 100%; border-radius: 5px; background: var(--amber); transition: width .25s ease; }
+.batch-panel .video-library-row:last-child { border-bottom: 0; }
+.batch-summary { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); padding: var(--space-3) var(--space-4); font-size: 13px; }
+.batch-summary .ok { color: var(--green); }
+.batch-summary .bad { color: var(--danger); }
+.batch-parse { margin-top: var(--space-3); border: 1px solid var(--line); border-radius: 7px; background: var(--panel); overflow: hidden; }
+.batch-parse .video-library-row { min-height: 48px; grid-template-columns: 20px minmax(0, 1fr) auto; cursor: pointer; }
+.batch-parse-foot { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); padding: var(--space-3) var(--space-4); background: var(--panel-soft); color: var(--muted); font-size: 12px; }
+/* Glossary editor (processing page -> 术语表). */
+.glossary-modal { width: min(1000px, calc(100vw - 48px)); max-height: calc(100vh - 48px); display: flex; flex-direction: column; }
+.glossary-tools { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.glossary-tools > input:first-child { flex: 1 1 220px; }
+.glossary-tools small { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.glossary-note { margin: 0; color: var(--amber-deep); font-size: 12px; }
+.glossary-table { flex: 1; min-height: 0; overflow-y: auto; margin: 0; border: 1px solid var(--line); border-radius: 7px; }
+.glossary-table th, .glossary-table td { padding: 5px 7px; text-align: left; vertical-align: middle; }
+.glossary-table td:last-child { min-width: 0; text-align: right; }
+.glossary-table th { position: sticky; top: 0; z-index: 1; background: var(--panel-soft); color: var(--muted); font-weight: 600; }
+.glossary-table td input { width: 100%; min-height: 30px; padding: 4px 7px; border-radius: 5px; font-size: 12px; }
+.glossary-table tr.is-dirty td { background: var(--panel-soft); }
+.glossary-table tr.is-dirty td:first-child { box-shadow: inset 3px 0 0 var(--amber); }
+.glossary-table tr.is-duplicate td:first-child input { border-color: var(--danger); }
+.glossary-table .field-error { display: block; margin-top: 3px; }
+.glossary-modal footer > span { margin-right: auto; color: var(--muted); font-size: 12px; }
+.glossary-modal footer > .glossary-unsaved { color: var(--amber-deep); font-weight: 600; }
+
+/* M4 dub */
+.dub-section .is-disabled label { opacity: .55; }
+.dub-unavailable { grid-column: 1 / -1; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-soft); font-size: 12px; line-height: 1.6; }
+.dub-unavailable b { color: var(--danger); }
+.dub-help { display: block; margin-top: 4px; padding: 6px 8px; border: 1px dashed var(--line); border-radius: 5px; color: var(--muted); }

@@ -8,6 +8,7 @@ processes, which keeps the HTTP handlers and the media pipeline declarative.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import cache
 import ctypes
 import json
 import os
@@ -25,6 +26,10 @@ import hashlib
 import tempfile
 import zipfile
 from typing import Any, Callable
+
+from .diagnostics import log_frontend_error
+
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 WEBVIEW2_DOWNLOAD_URL = "https://developer.microsoft.com/microsoft-edge/webview2/"
@@ -649,6 +654,38 @@ def dependency_statuses(user_data_root: Path | None = None, ocr_language: str = 
     return rows
 
 
+DEFAULT_VOXCPM_PYTHON = os.getenv("YBLOCALIZER_VOXCPM_PYTHON", "")
+DEFAULT_VOXCPM_MODEL_DIR = os.getenv("YBLOCALIZER_VOXCPM_MODEL_DIR", "")
+VOXCPM_HELP = (
+    "配音使用独立的 VoxCPM 环境，本程序不会自动安装。请先准备：\n"
+    "1. 新建 Python 3.12 虚拟环境，在其中安装 voxcpm 和匹配 CUDA 的 torch；\n"
+    "2. 下载 VoxCPM2 模型到本地目录；\n"
+    "3. 用环境变量 YBLOCALIZER_VOXCPM_PYTHON 指定该环境的 python.exe，YBLOCALIZER_VOXCPM_MODEL_DIR 指定模型目录。\n"
+    "详见 docs/配音安装说明.md。"
+)
+
+
+@cache
+def voxcpm_status(python: str | None = None, model_dir: str | None = None) -> dict[str, Any]:
+    """Detect the separate VoxCPM venv and local model; never installs anything."""
+    python = python or DEFAULT_VOXCPM_PYTHON
+    model_dir = model_dir or DEFAULT_VOXCPM_MODEL_DIR
+    reason = None
+    if not Path(python).is_file():
+        reason = f"未找到 VoxCPM 的 Python：{python}"
+    elif not (Path(model_dir) / "config.json").is_file():
+        reason = f"未找到 VoxCPM 模型目录：{model_dir}"
+    else:
+        probe = subprocess.run(
+            [python, "-c", "import importlib.util,sys;sys.exit(0 if importlib.util.find_spec('voxcpm') else 3)"],
+            capture_output=True, timeout=30, creationflags=NO_WINDOW,
+        )
+        if probe.returncode != 0:
+            reason = "VoxCPM 环境中未安装 voxcpm 包。"
+    return {"voxcpm_available": reason is None, "voxcpm_reason": reason, "voxcpm_help": VOXCPM_HELP,
+            "voxcpm_python": python, "voxcpm_model_dir": model_dir}
+
+
 def dependency_capabilities(user_data_root: Path | None = None) -> dict[str, dict[str, Any]]:
     return {
         row["id"]: {key: row[key] for key in ("label", "required", "purpose", "available")}
@@ -920,6 +957,7 @@ class DependencyManager:
                 job.status, job.error, job.message = "cancelled", None, "安装已由用户取消。"
                 job.logs.append(job.message)
             else:
+                log_frontend_error("依赖安装失败，已显示在界面")
                 job.status, job.error, job.message = "failed", str(exc), "安装失败；修正网络或权限问题后可以重试。"
                 job.logs.append(str(exc))
         finally:

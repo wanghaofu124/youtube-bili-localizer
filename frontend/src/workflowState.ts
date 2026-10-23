@@ -1,6 +1,6 @@
-export type StageName = "acquire" | "extract" | "translate" | "render" | "publish";
+export type StageName = "acquire" | "extract" | "translate" | "render" | "dub" | "publish";
 
-const order: StageName[] = ["acquire", "extract", "translate", "render", "publish"];
+const order: StageName[] = ["acquire", "extract", "translate", "render", "dub", "publish"];
 
 /** Treat API null and UI empty string as the same for optional text fields. */
 export function sameTaskOption(_key: string, current: unknown, saved: unknown): boolean {
@@ -38,7 +38,8 @@ export function stageAvailability(
   publishEnabled: boolean,
 ): { enabled: boolean; reason: string } {
   if (statuses[stage] === "completed") return { enabled: true, reason: "" };
-  const previous = order.slice(0, order.indexOf(stage));
+  // "dub" only exists in statuses when the job has dubbing enabled.
+  const previous = order.slice(0, order.indexOf(stage)).filter((name) => name !== "dub" || name in statuses);
   if (!checksReady) return { enabled: false, reason: "先通过准备检查" };
   if (!previous.every((name) => statuses[name] === "completed")) return { enabled: false, reason: "先完成上一个阶段" };
   if (stage === "publish" && !publishEnabled) return { enabled: false, reason: "处理方案中未启用投稿辅助" };

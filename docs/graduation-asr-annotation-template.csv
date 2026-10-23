@@ -1,1 +1,0 @@
-sample_id,video_code,start_sec,end_sec,speaker_id,gold_transcript,asr_model,asr_transcript,corrected_transcript,error_type,proper_noun_error,number_error,negation_error,omission_or_miss,reviewer,adjudication,notes

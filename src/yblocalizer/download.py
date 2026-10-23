@@ -626,6 +626,8 @@ def _fetch_range(
     try:
         completed = subprocess.run(command, capture_output=True, timeout=180,
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if completed.returncode != 0:
+            raise RuntimeError(f"curl 分块读取失败（退出码 {completed.returncode}）")
         header_text = (completed.stdout or b"").decode("utf-8", "replace")
         statuses = re.findall(r"HTTP/\d(?:\.\d)? (\d{3})", header_text)
         status = int(statuses[-1]) if statuses else 0
@@ -723,6 +725,12 @@ def _range_download(
                 break
             if len(data) < requested:
                 break
+    if total and stop_at:
+        expected = min(total, stop_at)
+    else:
+        expected = stop_at or total
+    if expected and offset != expected:
+        raise RuntimeError(f"分块下载不完整：得到 {offset} 字节，期望 {expected} 字节")
     part.replace(destination)
     return offset
 
@@ -790,7 +798,7 @@ def _download_prefix_with_ranges(
     if not files:
         raise _RangeDownloadUnavailable("没有可下载的媒体流")
     final = work_dir / f"{video_id}.mp4"
-    ffmpeg = require_command("ffmpeg")
+    ffmpeg = resolve_command("ffmpeg")
     command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
     for item in files:
         command += ["-i", str(item)]
@@ -798,7 +806,7 @@ def _download_prefix_with_ranges(
     if len(files) >= 2:
         command += ["-map", "0:v:0", "-map", "1:a:0"]
     command += ["-c", "copy", str(final)]
-    completed = subprocess.run(command, capture_output=True, text=True,
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=600,
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if completed.returncode != 0 or not final.is_file() or final.stat().st_size < 1024:
         for item in files:
@@ -808,6 +816,8 @@ def _download_prefix_with_ranges(
         )
     for item in files:
         item.unlink(missing_ok=True)
+    if log:
+        log(f"前缀分片下载完成：已截取前 {int(seconds)} 秒，{final.name}")
     selected = dict(selected)
     selected["requested_downloads"] = [{"filepath": str(final), "_range_prefix": True}]
     return selected
@@ -887,7 +897,7 @@ def _download_with_ranges(
             files[0].replace(final)
     else:
         final = work_dir / f"{video_id}.mp4"
-        ffmpeg = require_command("ffmpeg")
+        ffmpeg = resolve_command("ffmpeg")
         command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
         for path in files:
             command += ["-i", str(path)]
@@ -895,7 +905,7 @@ def _download_with_ranges(
         for index in range(2, len(files)):
             maps += ["-map", f"{index}:0"]
         command += maps + ["-c", "copy", str(final)]
-        completed = subprocess.run(command, capture_output=True, text=True,
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=600,
                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if completed.returncode != 0 or not final.is_file():
             for path in files:
@@ -1058,6 +1068,7 @@ def _probe_video_dimensions(path: Path) -> tuple[int, int] | None:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=20,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -1183,8 +1194,13 @@ def _cancellable_external_ffmpeg(
     original = external.Popen
     profile = normalize_resource_profile(resource_profile)
 
+    stderr_files: list = []
+
     class CancellablePopen(original):
         def __init__(self, *args, **kwargs):
+            if kwargs.get("stderr") is None:
+                kwargs["stderr"] = tempfile.TemporaryFile()
+                stderr_files.append(kwargs["stderr"])
             super().__init__(*args, **kwargs)
             lower_process_priority(self, profile)
 
@@ -1217,9 +1233,19 @@ def _cancellable_external_ffmpeg(
 
     external.Popen = CancellablePopen
     try:
-        yield
+        yield stderr_files
     finally:
         external.Popen = original
+        for item in stderr_files:
+            item.close()
+
+
+def _last_ffmpeg_stderr_line(files: list) -> str:
+    if not files:
+        return ""
+    files[-1].seek(0)
+    lines = [line.strip() for line in files[-1].read().decode("utf-8", "replace").splitlines() if line.strip()]
+    return _safe_diagnostic_text(lines[-1])[:200] if lines else ""
 
 
 def get_video_metadata(
@@ -1497,17 +1523,27 @@ def download_with_ytdlp(
                         log(f"Range 分块下载失败，改用 yt-dlp 下载器：{_safe_diagnostic_text(str(exc))[:160]}")
             return ydl.extract_info(url, download=True)
 
+    def _extract_with_ffmpeg_detail(trial_opts: dict) -> dict:
+        try:
+            return _extract_once(trial_opts)
+        except Exception as exc:
+            tail = _last_ffmpeg_stderr_line(ffmpeg_stderr)
+            if "ffmpeg exited" in str(exc) and tail:
+                raise RuntimeError(f"{exc}: {tail}") from exc
+            raise
+
+    ffmpeg_stderr: list = []
     try:
         check()
         partial_snapshots = _snapshot_existing_partials(work_dir, log)
-        with _cancellable_external_ffmpeg(check, profile):
+        with _cancellable_external_ffmpeg(check, profile) as ffmpeg_stderr:
             info = _extract_with_client_chain(
                 opts=opts,
                 url=url,
                 proxy=proxy,
                 po_token_mode=po_token_mode,
                 log=log,
-                extract=_extract_once,
+                extract=_extract_with_ffmpeg_detail,
             )
         check()
     except Exception as exc:
@@ -1863,3 +1899,44 @@ def _download_thumbnail(
     except Exception:
         original.unlink(missing_ok=True)
         return None
+
+
+def list_playlist_entries(
+    url: str,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | None = None,
+    proxy: str | None = None,
+    playlist_items: str | None = None,
+) -> list[dict[str, Any]]:
+    """Expand a playlist (or single video) URL into flat entries without downloading."""
+    _validate_video_url(url)
+    import yt_dlp
+
+    opts: dict[str, Any] = {
+        "extract_flat": "in_playlist",
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "socket_timeout": 15,
+    }
+    opts["playlist_items"] = playlist_items or "1-200"
+    if proxy:
+        opts["proxy"] = _validate_proxy(proxy)
+    if cookies_file:
+        opts["cookiefile"] = cookies_file
+    elif cookies_from_browser:
+        opts["cookiesfrombrowser"] = (cookies_from_browser,)
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    entries = info.get("entries")
+    if entries is None:
+        return [{"url": info.get("webpage_url") or url, "title": info.get("title") or "", "duration": info.get("duration")}]
+    result = []
+    for entry in entries:
+        if not entry:
+            continue
+        entry_url = entry.get("webpage_url") or entry.get("url") or ""
+        if entry_url and not entry_url.startswith("http") and entry.get("ie_key") == "Youtube":
+            entry_url = f"https://www.youtube.com/watch?v={entry_url}"
+        result.append({"url": entry_url, "title": entry.get("title") or "", "duration": entry.get("duration")})
+    return result
