@@ -50,6 +50,7 @@ _DEFAULT_USER_DATA_ROOT.mkdir(parents=True, exist_ok=True)
 load_dotenv(_DEFAULT_USER_DATA_ROOT / ".env")
 
 from .download import DownloadProposalMismatch, DownloadResolutionMismatch, YouTubeAccessError, get_video_metadata, list_playlist_entries, po_token_provider_status
+from .site_hot import refresh_site_hot, set_site_region, site_snapshot
 from .subscriptions import add_channel, refresh_weekly_hot, remove_channel, set_subscriptions_enabled, subscription_view, update_subscription_settings, weekly_snapshot
 from .dub import DUB_MIX_MODES
 from .dependencies import (
@@ -4211,6 +4212,13 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._json(subscription_view()); return
         if path == "/api/subscriptions/weekly":
             self._json(weekly_snapshot()); return
+        if path == "/api/trending":
+            category = str(parse_qs(urlparse(self.path).query).get("category", ["mix"])[0] or "mix")
+            try:
+                self._json(site_snapshot(category))
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
         if path == "/api/tutorial-preferences":
             self._json(_read_tutorial_preferences()); return
         if path == "/api/diagnostics":
@@ -4613,6 +4621,26 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 self._json(refresh_weekly_hot(self._weekly_access(payload), channel_id=channel_id))
             except InputValidationError as exc:
                 self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/trending/refresh":
+            try:
+                category = str(payload.get("category") or "mix")
+                raw_region = payload.get("region")
+                region = raw_region if isinstance(raw_region, str) else None
+                self._json(refresh_site_hot(self._weekly_access(payload), category, region=region))
+            except InputValidationError as exc:
+                self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/trending/region":
+            try:
+                region = payload.get("region")
+                if not isinstance(region, str):
+                    raise ValueError("没有这个地区。")
+                self._json(set_site_region(region, str(payload.get("category") or "mix")))
             except ValueError as exc:
                 self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return

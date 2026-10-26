@@ -752,6 +752,21 @@ type WeeklyHot = {
   channel_progress?: { done: number; total: number } | null;
   sort_mode?: "views" | "recent";
 };
+type SiteHot = {
+  category: string;
+  categories: { id: string; label: string }[];
+  region: string;
+  regions: { id: string; label: string }[];
+  cached_region: string | null;
+  videos: WeeklyHotVideo[];
+  refreshed_at: string | null;
+  stale: boolean;
+  refreshing?: boolean;
+  progress?: { done: number; total: number; category: string } | null;
+  error: string | null;
+  query_errors: string[];
+  sort_mode?: "views";
+};
 function WeeklyThumb({ src }: { src: string }) {
   const [failed, setFailed] = useState(false);
   if (failed) return <span className="weekly-hot-thumb" />;
@@ -760,6 +775,15 @@ function WeeklyThumb({ src }: { src: string }) {
 const formatUploadDay = (value: string | null): string | null => {
   if (!value || !/^\d{8}$/.test(value)) return null;
   return `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`;
+};
+const formatDaysAgo = (timestamp: number | null): string | null => {
+  if (!timestamp) return null;
+  const upload = new Date(timestamp * 1000);
+  const now = new Date();
+  const days = Math.round((Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - Date.UTC(upload.getUTCFullYear(), upload.getUTCMonth(), upload.getUTCDate())) / 86400000);
+  if (days <= 0) return "今天";
+  if (days === 1) return "昨天";
+  return `${days} 天前`;
 };
 const formatClock = (seconds: number): string => {
   const total = Math.max(0, Math.round(seconds));
@@ -932,6 +956,14 @@ function App() {
   const [channelDraft, setChannelDraft] = useState("");
   const [channelSaving, setChannelSaving] = useState(false);
   const weeklyBusyRef = useRef(false);
+  const [hotTab, setHotTab] = useState<"site" | "channels">("site");
+  const [site, setSite] = useState<SiteHot | null>(null);
+  const [siteCategory, setSiteCategory] = useState("mix");
+  const [siteBusy, setSiteBusy] = useState(false);
+  const [siteError, setSiteError] = useState("");
+  const siteBusyRef = useRef(false);
+  const siteCategoryRef = useRef("mix");
+  const siteRegionRef = useRef("US");
   const [materialSourceTab, setMaterialSourceTab] = useState<"url" | "local">("url");
   const sourceRevision = useRef(0);
   const [authorized, setAuthorized] = useState(false);
@@ -1510,6 +1542,74 @@ function App() {
       setMessage(error instanceof Error ? error.message : "移除频道失败");
     } finally {
       setChannelSaving(false);
+    }
+  };
+  const loadSite = async (category = siteCategoryRef.current) => {
+    try {
+      const data = await api<SiteHot>(`/api/trending?category=${encodeURIComponent(category)}`);
+      if (siteCategoryRef.current !== category) return data;
+      siteRegionRef.current = data.region;
+      setSite(data);
+      setSiteCategory(data.category);
+      return data;
+    } catch (error) {
+      setSiteError(error instanceof Error ? error.message : "读取全站热门失败");
+      return null;
+    }
+  };
+  const refreshSite = async () => {
+    if (siteBusyRef.current) return;
+    const category = siteCategoryRef.current;
+    siteBusyRef.current = true;
+    setSiteBusy(true);
+    setSiteError("");
+    try {
+      const data = await api<SiteHot>("/api/trending/refresh", {
+        method: "POST",
+        body: JSON.stringify({
+          category,
+          ...(site ? { region: siteRegionRef.current } : {}),
+          cookies_from_browser: options.cookies_from_browser,
+          cookies_file: options.cookies_file,
+          youtube_proxy: options.youtube_proxy,
+          youtube_po_token_mode: options.youtube_po_token_mode,
+        }),
+      });
+      if (siteCategoryRef.current === category) {
+        siteRegionRef.current = data.region;
+        setSite(data);
+        setSiteCategory(data.category);
+      }
+      if (data.refreshing) setSiteError("正在刷新，请稍候再试。");
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "刷新失败";
+      setSiteError(detail);
+      setMessage(`全站热门刷新失败：${detail}`);
+    } finally {
+      siteBusyRef.current = false;
+      setSiteBusy(false);
+    }
+  };
+  const selectSiteCategory = (id: string) => {
+    siteCategoryRef.current = id;
+    setSiteCategory(id);
+    setSiteError("");
+    void loadSite(id);
+  };
+  const saveSiteRegion = async (region: string) => {
+    siteRegionRef.current = region;
+    setSite((current) => current ? { ...current, region } : current);
+    try {
+      const data = await api<SiteHot>("/api/trending/region", {
+        method: "POST",
+        body: JSON.stringify({ region, category: siteCategoryRef.current }),
+      });
+      if (siteCategoryRef.current === data.category) {
+        siteRegionRef.current = data.region;
+        setSite(data);
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "保存地区失败");
     }
   };
   const loadRestorableJobs = async () => {
@@ -2272,6 +2372,7 @@ function App() {
           loadDependencies(),
           loadRestorableJobs(),
           loadWeekly(),
+          loadSite(),
         ]);
       })
       .then((results) => {
@@ -3790,6 +3891,19 @@ function App() {
     }, 700);
     return () => window.clearInterval(timer);
   }, [weeklyBusy]);
+  useEffect(() => {
+    if (!siteBusy) return;
+    const category = siteCategoryRef.current;
+    const timer = window.setInterval(() => {
+      void api<SiteHot>(`/api/trending?category=${encodeURIComponent(category)}`).then((data) => {
+        if (!siteBusyRef.current || siteCategoryRef.current !== category) return;
+        setSite((current) => current && current.category === category
+          ? { ...current, progress: data.progress, refreshing: data.refreshing }
+          : current);
+      }).catch(() => undefined);
+    }, 700);
+    return () => window.clearInterval(timer);
+  }, [siteBusy]);
   const chooseNativeMaterial = async () => {
     if (running) return setMessage("当前阶段运行中，请先取消或等待完成后再切换素材。");
     if (!authorized) {
@@ -3854,6 +3968,20 @@ function App() {
           : weeklyRankedByViews
             ? `${weekly.videos.length} 条近 ${weeklyWindow} 天热片`
             : `${weekly.videos.length} 条近 ${weeklyWindow} 天新片`;
+  const siteLabel = site?.categories.find((item) => item.id === siteCategory)?.label ?? "综合";
+  const siteBusyLabel = site?.progress && site.progress.category === siteCategory
+    ? `正在刷新 ${site.progress.done}/${site.progress.total}`
+    : "正在刷新…";
+  const siteSummary = !site
+    ? "读取全站热门…"
+    : siteBusy
+      ? siteBusyLabel
+      : site.category === siteCategory && site.videos.length
+        ? `${siteLabel} · ${site.videos.length} 条近一周`
+        : "点刷新获取";
+  const siteRegions = site?.regions ?? [{ id: "US", label: "美国" }, { id: "GB", label: "英国" }, { id: "", label: "不限" }];
+  const siteFailedQueries = (site?.query_errors ?? []).map((item) => item.split(":")[0]).filter(Boolean);
+  const siteReady = Boolean(site && site.category === siteCategory);
   const weeklyNumber = (key: "window_days" | "top_k" | "fetch_count" | "cache_ttl_hours", label: string, min: number, max: number) => (
     <label>
       {label}
@@ -3874,79 +4002,146 @@ function App() {
       />
     </label>
   );
+  const hotVideoRow = (entry: WeeklyHotVideo, when: string | null, showViews: boolean) => (
+    <div className="video-library-row" key={entry.url}>
+      {weekly?.show_thumbnails !== false && (entry.thumbnail_url
+        ? <WeeklyThumb src={entry.thumbnail_url} />
+        : <span className="weekly-hot-thumb" />)}
+      <div className="video-library-main">
+        <div className="video-library-title"><b title={entry.title}>{entry.title}</b></div>
+        <div className="video-library-meta">
+          <span>{entry.channel_title || "频道"}</span>
+          {showViews && typeof entry.view_count === "number" && <span>{entry.view_count.toLocaleString()} 播放</span>}
+          {typeof entry.duration === "number" && <span>{formatClock(entry.duration)}</span>}
+          {when && <span>{when}</span>}
+        </div>
+      </div>
+      <div className="video-library-actions">
+        <button type="button" className="primary small" onClick={() => fillSourceFromHot(entry.url)} disabled={running}>翻译</button>
+      </div>
+    </div>
+  );
   const weeklyHotCard = (
     <details className={`workspace-card weekly-hot-card${weekly?.show_thumbnails === false ? " no-thumbs" : ""}`}>
       <summary>
-        <b>{weeklyTitle}</b>
-        <span>{weeklySummary}</span>
+        <b>{hotTab === "channels" ? weeklyTitle : "本周热片"}</b>
+        <span>{hotTab === "site" ? siteSummary : weeklySummary}</span>
       </summary>
       <div className="weekly-hot-body">
         <div className="weekly-hot-toolbar">
-          <button type="button" onClick={() => void refreshWeekly()} disabled={!canRefreshWeekly || weeklyBusy} aria-busy={weeklyBusy}>
-            {weeklyBusy ? weeklyBusyLabel : weeklyFailures.length ? "全部重试" : "刷新"}
-          </button>
-          {weekly?.refreshed_at && <small>上次获取 {new Date(weekly.refreshed_at).toLocaleString()}</small>}
+          <div className="weekly-hot-tabs" role="tablist">
+            <button type="button" className={hotTab === "site" ? "selected" : ""} aria-selected={hotTab === "site"} onClick={() => setHotTab("site")}>全站热门</button>
+            <button type="button" className={hotTab === "channels" ? "selected" : ""} aria-selected={hotTab === "channels"} onClick={() => setHotTab("channels")}>关注频道</button>
+          </div>
+          {hotTab === "site" ? (
+            <>
+              <button type="button" onClick={() => void refreshSite()} disabled={siteBusy} aria-busy={siteBusy}>
+                {siteBusy ? siteBusyLabel : "刷新"}
+              </button>
+              <label className="weekly-hot-region">
+                地区
+                <select
+                  value={site?.region ?? "US"}
+                  disabled={siteBusy || !site}
+                  onChange={(event) => void saveSiteRegion(event.target.value)}
+                >
+                  {siteRegions.map((item) => <option key={item.id || "any"} value={item.id}>{item.label}</option>)}
+                </select>
+              </label>
+              {siteReady && site?.refreshed_at && <small>上次获取 {new Date(site.refreshed_at).toLocaleString()}</small>}
+            </>
+          ) : (
+            <>
+              <button type="button" onClick={() => void refreshWeekly()} disabled={!canRefreshWeekly || weeklyBusy} aria-busy={weeklyBusy}>
+                {weeklyBusy ? weeklyBusyLabel : weeklyFailures.length ? "全部重试" : "刷新"}
+              </button>
+              {weekly?.refreshed_at && <small>上次获取 {new Date(weekly.refreshed_at).toLocaleString()}</small>}
+            </>
+          )}
         </div>
-        {!weekly && <div className="empty-editor"><b>正在读取关注列表</b><span>稍候即可查看本周热片。</span></div>}
-        {weeklyError && <p className="metadata-notice error" role="status">{weeklyError}</p>}
-        {weeklyFailures.map((item) => (
-          <p className="metadata-notice warning weekly-hot-failure" role="status" key={item.id}>
-            <span>{item.title || item.url}：{item.error || "读取失败"}</span>
-            <button type="button" onClick={() => void refreshWeekly(item.id)} disabled={weeklyBusy}>重试</button>
-          </p>
-        ))}
-        {weekly && !weekly.enabled && (
-          <div className="empty-editor">
-            <b>关注频道未开启</b>
-            <span>到设置里打开「启用周热」，添加 YouTube 频道后，这里会列出近 {weeklyWindow} 天的片子。</span>
-            <button type="button" onClick={() => setSettingsOpen(true)}>打开设置</button>
-          </div>
-        )}
-        {weekly?.enabled && weekly.channels.length === 0 && (
-          <div className="empty-editor">
-            <b>还没有关注的频道</b>
-            <span>在设置 → 关注频道里粘贴 https://www.youtube.com/@handle 或 /channel/UC… 链接。</span>
-            <button type="button" onClick={() => setSettingsOpen(true)}>去添加频道</button>
-          </div>
-        )}
-        {weekly?.enabled && weekly.channels.length > 0 && weekly.videos.length === 0 && !weeklyBusy && (
-          <div className="empty-editor">
-            <b>{weeklyFailures.length ? "没有拿到新片" : `这 ${weeklyWindow} 天没有新片`}</b>
-            <span>{weeklyFailures.length ? "失败的频道列在上面，可以重试该频道，或点「全部重试」。成功的频道会留在列表里。" : `已关注的频道在近 ${weeklyWindow} 天内没有带上传时间的视频。没有日期的不会出现在这里。`}</span>
-          </div>
-        )}
-        {weeklyBusy && (weekly?.videos.length ?? 0) === 0 && canRefreshWeekly && (
-          <div className="empty-editor">
-            <b>正在获取最近上传</b>
-            <span>每个频道读取最近约 {weekly?.fetch_count ?? 20} 条，只保留 {weeklyWindow} 天内、能读到上传时间的视频。</span>
-          </div>
-        )}
-        {weekly?.videos.map((entry) => {
-          const day = formatUploadDay(entry.upload_date);
-          return (
-            <div className="video-library-row" key={entry.url}>
-              {weekly?.show_thumbnails !== false && (entry.thumbnail_url
-                ? <WeeklyThumb src={entry.thumbnail_url} />
-                : <span className="weekly-hot-thumb" />)}
-              <div className="video-library-main">
-                <div className="video-library-title"><b title={entry.title}>{entry.title}</b></div>
-                <div className="video-library-meta">
-                  <span>{entry.channel_title || "频道"}</span>
-                  {weeklyRankedByViews && typeof entry.view_count === "number" && <span>{entry.view_count.toLocaleString()} 播放</span>}
-                  {typeof entry.duration === "number" && <span>{formatClock(entry.duration)}</span>}
-                  {day && <span>{day}</span>}
-                </div>
-              </div>
-              <div className="video-library-actions">
-                <button type="button" className="primary small" onClick={() => fillSourceFromHot(entry.url)} disabled={running}>翻译</button>
-              </div>
+        {hotTab === "site" ? (
+          <>
+            <div className="weekly-hot-cats" role="tablist">
+              {(site?.categories ?? []).map((item) => (
+                <button type="button" key={item.id} className={item.id === siteCategory ? "selected" : ""} aria-selected={item.id === siteCategory} onClick={() => selectSiteCategory(item.id)}>
+                  {item.label}
+                </button>
+              ))}
             </div>
-          );
-        })}
-        {weekly?.enabled && weekly.channels.length > 0 && (
-          <p className="weekly-hot-note">{weeklyRankedByViews
-            ? "按播放量从高到低，播放量相同则较新的在前。数字来自频道页，没有逐条再打开视频。"
-            : "按上传时间从新到旧。播放量缺失时用这个顺序，也不逐条重抓。日期来自频道页的近似时间，可能有几小时偏差；太旧或没有日期的不会列入。"}</p>
+            {!site && <div className="empty-editor"><b>正在读取全站热门</b><span>稍候即可查看近一周播放量较高的视频。</span></div>}
+            {siteError && <p className="metadata-notice error" role="status">{siteError}</p>}
+            {siteReady && site?.error && <p className="metadata-notice error" role="status">{site.error}</p>}
+            {siteReady && site?.refreshed_at && site.cached_region !== site.region && (
+              <p className="metadata-notice warning" role="status">地区已改，点刷新后按新地区重取。下面仍是上次的列表。</p>
+            )}
+            {siteReady && siteFailedQueries.length > 0 && !site?.error && (
+              <p className="metadata-notice warning" role="status">部分搜索词没有拉到：{siteFailedQueries.join("、")}。下面是这次拿到的结果。</p>
+            )}
+            {site && !siteReady && !siteError && (
+              <div className="empty-editor"><b>正在读取{siteLabel}</b><span>稍候。</span></div>
+            )}
+            {siteReady && site && site.videos.length === 0 && !siteBusy && (
+              <div className="empty-editor">
+                <b>{site.error ? "没有拿到热门视频" : "还没有全站热门"}</b>
+                <span>{site.error ? "上次如果有列表会留在这里。可以稍后再点刷新。" : "点「刷新」直接看 YouTube 近一周播放量较高的视频，不用先关注频道。"}</span>
+              </div>
+            )}
+            {siteBusy && siteReady && (site?.videos.length ?? 0) === 0 && (
+              <div className="empty-editor">
+                <b>正在搜索本周热门</b>
+                <span>按这个分类的词搜索近一周视频，去掉 Shorts 和直播后按播放量排列。</span>
+              </div>
+            )}
+            {siteReady && site?.videos.map((entry) => hotVideoRow(entry, formatDaysAgo(entry.timestamp), true))}
+            {siteReady && (site?.videos.length ?? 0) > 0 && (
+              <p className="weekly-hot-note">{site?.category === "mix"
+                ? "综合是科技、游戏、科普和编程，按播放量重排。音乐、影视、生活、资讯在各自的分类里。已去掉 60 秒及以内的 Shorts 和直播。时间只精确到天。"
+                : "按播放量从高到低重排。搜索页的顺序只是大致按播放量。已去掉 60 秒及以内的 Shorts 和直播。时间只精确到天。"}</p>
+            )}
+          </>
+        ) : (
+          <>
+            {!weekly && <div className="empty-editor"><b>正在读取关注列表</b><span>稍候即可查看本周热片。</span></div>}
+            {weeklyError && <p className="metadata-notice error" role="status">{weeklyError}</p>}
+            {weeklyFailures.map((item) => (
+              <p className="metadata-notice warning weekly-hot-failure" role="status" key={item.id}>
+                <span>{item.title || item.url}：{item.error || "读取失败"}</span>
+                <button type="button" onClick={() => void refreshWeekly(item.id)} disabled={weeklyBusy}>重试</button>
+              </p>
+            ))}
+            {weekly && !weekly.enabled && (
+              <div className="empty-editor">
+                <b>关注频道未开启</b>
+                <span>到设置里打开「启用周热」，添加 YouTube 频道后，这里会列出近 {weeklyWindow} 天的片子。</span>
+                <button type="button" onClick={() => setSettingsOpen(true)}>打开设置</button>
+              </div>
+            )}
+            {weekly?.enabled && weekly.channels.length === 0 && (
+              <div className="empty-editor">
+                <b>还没有关注的频道</b>
+                <span>在设置 → 关注频道里粘贴 https://www.youtube.com/@handle 或 /channel/UC… 链接。</span>
+                <button type="button" onClick={() => setSettingsOpen(true)}>去添加频道</button>
+              </div>
+            )}
+            {weekly?.enabled && weekly.channels.length > 0 && weekly.videos.length === 0 && !weeklyBusy && (
+              <div className="empty-editor">
+                <b>{weeklyFailures.length ? "没有拿到新片" : `这 ${weeklyWindow} 天没有新片`}</b>
+                <span>{weeklyFailures.length ? "失败的频道列在上面，可以重试该频道，或点「全部重试」。成功的频道会留在列表里。" : `已关注的频道在近 ${weeklyWindow} 天内没有带上传时间的视频。没有日期的不会出现在这里。`}</span>
+              </div>
+            )}
+            {weeklyBusy && (weekly?.videos.length ?? 0) === 0 && canRefreshWeekly && (
+              <div className="empty-editor">
+                <b>正在获取最近上传</b>
+                <span>每个频道读取最近约 {weekly?.fetch_count ?? 20} 条，只保留 {weeklyWindow} 天内、能读到上传时间的视频。</span>
+              </div>
+            )}
+            {weekly?.videos.map((entry) => hotVideoRow(entry, formatUploadDay(entry.upload_date), weeklyRankedByViews))}
+            {weekly?.enabled && weekly.channels.length > 0 && (
+              <p className="weekly-hot-note">{weeklyRankedByViews
+                ? "按播放量从高到低，播放量相同则较新的在前。数字来自频道页，没有逐条再打开视频。"
+                : "按上传时间从新到旧。播放量缺失时用这个顺序，也不逐条重抓。日期来自频道页的近似时间，可能有几小时偏差；太旧或没有日期的不会列入。"}</p>
+            )}
+          </>
         )}
       </div>
     </details>
@@ -6815,7 +7010,7 @@ function App() {
             />
             启用周热
           </label>
-          <p className="drawer-note">打开后，素材页列出已关注频道近 {weeklyWindow} 天的视频。频道页带齐播放量时按播放量排，标题是「本周热片」；播放量缺失时按上传时间排，标题是「本周新片」。列表缓存约 {weekly?.cache_ttl_hours ?? 12} 小时，点刷新会立刻重取。关闭或还没有频道时，卡片仍留在素材页。</p>
+          <p className="drawer-note">打开后，素材页「关注频道」标签列出已关注频道近 {weeklyWindow} 天的视频。频道页带齐播放量时按播放量排，标题是「本周热片」；播放量缺失时按上传时间排，标题是「本周新片」。列表缓存约 {weekly?.cache_ttl_hours ?? 12} 小时，点刷新会立刻重取。关闭或还没有频道时，这个标签仍留在素材页。全站热门是另一个标签，不依赖这里的开关。</p>
           <div className="settings-weekly-fields">
             {weeklyNumber("window_days", "时间窗口（天）", 1, 30)}
             {weeklyNumber("top_k", "最多显示", 1, 50)}
