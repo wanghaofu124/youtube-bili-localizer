@@ -733,6 +733,7 @@ type WeeklyHotVideo = {
   channel_url: string;
   channel_id: string;
   thumbnail_url?: string | null;
+  view_count?: number | null;
 };
 type WeeklyChannelResult = { id: string; url: string; title: string; ok: boolean; error: string | null; count: number };
 type WeeklyHot = {
@@ -744,6 +745,7 @@ type WeeklyHot = {
   stale: boolean;
   refreshing?: boolean;
   window_days: number;
+  sort_mode?: "views" | "recent";
 };
 const formatUploadDay = (value: string | null): string | null => {
   if (!value || !/^\d{8}$/.test(value)) return null;
@@ -3804,6 +3806,8 @@ function App() {
 
   const weeklyFailures = weekly?.channel_results.filter((item) => !item.ok) ?? [];
   const canRefreshWeekly = Boolean(weekly?.enabled && weekly.channels.length);
+  const weeklyRankedByViews = weekly?.sort_mode === "views";
+  const weeklyTitle = weeklyRankedByViews || !weekly?.videos.length ? "本周热片" : "本周新片";
   const weeklySummary = !weekly
     ? "读取关注列表…"
     : !weekly.enabled
@@ -3812,11 +3816,13 @@ function App() {
         ? "还没有频道 · 展开查看说明"
         : weeklyBusy
           ? "正在刷新…"
-          : `${weekly.videos.length} 条近 7 天新片`;
+          : weeklyRankedByViews
+            ? `${weekly.videos.length} 条近 7 天热片`
+            : `${weekly.videos.length} 条近 7 天新片`;
   const weeklyHotCard = (
     <details className="workspace-card weekly-hot-card">
       <summary>
-        <b>本周热片</b>
+        <b>{weeklyTitle}</b>
         <span>{weeklySummary}</span>
       </summary>
       <div className="weekly-hot-body">
@@ -3868,6 +3874,7 @@ function App() {
                 <div className="video-library-title"><b title={entry.title}>{entry.title}</b></div>
                 <div className="video-library-meta">
                   <span>{entry.channel_title || "频道"}</span>
+                  {weeklyRankedByViews && typeof entry.view_count === "number" && <span>{entry.view_count.toLocaleString()} 播放</span>}
                   {typeof entry.duration === "number" && <span>{formatClock(entry.duration)}</span>}
                   {day && <span>{day}</span>}
                 </div>
@@ -3879,7 +3886,9 @@ function App() {
           );
         })}
         {weekly?.enabled && weekly.channels.length > 0 && (
-          <p className="weekly-hot-note">按上传时间排列，不看播放量。日期来自频道页的近似时间，可能有几小时偏差；太旧或没有日期的不会列入。</p>
+          <p className="weekly-hot-note">{weeklyRankedByViews
+            ? "按播放量从高到低，播放量相同则较新的在前。数字来自频道页，没有逐条再打开视频。"
+            : "按上传时间从新到旧。播放量缺失时用这个顺序，也不逐条重抓。日期来自频道页的近似时间，可能有几小时偏差；太旧或没有日期的不会列入。"}</p>
         )}
       </div>
     </details>
@@ -6738,7 +6747,7 @@ function App() {
               同一地址用于元数据、视频、封面和浏览器验证；只保存在本机设置，不会写入任务历史或日志。
             </small>
           </label>
-          <div className="settings-section-label"><NavIcon name="video" className="app-icon" /><b>关注频道</b><span>本周热片</span></div>
+          <div className="settings-section-label"><NavIcon name="video" className="app-icon" /><b>关注频道</b><span>{weeklyTitle}</span></div>
           <label className="check settings-check">
             <input
               type="checkbox"
@@ -6748,7 +6757,7 @@ function App() {
             />
             启用关注频道
           </label>
-          <p className="drawer-note">打开后，素材页「本周热片」会列出已关注频道近 7 天的新片。列表缓存约 12 小时，也可以手动刷新。关闭或还没有频道时，卡片仍留在素材页。</p>
+          <p className="drawer-note">打开后，素材页列出已关注频道近 7 天的视频。频道页带齐播放量时按播放量排，标题是「本周热片」；播放量缺失时按上传时间排，标题是「本周新片」。列表缓存约 12 小时，点刷新会立刻重取。关闭或还没有频道时，卡片仍留在素材页。</p>
           <div className="settings-channels">
             {(weekly?.channels ?? []).map((channel) => (
               <div className="settings-channel-row" key={channel.id}>

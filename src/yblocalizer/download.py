@@ -1951,6 +1951,8 @@ def _flat_entries(info: dict, url: str, *, with_dates: bool) -> list[dict[str, A
             row["upload_date"] = upload_date
             row["timestamp"] = timestamp
             row["thumbnail_url"] = _best_thumbnail_url(entry)
+            view_count = entry.get("view_count")
+            row["view_count"] = view_count if isinstance(view_count, int) else None
             channel = entry.get("channel") or entry.get("uploader") or ""
             if channel:
                 row["channel"] = channel

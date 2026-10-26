@@ -144,6 +144,21 @@ def _save_cache(refreshed_at: str, videos: list[dict], channel_results: list[dic
     })
 
 
+def _order_videos(videos: list[dict]) -> str:
+    """Return ``views`` or ``recent`` and sort ``videos`` in place.
+
+    Flat tab rows often include ``view_count``. The list is ranked by plays
+    only when every row has one, so the label can say 热. A missing count
+    (including an older cache row) keeps upload order and the 新片 label.
+    Nothing re-opens each video to fill the count.
+    """
+    if videos and all(isinstance(item.get("view_count"), int) for item in videos):
+        videos.sort(key=lambda item: (item["view_count"], item.get("timestamp") or 0), reverse=True)
+        return "views"
+    videos.sort(key=lambda item: item.get("timestamp") or 0, reverse=True)
+    return "recent"
+
+
 def _in_window(timestamp: int | None, now: float) -> bool:
     """Keep uploads from the last 7 calendar days, UTC.
 
@@ -192,8 +207,8 @@ def weekly_snapshot(now: float | None = None) -> dict:
     results = []
     if enabled:
         videos = [item for item in cache["videos"] if item.get("channel_id") in ids and _in_window(item.get("timestamp"), stamp)]
-        videos.sort(key=lambda item: item.get("timestamp") or 0, reverse=True)
         results = [item for item in cache["channel_results"] if item.get("id") in ids]
+    sort_mode = _order_videos(videos)
     refreshed = _parse_stamp(cache.get("refreshed_at"))
     stale = bool(enabled and subs["channels"] and (refreshed is None or stamp - refreshed >= CACHE_TTL_SECONDS))
     return {
@@ -205,6 +220,7 @@ def weekly_snapshot(now: float | None = None) -> dict:
         "stale": stale,
         "refreshing": False,
         "window_days": 7,
+        "sort_mode": sort_mode,
     }
 
 
@@ -263,6 +279,7 @@ def _video_row(channel: dict, entry: dict, channel_title: str) -> dict | None:
         "channel_url": channel["url"],
         "channel_id": channel["id"],
         "thumbnail_url": entry.get("thumbnail_url") or None,
+        "view_count": entry.get("view_count") if isinstance(entry.get("view_count"), int) else None,
     }
 
 
@@ -364,7 +381,7 @@ def refresh_weekly_hot(access: dict, now: float | None = None) -> dict:
                     seen.add(item["url"])
                     videos.append(item)
                     result["count"] += 1
-            videos.sort(key=lambda item: item["timestamp"], reverse=True)
+            _order_videos(videos)
             _save_subscriptions(current)
             _save_cache(_iso(stamp), videos, channel_results)
         return weekly_snapshot(stamp)

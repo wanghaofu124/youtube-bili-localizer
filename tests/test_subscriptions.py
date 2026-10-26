@@ -66,6 +66,7 @@ def test_weekly_refresh_ranks_by_upload_time_and_isolates_failures(monkeypatch):
     monkeypatch.setattr("yblocalizer.subscriptions.list_channel_uploads", fake_list)
     view = refresh_weekly_hot({"cookies_from_browser": None, "cookies_file": None, "proxy": None, "po_token_mode": "off"}, now=NOW)
     assert [item["title"] for item in view["videos"]] == ["Newer", "Older", "Edge"]
+    assert view["sort_mode"] == "recent"
     assert view["stale"] is False
     failed = [item for item in view["channel_results"] if not item["ok"]]
     assert len(failed) == 1 and failed[0]["error"] == "channel down"
@@ -115,6 +116,34 @@ def test_failed_channel_keeps_previous_in_window_videos(monkeypatch):
     assert failed["count"] == 1
 
 
+def test_view_counts_rank_the_week_until_one_count_is_missing(monkeypatch):
+    monkeypatch.setattr("yblocalizer.subscriptions.REQUEST_GAP_SECONDS", 0)
+    add_channel("https://www.youtube.com/@good")
+    set_subscriptions_enabled(True)
+    newer = int(NOW - 3600)
+    older = int(NOW - 2 * 3600)
+    access = {"cookies_from_browser": None, "cookies_file": None, "proxy": None, "po_token_mode": "off"}
+    rows = {"missing": False}
+
+    def fake_list(_url, *_args, **_kwargs):
+        older_row = {"url": "https://www.youtube.com/watch?v=older", "title": "Older", "duration": 12, "timestamp": older, "view_count": 90}
+        newer_row = {"url": "https://www.youtube.com/watch?v=newer", "title": "Newer", "duration": 8, "timestamp": newer, "view_count": 10}
+        if rows["missing"]:
+            newer_row.pop("view_count")
+        return {"title": "Good", "entries": [newer_row, older_row]}
+
+    monkeypatch.setattr("yblocalizer.subscriptions.list_channel_uploads", fake_list)
+    ranked = refresh_weekly_hot(access, now=NOW)
+    assert [item["title"] for item in ranked["videos"]] == ["Older", "Newer"]
+    assert [item["view_count"] for item in ranked["videos"]] == [90, 10]
+    assert ranked["sort_mode"] == "views"
+    rows["missing"] = True
+    fallback = refresh_weekly_hot(access, now=NOW)
+    assert [item["title"] for item in fallback["videos"]] == ["Newer", "Older"]
+    assert fallback["videos"][0]["view_count"] is None
+    assert fallback["sort_mode"] == "recent"
+
+
 def test_disabled_refresh_does_not_call_ytdlp(monkeypatch):
     called = []
     monkeypatch.setattr("yblocalizer.subscriptions.list_channel_uploads", lambda *_args, **_kwargs: called.append(True))
@@ -134,6 +163,7 @@ def test_weekly_route_returns_empty_snapshot():
     assert result["payload"]["enabled"] is False
     assert result["payload"]["videos"] == []
     assert result["payload"]["window_days"] == 7
+    assert result["payload"]["sort_mode"] == "recent"
 
 
 def test_channel_listing_reuses_flat_extract_and_metadata_access(monkeypatch):
@@ -160,6 +190,7 @@ def test_channel_listing_reuses_flat_extract_and_metadata_access(monkeypatch):
                     "title": "Clip",
                     "duration": 12,
                     "timestamp": 1_700_000_000,
+                    "view_count": 1200,
                     "thumbnails": [
                         {"url": "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg", "width": 480, "height": 360},
                         {"url": "https://i.ytimg.com/vi/abcdefghijk/sddefault.jpg", "width": 640, "height": 480},
@@ -197,6 +228,7 @@ def test_channel_listing_reuses_flat_extract_and_metadata_access(monkeypatch):
     assert listed["entries"][0]["upload_date"] == "20231114"
     assert listed["entries"][0]["timestamp"] == 1_700_000_000
     assert listed["entries"][0]["thumbnail_url"] == "https://i.ytimg.com/vi/abcdefghijk/sddefault.jpg"
+    assert listed["entries"][0]["view_count"] == 1200
 
 
 def test_plain_playlist_listing_stays_flat_without_access_opts(monkeypatch):
