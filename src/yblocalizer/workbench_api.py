@@ -50,7 +50,7 @@ _DEFAULT_USER_DATA_ROOT.mkdir(parents=True, exist_ok=True)
 load_dotenv(_DEFAULT_USER_DATA_ROOT / ".env")
 
 from .download import DownloadProposalMismatch, DownloadResolutionMismatch, YouTubeAccessError, get_video_metadata, list_playlist_entries, po_token_provider_status
-from .subscriptions import add_channel, refresh_weekly_hot, remove_channel, set_subscriptions_enabled, subscription_view, weekly_snapshot
+from .subscriptions import add_channel, refresh_weekly_hot, remove_channel, set_subscriptions_enabled, subscription_view, update_subscription_settings, weekly_snapshot
 from .dub import DUB_MIX_MODES
 from .dependencies import (
     voxcpm_status,
@@ -4599,9 +4599,18 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             except InputValidationError as exc:
                 self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
             return
+        if path == "/api/subscriptions/settings":
+            try:
+                self._json(update_subscription_settings(payload if isinstance(payload, dict) else {}))
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
         if path == "/api/subscriptions/weekly/refresh":
             try:
-                self._json(refresh_weekly_hot(self._weekly_access(payload)))
+                channel_id = str(payload.get("channel_id") or "").strip() or None
+                if channel_id:
+                    channel_id = require_text(channel_id, "channel_id", 32, allow_empty=False)
+                self._json(refresh_weekly_hot(self._weekly_access(payload), channel_id=channel_id))
             except InputValidationError as exc:
                 self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
             except ValueError as exc:

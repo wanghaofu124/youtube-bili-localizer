@@ -23,13 +23,20 @@ from .download import list_channel_uploads
 SUBSCRIPTIONS_NAME = "channel-subscriptions.json"
 CACHE_NAME = "weekly-hot.json"
 MAX_CHANNELS = 30
-CACHE_TTL_SECONDS = 12 * 60 * 60
 CHANNEL_WORKERS = 3
 REQUEST_GAP_SECONDS = 0.75
-PLAYLIST_ITEMS = "1-20"
+
+_PREF_BOUNDS = {
+    "window_days": (1, 30, 7),
+    "top_k": (1, 50, 20),
+    "fetch_count": (1, 50, 20),
+    "cache_ttl_hours": (1, 168, 12),
+}
 
 _io_lock = threading.Lock()
 _refresh_lock = threading.Lock()
+_progress_lock = threading.Lock()
+_progress = {"on": False, "done": 0, "total": 0}
 
 _CHANNEL_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com"}
 
@@ -85,8 +92,23 @@ def normalize_channel_videos_url(value: str) -> str:
     return f"https://www.youtube.com/{key}/videos"
 
 
+def _bound(value, low: int, high: int, default: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    return min(high, max(low, value))
+
+
+def _preferences(data: dict) -> dict:
+    prefs = {
+        key: _bound(data.get(key), low, high, default)
+        for key, (low, high, default) in _PREF_BOUNDS.items()
+    }
+    prefs["show_thumbnails"] = data.get("show_thumbnails") is not False
+    return prefs
+
+
 def _empty_subscriptions() -> dict:
-    return {"enabled": False, "channels": []}
+    return {"enabled": False, "channels": [], **_preferences({})}
 
 
 def _load_subscriptions() -> dict:
@@ -111,11 +133,16 @@ def _load_subscriptions() -> dict:
             "title": str(item.get("title") or ""),
             "added_at": str(item.get("added_at") or ""),
         })
-    return {"enabled": data.get("enabled") is True, "channels": channels}
+    loaded = data if isinstance(data, dict) else {}
+    return {"enabled": loaded.get("enabled") is True, "channels": channels, **_preferences(loaded)}
 
 
 def _save_subscriptions(data: dict) -> None:
-    _write_json(_subscriptions_path(), {"enabled": data["enabled"] is True, "channels": data["channels"]})
+    _write_json(_subscriptions_path(), {
+        "enabled": data["enabled"] is True,
+        "channels": data["channels"],
+        **_preferences(data),
+    })
 
 
 def _load_cache() -> dict:
@@ -159,19 +186,19 @@ def _order_videos(videos: list[dict]) -> str:
     return "recent"
 
 
-def _in_window(timestamp: int | None, now: float) -> bool:
-    """Keep uploads from the last 7 calendar days, UTC.
+def _in_window(timestamp: int | None, now: float, window_days: int) -> bool:
+    """Keep uploads from the last `window_days` UTC calendar days.
 
-    approximate_date snaps to midnight, so a strict 168-hour cutoff drops the
-    oldest day of the week once the clock passes midnight. One future day is
-    allowed because that same rounding can land slightly ahead of now.
+    approximate_date snaps to midnight, so a strict hour cutoff drops the
+    oldest day once the clock passes midnight. One future day is allowed
+    because that same rounding can land slightly ahead of now.
     """
     if timestamp is None:
         return False
     upload_day = datetime.fromtimestamp(timestamp, timezone.utc).date()
     today = datetime.fromtimestamp(now, timezone.utc).date()
     delta = (today - upload_day).days
-    return -1 <= delta <= 6
+    return -1 <= delta <= window_days - 1
 
 
 def _parse_stamp(value: str | None) -> float | None:
@@ -191,9 +218,35 @@ def get_subscriptions() -> dict:
         return _load_subscriptions()
 
 
+def _progress_view() -> dict | None:
+    with _progress_lock:
+        if not _progress["on"]:
+            return None
+        return {"done": _progress["done"], "total": _progress["total"]}
+
+
+def _progress_start(total: int) -> None:
+    with _progress_lock:
+        _progress.update(on=True, done=0, total=total)
+
+
+def _progress_step() -> None:
+    with _progress_lock:
+        _progress["done"] += 1
+
+
+def _progress_stop() -> None:
+    with _progress_lock:
+        _progress["on"] = False
+
+
 def subscription_view() -> dict:
     data = get_subscriptions()
-    return {"enabled": data["enabled"], "channels": data["channels"]}
+    return {
+        "enabled": data["enabled"],
+        "channels": data["channels"],
+        **_preferences(data),
+    }
 
 
 def weekly_snapshot(now: float | None = None) -> dict:
@@ -205,12 +258,17 @@ def weekly_snapshot(now: float | None = None) -> dict:
     enabled = subs["enabled"] is True
     videos = []
     results = []
+    window_days = subs["window_days"]
     if enabled:
-        videos = [item for item in cache["videos"] if item.get("channel_id") in ids and _in_window(item.get("timestamp"), stamp)]
+        videos = [item for item in cache["videos"] if item.get("channel_id") in ids and _in_window(item.get("timestamp"), stamp, window_days)]
         results = [item for item in cache["channel_results"] if item.get("id") in ids]
     sort_mode = _order_videos(videos)
+    if enabled:
+        videos = videos[:subs["top_k"]]
     refreshed = _parse_stamp(cache.get("refreshed_at"))
-    stale = bool(enabled and subs["channels"] and (refreshed is None or stamp - refreshed >= CACHE_TTL_SECONDS))
+    ttl = subs["cache_ttl_hours"] * 60 * 60
+    stale = bool(enabled and subs["channels"] and (refreshed is None or stamp - refreshed >= ttl))
+    progress = _progress_view()
     return {
         "enabled": enabled,
         "channels": subs["channels"],
@@ -218,8 +276,13 @@ def weekly_snapshot(now: float | None = None) -> dict:
         "channel_results": results,
         "refreshed_at": cache.get("refreshed_at"),
         "stale": stale,
-        "refreshing": False,
-        "window_days": 7,
+        "refreshing": progress is not None,
+        "window_days": window_days,
+        "top_k": subs["top_k"],
+        "fetch_count": subs["fetch_count"],
+        "show_thumbnails": subs["show_thumbnails"],
+        "cache_ttl_hours": subs["cache_ttl_hours"],
+        "channel_progress": progress,
         "sort_mode": sort_mode,
     }
 
@@ -261,6 +324,26 @@ def set_subscriptions_enabled(enabled: bool) -> dict:
     return weekly_snapshot()
 
 
+def update_subscription_settings(patch: dict) -> dict:
+    with _io_lock:
+        data = _load_subscriptions()
+        for key, (low, high, _default) in _PREF_BOUNDS.items():
+            if key not in patch:
+                continue
+            value = patch[key]
+            if isinstance(value, bool):
+                raise ValueError("请填写整数。")
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                raise ValueError("请填写整数。")
+            data[key] = min(high, max(low, number))
+        if "show_thumbnails" in patch:
+            data["show_thumbnails"] = patch["show_thumbnails"] is True
+        _save_subscriptions(data)
+    return weekly_snapshot()
+
+
 def _video_row(channel: dict, entry: dict, channel_title: str) -> dict | None:
     url = str(entry.get("url") or "").strip()
     timestamp = entry.get("timestamp")
@@ -283,7 +366,20 @@ def _video_row(channel: dict, entry: dict, channel_title: str) -> dict | None:
     }
 
 
-def _fetch_channel(channel: dict, access: dict) -> dict:
+def _take_cached(videos: list[dict], channel_id: str, seen: set[str], stamp: float, window_days: int) -> list[dict]:
+    kept = []
+    for item in videos:
+        if item.get("channel_id") != channel_id or item.get("url") in seen:
+            continue
+        timestamp = item.get("timestamp") if isinstance(item.get("timestamp"), int) else None
+        if not _in_window(timestamp, stamp, window_days):
+            continue
+        seen.add(item["url"])
+        kept.append(item)
+    return kept
+
+
+def _fetch_channel(channel: dict, access: dict, playlist_items: str) -> dict:
     try:
         listed = list_channel_uploads(
             channel["url"],
@@ -291,7 +387,7 @@ def _fetch_channel(channel: dict, access: dict) -> dict:
             access.get("cookies_file"),
             access.get("proxy"),
             po_token_mode=str(access.get("po_token_mode") or "auto"),
-            playlist_items=PLAYLIST_ITEMS,
+            playlist_items=playlist_items,
             sleep_requests=REQUEST_GAP_SECONDS,
         )
     except Exception as exc:
@@ -306,8 +402,12 @@ def _fetch_channel(channel: dict, access: dict) -> dict:
     }
 
 
-def refresh_weekly_hot(access: dict, now: float | None = None) -> dict:
-    """Refresh recent uploads. One channel failing does not cancel the others."""
+def refresh_weekly_hot(access: dict, now: float | None = None, channel_id: str | None = None) -> dict:
+    """Refresh recent uploads. One channel failing does not cancel the others.
+
+    ``channel_id`` refreshes that channel only. Channels that are not fetched,
+    and a fetched channel that fails, keep their previous in-window rows.
+    """
     if not _refresh_lock.acquire(blocking=False):
         view = weekly_snapshot(now)
         view["refreshing"] = True
@@ -319,6 +419,12 @@ def refresh_weekly_hot(access: dict, now: float | None = None) -> dict:
         if not subs["enabled"] or not subs["channels"]:
             return weekly_snapshot(stamp)
         channels = list(subs["channels"])
+        if channel_id:
+            channels = [item for item in channels if item["id"] == channel_id]
+            if not channels:
+                raise ValueError("没有这个频道。")
+        playlist_items = f"1-{subs['fetch_count']}"
+        _progress_start(len(channels))
         results: list[dict | None] = [None] * len(channels)
         gap = threading.Lock()
         last = {"t": 0.0}
@@ -329,7 +435,8 @@ def refresh_weekly_hot(access: dict, now: float | None = None) -> dict:
                 if last["t"] and wait > 0:
                     time.sleep(wait)
                 last["t"] = time.monotonic()
-            results[index] = _fetch_channel(channel, access)
+            results[index] = _fetch_channel(channel, access, playlist_items)
+            _progress_step()
 
         workers = min(CHANNEL_WORKERS, len(channels))
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -343,16 +450,23 @@ def refresh_weekly_hot(access: dict, now: float | None = None) -> dict:
         seen: set[str] = set()
         with _io_lock:
             current = _load_subscriptions()
+            window_days = current["window_days"]
+            old = _load_cache()
+            old_results = {item.get("id"): item for item in old["channel_results"]}
             for channel in current["channels"]:
                 result = fetched.get(channel["id"])
                 if result is None:
+                    videos.extend(_take_cached(old["videos"], channel["id"], seen, stamp, window_days))
+                    previous = old_results.get(channel["id"])
+                    if previous:
+                        channel_results.append(previous)
                     continue
                 if result["ok"] and result["title"]:
                     channel["title"] = result["title"]
                 kept = 0
                 if result["ok"]:
                     for entry in result["entries"]:
-                        if not _in_window(entry.get("timestamp") if isinstance(entry.get("timestamp"), int) else None, stamp):
+                        if not _in_window(entry.get("timestamp") if isinstance(entry.get("timestamp"), int) else None, stamp, window_days):
                             continue
                         row = _video_row(channel, entry, result["title"] or channel.get("title") or "")
                         if row is None or row["url"] in seen:
@@ -360,6 +474,10 @@ def refresh_weekly_hot(access: dict, now: float | None = None) -> dict:
                         seen.add(row["url"])
                         videos.append(row)
                         kept += 1
+                else:
+                    restored = _take_cached(old["videos"], channel["id"], seen, stamp, window_days)
+                    videos.extend(restored)
+                    kept = len(restored)
                 channel_results.append({
                     "id": channel["id"],
                     "url": channel["url"],
@@ -368,22 +486,11 @@ def refresh_weekly_hot(access: dict, now: float | None = None) -> dict:
                     "error": result["error"],
                     "count": kept,
                 })
-            old_videos = _load_cache()["videos"]
-            for result in channel_results:
-                if result["ok"]:
-                    continue
-                for item in old_videos:
-                    if item.get("channel_id") != result["id"] or item.get("url") in seen:
-                        continue
-                    timestamp = item.get("timestamp") if isinstance(item.get("timestamp"), int) else None
-                    if not _in_window(timestamp, stamp):
-                        continue
-                    seen.add(item["url"])
-                    videos.append(item)
-                    result["count"] += 1
             _order_videos(videos)
             _save_subscriptions(current)
             _save_cache(_iso(stamp), videos, channel_results)
+        _progress_stop()
         return weekly_snapshot(stamp)
     finally:
+        _progress_stop()
         _refresh_lock.release()

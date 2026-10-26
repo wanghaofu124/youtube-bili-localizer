@@ -856,6 +856,10 @@ details[open] > .studio-drawer-summary { border-bottom: 1px solid var(--line); }
 .weekly-hot-card .empty-editor { min-height: 132px; padding: 12px 18px 16px; }
 .weekly-hot-card .empty-editor button { justify-self: center; }
 .weekly-hot-card .video-library-row { grid-template-columns: 168px minmax(0, 1fr) auto; align-items: center; min-height: 108px; }
+.weekly-hot-card.no-thumbs .video-library-row { grid-template-columns: minmax(0, 1fr) auto; min-height: 64px; }
+.weekly-hot-failure { display: flex; align-items: center; gap: 8px; }
+.weekly-hot-failure span { min-width: 0; }
+.weekly-hot-failure button { margin-left: auto; flex: 0 0 auto; }
 .weekly-hot-thumb { width: 160px; height: 90px; object-fit: cover; border-radius: 8px; background: #f3dfbd; }
 .weekly-hot-card .video-library-title > b { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .weekly-hot-note { margin: 0; padding: 0 18px 12px; color: var(--muted); font-size: 11px; line-height: 1.5; }
@@ -867,3 +871,5 @@ details[open] > .studio-drawer-summary { border-bottom: 1px solid var(--line); }
 .settings-channel-row small { color: var(--muted); font-size: 11px; }
 .settings-channel-add { display: flex; gap: 8px; }
 .settings-channel-add input { flex: 1; min-width: 0; }
+.settings-weekly-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; width: 100%; }
+.settings-weekly-fields label { display: grid; gap: 4px; font-size: 12px; font-weight: 600; }

@@ -5,11 +5,13 @@ from types import SimpleNamespace
 
 from yblocalizer import download
 from yblocalizer.subscriptions import (
+    _progress_view,
     add_channel,
     normalize_channel_videos_url,
     refresh_weekly_hot,
     remove_channel,
     set_subscriptions_enabled,
+    update_subscription_settings,
     weekly_snapshot,
 )
 from yblocalizer.workbench_api import WorkbenchHandler
@@ -144,6 +146,61 @@ def test_view_counts_rank_the_week_until_one_count_is_missing(monkeypatch):
     assert fallback["sort_mode"] == "recent"
 
 
+def test_one_channel_retry_keeps_the_other_and_reports_progress(monkeypatch):
+    monkeypatch.setattr("yblocalizer.subscriptions.REQUEST_GAP_SECONDS", 0)
+    monkeypatch.setattr("yblocalizer.subscriptions.CHANNEL_WORKERS", 1)
+    add_channel("https://www.youtube.com/@good")
+    add_channel("https://www.youtube.com/@bad")
+    set_subscriptions_enabled(True)
+    update_subscription_settings({"fetch_count": 5, "show_thumbnails": False})
+    seen = []
+
+    def fake_list(url, *_args, **kwargs):
+        seen.append((url, kwargs.get("playlist_items"), _progress_view()["done"]))
+        title = "Bad" if url.endswith("/@bad/videos") else "Good"
+        slug = "bad" if title == "Bad" else "good"
+        return {"title": title, "entries": [{
+            "url": f"https://www.youtube.com/watch?v={slug}",
+            "title": f"{title} clip",
+            "duration": 4,
+            "timestamp": int(NOW - (3600 if title == "Bad" else 1000)),
+            "thumbnail_url": f"https://i.ytimg.com/vi/{slug}/hq.jpg",
+        }]}
+
+    monkeypatch.setattr("yblocalizer.subscriptions.list_channel_uploads", fake_list)
+    access = {"cookies_from_browser": None, "cookies_file": None, "proxy": None, "po_token_mode": "off"}
+    first = refresh_weekly_hot(access, now=NOW)
+    assert seen == [
+        ("https://www.youtube.com/@good/videos", "1-5", 0),
+        ("https://www.youtube.com/@bad/videos", "1-5", 1),
+    ]
+    assert first["show_thumbnails"] is False
+    assert first["fetch_count"] == 5
+    assert first["channel_progress"] is None
+    assert [item["title"] for item in first["videos"]] == ["Good clip", "Bad clip"]
+
+    def fail_bad(url, *_args, **_kwargs):
+        if url.endswith("/@bad/videos"):
+            raise RuntimeError("channel down")
+        return {"title": "Good", "entries": [{
+            "url": "https://www.youtube.com/watch?v=replacement",
+            "title": "Replacement",
+            "duration": 6,
+            "timestamp": int(NOW - 10),
+        }]}
+
+    monkeypatch.setattr("yblocalizer.subscriptions.list_channel_uploads", fail_bad)
+    bad_id = next(item["id"] for item in first["channels"] if item["url"].endswith("/@bad/videos"))
+    second = refresh_weekly_hot(access, now=NOW, channel_id=bad_id)
+    assert [item["title"] for item in second["videos"]] == ["Good clip", "Bad clip"]
+    failed = next(item for item in second["channel_results"] if item["id"] == bad_id)
+    assert failed["ok"] is False and failed["count"] == 1
+    narrow = update_subscription_settings({"top_k": 1, "window_days": 0})
+    assert narrow["top_k"] == 1
+    assert narrow["window_days"] == 1
+    assert [item["title"] for item in narrow["videos"]] == ["Good clip"]
+
+
 def test_disabled_refresh_does_not_call_ytdlp(monkeypatch):
     called = []
     monkeypatch.setattr("yblocalizer.subscriptions.list_channel_uploads", lambda *_args, **_kwargs: called.append(True))
@@ -163,6 +220,11 @@ def test_weekly_route_returns_empty_snapshot():
     assert result["payload"]["enabled"] is False
     assert result["payload"]["videos"] == []
     assert result["payload"]["window_days"] == 7
+    assert result["payload"]["top_k"] == 20
+    assert result["payload"]["fetch_count"] == 20
+    assert result["payload"]["show_thumbnails"] is True
+    assert result["payload"]["cache_ttl_hours"] == 12
+    assert result["payload"]["channel_progress"] is None
     assert result["payload"]["sort_mode"] == "recent"
 
 

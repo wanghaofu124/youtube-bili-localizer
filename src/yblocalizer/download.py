@@ -2073,7 +2073,11 @@ def list_channel_uploads(
         approximate_date=True,
         sleep_requests=sleep_requests,
     )
-    entries = _flat_entries(info, url, with_dates=True)[:20]
+    limit = 20
+    matched = re.fullmatch(r"1-(\d+)", playlist_items or "")
+    if matched:
+        limit = int(matched.group(1))
+    entries = _flat_entries(info, url, with_dates=True)[:limit]
     title = str(info.get("channel") or info.get("uploader") or info.get("title") or "").strip()
     title = re.sub(r"\s+-\s+Videos$", "", title, flags=re.IGNORECASE).strip()
     if not title:

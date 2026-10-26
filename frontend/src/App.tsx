@@ -745,8 +745,18 @@ type WeeklyHot = {
   stale: boolean;
   refreshing?: boolean;
   window_days: number;
+  top_k: number;
+  fetch_count: number;
+  show_thumbnails: boolean;
+  cache_ttl_hours: number;
+  channel_progress?: { done: number; total: number } | null;
   sort_mode?: "views" | "recent";
 };
+function WeeklyThumb({ src }: { src: string }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return <span className="weekly-hot-thumb" />;
+  return <img className="weekly-hot-thumb" src={src} alt="" referrerPolicy="no-referrer" onError={() => setFailed(true)} />;
+}
 const formatUploadDay = (value: string | null): string | null => {
   if (!value || !/^\d{8}$/.test(value)) return null;
   return `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`;
@@ -1425,7 +1435,7 @@ function App() {
       return null;
     }
   };
-  const refreshWeekly = async () => {
+  const refreshWeekly = async (channelId?: string) => {
     if (weeklyBusyRef.current) return;
     weeklyBusyRef.current = true;
     setWeeklyBusy(true);
@@ -1438,6 +1448,7 @@ function App() {
           cookies_file: options.cookies_file,
           youtube_proxy: options.youtube_proxy,
           youtube_po_token_mode: options.youtube_po_token_mode,
+          channel_id: channelId || undefined,
         }),
       });
       setWeekly(data);
@@ -1449,6 +1460,17 @@ function App() {
     } finally {
       weeklyBusyRef.current = false;
       setWeeklyBusy(false);
+    }
+  };
+  const saveWeeklyPrefs = async (patch: Partial<Pick<WeeklyHot, "window_days" | "top_k" | "fetch_count" | "cache_ttl_hours" | "show_thumbnails">>) => {
+    setChannelSaving(true);
+    try {
+      const data = await api<WeeklyHot>("/api/subscriptions/settings", { method: "POST", body: JSON.stringify(patch) });
+      setWeekly(data);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "保存列表设置失败");
+    } finally {
+      setChannelSaving(false);
     }
   };
   const setWeeklyEnabled = async (enabled: boolean) => {
@@ -3757,6 +3779,17 @@ function App() {
     }
   };
   const [rightsHint, setRightsHint] = useState(false);
+  const [weeklyField, setWeeklyField] = useState<{ key: string; value: string } | null>(null);
+  useEffect(() => {
+    if (!weeklyBusy) return;
+    const timer = window.setInterval(() => {
+      void api<WeeklyHot>("/api/subscriptions/weekly").then((data) => {
+        if (!weeklyBusyRef.current) return;
+        setWeekly((current) => current ? { ...current, channel_progress: data.channel_progress, refreshing: data.refreshing } : data);
+      }).catch(() => undefined);
+    }, 700);
+    return () => window.clearInterval(timer);
+  }, [weeklyBusy]);
   const chooseNativeMaterial = async () => {
     if (running) return setMessage("当前阶段运行中，请先取消或等待完成后再切换素材。");
     if (!authorized) {
@@ -3808,6 +3841,8 @@ function App() {
   const canRefreshWeekly = Boolean(weekly?.enabled && weekly.channels.length);
   const weeklyRankedByViews = weekly?.sort_mode === "views";
   const weeklyTitle = weeklyRankedByViews || !weekly?.videos.length ? "本周热片" : "本周新片";
+  const weeklyWindow = weekly?.window_days ?? 7;
+  const weeklyBusyLabel = weekly?.channel_progress ? `正在刷新 ${weekly.channel_progress.done}/${weekly.channel_progress.total}` : "正在刷新…";
   const weeklySummary = !weekly
     ? "读取关注列表…"
     : !weekly.enabled
@@ -3815,12 +3850,32 @@ function App() {
       : weekly.channels.length === 0
         ? "还没有频道 · 展开查看说明"
         : weeklyBusy
-          ? "正在刷新…"
+          ? weeklyBusyLabel
           : weeklyRankedByViews
-            ? `${weekly.videos.length} 条近 7 天热片`
-            : `${weekly.videos.length} 条近 7 天新片`;
+            ? `${weekly.videos.length} 条近 ${weeklyWindow} 天热片`
+            : `${weekly.videos.length} 条近 ${weeklyWindow} 天新片`;
+  const weeklyNumber = (key: "window_days" | "top_k" | "fetch_count" | "cache_ttl_hours", label: string, min: number, max: number) => (
+    <label>
+      {label}
+      <input
+        type="number"
+        min={min}
+        max={max}
+        value={weeklyField?.key === key ? weeklyField.value : String(weekly?.[key] ?? "")}
+        disabled={channelSaving || !weekly}
+        onFocus={() => setWeeklyField({ key, value: String(weekly?.[key] ?? "") })}
+        onChange={(event) => setWeeklyField({ key, value: event.target.value })}
+        onBlur={() => {
+          const raw = weeklyField?.key === key ? weeklyField.value : String(weekly?.[key] ?? "");
+          setWeeklyField(null);
+          const number = Number(raw);
+          if (weekly && Number.isFinite(number) && number !== weekly[key]) void saveWeeklyPrefs({ [key]: number });
+        }}
+      />
+    </label>
+  );
   const weeklyHotCard = (
-    <details className="workspace-card weekly-hot-card">
+    <details className={`workspace-card weekly-hot-card${weekly?.show_thumbnails === false ? " no-thumbs" : ""}`}>
       <summary>
         <b>{weeklyTitle}</b>
         <span>{weeklySummary}</span>
@@ -3828,19 +3883,22 @@ function App() {
       <div className="weekly-hot-body">
         <div className="weekly-hot-toolbar">
           <button type="button" onClick={() => void refreshWeekly()} disabled={!canRefreshWeekly || weeklyBusy} aria-busy={weeklyBusy}>
-            {weeklyBusy ? "正在刷新…" : weeklyFailures.length ? "重试" : "刷新"}
+            {weeklyBusy ? weeklyBusyLabel : weeklyFailures.length ? "全部重试" : "刷新"}
           </button>
           {weekly?.refreshed_at && <small>上次获取 {new Date(weekly.refreshed_at).toLocaleString()}</small>}
         </div>
         {!weekly && <div className="empty-editor"><b>正在读取关注列表</b><span>稍候即可查看本周热片。</span></div>}
         {weeklyError && <p className="metadata-notice error" role="status">{weeklyError}</p>}
         {weeklyFailures.map((item) => (
-          <p className="metadata-notice warning" role="status" key={item.id}>{item.title || item.url}：{item.error || "读取失败"}</p>
+          <p className="metadata-notice warning weekly-hot-failure" role="status" key={item.id}>
+            <span>{item.title || item.url}：{item.error || "读取失败"}</span>
+            <button type="button" onClick={() => void refreshWeekly(item.id)} disabled={weeklyBusy}>重试</button>
+          </p>
         ))}
         {weekly && !weekly.enabled && (
           <div className="empty-editor">
             <b>关注频道未开启</b>
-            <span>到设置里打开「关注频道」，添加 YouTube 频道后，这里会列出近 7 天的新片。</span>
+            <span>到设置里打开「启用周热」，添加 YouTube 频道后，这里会列出近 {weeklyWindow} 天的片子。</span>
             <button type="button" onClick={() => setSettingsOpen(true)}>打开设置</button>
           </div>
         )}
@@ -3853,23 +3911,23 @@ function App() {
         )}
         {weekly?.enabled && weekly.channels.length > 0 && weekly.videos.length === 0 && !weeklyBusy && (
           <div className="empty-editor">
-            <b>{weeklyFailures.length ? "没有拿到本周新片" : "这 7 天没有新片"}</b>
-            <span>{weeklyFailures.length ? "失败的频道列在上面，点「重试」再取一次。成功的频道会留在列表里。" : "已关注的频道在近 7 天内没有带上传时间的视频。没有日期的不会出现在这里。"}</span>
+            <b>{weeklyFailures.length ? "没有拿到新片" : `这 ${weeklyWindow} 天没有新片`}</b>
+            <span>{weeklyFailures.length ? "失败的频道列在上面，可以重试该频道，或点「全部重试」。成功的频道会留在列表里。" : `已关注的频道在近 ${weeklyWindow} 天内没有带上传时间的视频。没有日期的不会出现在这里。`}</span>
           </div>
         )}
         {weeklyBusy && (weekly?.videos.length ?? 0) === 0 && canRefreshWeekly && (
           <div className="empty-editor">
             <b>正在获取最近上传</b>
-            <span>每个频道读取最近约 20 条，只保留 7 天内、能读到上传时间的视频。</span>
+            <span>每个频道读取最近约 {weekly?.fetch_count ?? 20} 条，只保留 {weeklyWindow} 天内、能读到上传时间的视频。</span>
           </div>
         )}
         {weekly?.videos.map((entry) => {
           const day = formatUploadDay(entry.upload_date);
           return (
             <div className="video-library-row" key={entry.url}>
-              {entry.thumbnail_url
-                ? <img className="weekly-hot-thumb" src={entry.thumbnail_url} alt="" referrerPolicy="no-referrer" />
-                : <span className="weekly-hot-thumb" />}
+              {weekly?.show_thumbnails !== false && (entry.thumbnail_url
+                ? <WeeklyThumb src={entry.thumbnail_url} />
+                : <span className="weekly-hot-thumb" />)}
               <div className="video-library-main">
                 <div className="video-library-title"><b title={entry.title}>{entry.title}</b></div>
                 <div className="video-library-meta">
@@ -6755,9 +6813,24 @@ function App() {
               disabled={channelSaving || !weekly}
               onChange={(event) => void setWeeklyEnabled(event.target.checked)}
             />
-            启用关注频道
+            启用周热
           </label>
-          <p className="drawer-note">打开后，素材页列出已关注频道近 7 天的视频。频道页带齐播放量时按播放量排，标题是「本周热片」；播放量缺失时按上传时间排，标题是「本周新片」。列表缓存约 12 小时，点刷新会立刻重取。关闭或还没有频道时，卡片仍留在素材页。</p>
+          <p className="drawer-note">打开后，素材页列出已关注频道近 {weeklyWindow} 天的视频。频道页带齐播放量时按播放量排，标题是「本周热片」；播放量缺失时按上传时间排，标题是「本周新片」。列表缓存约 {weekly?.cache_ttl_hours ?? 12} 小时，点刷新会立刻重取。关闭或还没有频道时，卡片仍留在素材页。</p>
+          <div className="settings-weekly-fields">
+            {weeklyNumber("window_days", "时间窗口（天）", 1, 30)}
+            {weeklyNumber("top_k", "最多显示", 1, 50)}
+            {weeklyNumber("fetch_count", "每频道拉取", 1, 50)}
+            {weeklyNumber("cache_ttl_hours", "缓存（小时）", 1, 168)}
+          </div>
+          <label className="check settings-check">
+            <input
+              type="checkbox"
+              checked={weekly?.show_thumbnails !== false}
+              disabled={channelSaving || !weekly}
+              onChange={(event) => void saveWeeklyPrefs({ show_thumbnails: event.target.checked })}
+            />
+            显示缩略图
+          </label>
           <div className="settings-channels">
             {(weekly?.channels ?? []).map((channel) => (
               <div className="settings-channel-row" key={channel.id}>
