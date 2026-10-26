@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
@@ -1901,14 +1902,85 @@ def _download_thumbnail(
         return None
 
 
-def list_playlist_entries(
+def _upload_fields(entry: dict) -> tuple[str | None, int | None]:
+    """Return `(upload_date, timestamp)` from a flat playlist entry.
+
+    `youtubetab:approximate_date` fills `timestamp` from relative labels such as
+    "3 days ago". That value is day-granular and can sit a few hours off.
+    """
+    raw_timestamp = entry.get("timestamp")
+    if raw_timestamp is None:
+        raw_timestamp = entry.get("release_timestamp")
+    try:
+        timestamp = int(raw_timestamp) if raw_timestamp is not None else None
+    except (TypeError, ValueError):
+        timestamp = None
+    if timestamp is not None and timestamp <= 0:
+        timestamp = None
+    upload_date = entry.get("upload_date")
+    if not isinstance(upload_date, str) or not re.fullmatch(r"\d{8}", upload_date):
+        upload_date = None
+    if timestamp is not None and upload_date is None:
+        upload_date = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y%m%d")
+    if timestamp is None and upload_date is not None:
+        timestamp = int(datetime.strptime(upload_date, "%Y%m%d").replace(tzinfo=timezone.utc).timestamp())
+    return upload_date, timestamp
+
+
+def _flat_entry_url(entry: dict) -> str:
+    entry_url = str(entry.get("webpage_url") or entry.get("url") or "")
+    if entry_url.startswith(("http://", "https://")):
+        return entry_url
+    if entry_url and entry.get("ie_key") == "Youtube":
+        return f"https://www.youtube.com/watch?v={entry_url}"
+    video_id = str(entry.get("id") or "")
+    if re.fullmatch(r"[\w-]{11}", video_id):
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return entry_url
+
+
+def _flat_entries(info: dict, url: str, *, with_dates: bool) -> list[dict[str, Any]]:
+    def row_from(entry: dict, fallback_url: str) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "url": _flat_entry_url(entry) or fallback_url,
+            "title": entry.get("title") or "",
+            "duration": entry.get("duration"),
+        }
+        if with_dates:
+            upload_date, timestamp = _upload_fields(entry)
+            row["upload_date"] = upload_date
+            row["timestamp"] = timestamp
+            row["thumbnail_url"] = _best_thumbnail_url(entry)
+            view_count = entry.get("view_count")
+            row["view_count"] = view_count if isinstance(view_count, int) else None
+            channel = entry.get("channel") or entry.get("uploader") or ""
+            if channel:
+                row["channel"] = channel
+        return row
+
+    entries = info.get("entries")
+    if entries is None:
+        return [row_from(info, info.get("webpage_url") or url)]
+    result = []
+    for entry in entries:
+        if not entry:
+            continue
+        result.append(row_from(entry, url))
+    return result
+
+
+def _extract_flat_playlist(
     url: str,
-    cookies_from_browser: str | None = None,
-    cookies_file: str | None = None,
-    proxy: str | None = None,
-    playlist_items: str | None = None,
-) -> list[dict[str, Any]]:
-    """Expand a playlist (or single video) URL into flat entries without downloading."""
+    cookies_from_browser: str | None,
+    cookies_file: str | None,
+    proxy: str | None,
+    playlist_items: str | None,
+    *,
+    po_token_mode: str,
+    approximate_date: bool,
+    sleep_requests: float | None,
+) -> dict:
+    """One yt-dlp flat extraction shared by batch parse and channel refresh."""
     _validate_video_url(url)
     import yt_dlp
 
@@ -1918,25 +1990,103 @@ def list_playlist_entries(
         "no_warnings": True,
         "skip_download": True,
         "socket_timeout": 15,
+        "playlist_items": playlist_items or "1-200",
     }
-    opts["playlist_items"] = playlist_items or "1-200"
-    if proxy:
+    # Batch parse keeps the historical flat options. Channel refresh opts in
+    # so the tab request uses the same proxy / cookies / PO Token path as
+    # get_video_metadata.
+    use_access = approximate_date or str(po_token_mode or "off").strip().lower() != "off"
+    if use_access:
+        opts.update(_js_runtime_opts())
+        opts.update(_youtube_access_opts(proxy, po_token_mode))
+    elif proxy:
         opts["proxy"] = _validate_proxy(proxy)
+    if approximate_date:
+        # Relative dates ("3 days ago") only parse reliably in English.
+        # A non-English youtube:lang value drops upload_date entirely.
+        extractor_args = dict(opts.get("extractor_args") or {})
+        youtube_args = dict(extractor_args.get("youtube") or {})
+        youtube_args.setdefault("lang", ["en"])
+        extractor_args["youtube"] = youtube_args
+        tab_args = dict(extractor_args.get("youtubetab") or {})
+        tab_args["approximate_date"] = [""]
+        extractor_args["youtubetab"] = tab_args
+        opts["extractor_args"] = extractor_args
+    if sleep_requests:
+        opts["sleep_interval_requests"] = float(sleep_requests)
     if cookies_file:
+        if use_access:
+            _validate_cookies_file(cookies_file)
         opts["cookiefile"] = cookies_file
     elif cookies_from_browser:
         opts["cookiesfrombrowser"] = (cookies_from_browser,)
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
-    entries = info.get("entries")
-    if entries is None:
-        return [{"url": info.get("webpage_url") or url, "title": info.get("title") or "", "duration": info.get("duration")}]
-    result = []
-    for entry in entries:
-        if not entry:
-            continue
-        entry_url = entry.get("webpage_url") or entry.get("url") or ""
-        if entry_url and not entry_url.startswith("http") and entry.get("ie_key") == "Youtube":
-            entry_url = f"https://www.youtube.com/watch?v={entry_url}"
-        result.append({"url": entry_url, "title": entry.get("title") or "", "duration": entry.get("duration")})
-    return result
+    if not isinstance(info, dict):
+        raise RuntimeError("播放列表没有返回数据。")
+    return info
+
+
+def list_playlist_entries(
+    url: str,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | None = None,
+    proxy: str | None = None,
+    playlist_items: str | None = None,
+    *,
+    po_token_mode: str = "off",
+    approximate_date: bool = False,
+    sleep_requests: float | None = None,
+) -> list[dict[str, Any]]:
+    """Expand a playlist (or single video) URL into flat entries without downloading."""
+    info = _extract_flat_playlist(
+        url,
+        cookies_from_browser,
+        cookies_file,
+        proxy,
+        playlist_items,
+        po_token_mode=po_token_mode,
+        approximate_date=approximate_date,
+        sleep_requests=sleep_requests,
+    )
+    return _flat_entries(info, url, with_dates=approximate_date)
+
+
+def list_channel_uploads(
+    url: str,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | None = None,
+    proxy: str | None = None,
+    *,
+    po_token_mode: str = "auto",
+    playlist_items: str = "1-20",
+    sleep_requests: float = 0.75,
+) -> dict[str, Any]:
+    """Flat-list the recent uploads tab. Dates come from approximate_date, not a second extract."""
+    info = _extract_flat_playlist(
+        url,
+        cookies_from_browser,
+        cookies_file,
+        proxy,
+        playlist_items,
+        po_token_mode=po_token_mode,
+        approximate_date=True,
+        sleep_requests=sleep_requests,
+    )
+    limit = 20
+    matched = re.fullmatch(r"1-(\d+)", playlist_items or "")
+    if matched:
+        limit = int(matched.group(1))
+    entries = _flat_entries(info, url, with_dates=True)[:limit]
+    title = str(info.get("channel") or info.get("uploader") or info.get("title") or "").strip()
+    title = re.sub(r"\s+-\s+Videos$", "", title, flags=re.IGNORECASE).strip()
+    if not title:
+        for entry in entries:
+            title = str(entry.get("channel") or "").strip()
+            if title:
+                break
+    return {
+        "title": title,
+        "channel_id": str(info.get("channel_id") or ""),
+        "entries": entries,
+    }

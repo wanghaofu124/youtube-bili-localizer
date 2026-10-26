@@ -722,6 +722,53 @@ function externalAiConfirmation(disclosure: ExternalAiDisclosure): boolean {
 }
 
 type BatchEntry = { url: string; title: string; duration?: number | null; error?: string; selected: boolean };
+type SubscribedChannel = { id: string; url: string; title: string; added_at?: string };
+type WeeklyHotVideo = {
+  url: string;
+  title: string;
+  duration: number | null;
+  upload_date: string | null;
+  timestamp: number | null;
+  channel_title: string;
+  channel_url: string;
+  channel_id: string;
+  thumbnail_url?: string | null;
+  view_count?: number | null;
+};
+type WeeklyChannelResult = { id: string; url: string; title: string; ok: boolean; error: string | null; count: number };
+type WeeklyHot = {
+  enabled: boolean;
+  channels: SubscribedChannel[];
+  videos: WeeklyHotVideo[];
+  channel_results: WeeklyChannelResult[];
+  refreshed_at: string | null;
+  stale: boolean;
+  refreshing?: boolean;
+  window_days: number;
+  top_k: number;
+  fetch_count: number;
+  show_thumbnails: boolean;
+  cache_ttl_hours: number;
+  channel_progress?: { done: number; total: number } | null;
+  sort_mode?: "views" | "recent";
+};
+function WeeklyThumb({ src }: { src: string }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return <span className="weekly-hot-thumb" />;
+  return <img className="weekly-hot-thumb" src={src} alt="" referrerPolicy="no-referrer" onError={() => setFailed(true)} />;
+}
+const formatUploadDay = (value: string | null): string | null => {
+  if (!value || !/^\d{8}$/.test(value)) return null;
+  return `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`;
+};
+const formatClock = (seconds: number): string => {
+  const total = Math.max(0, Math.round(seconds));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const remain = total % 60;
+  const clock = `${minutes}:${String(remain).padStart(2, "0")}`;
+  return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remain).padStart(2, "0")}` : clock;
+};
 type BatchItem = { id: string; url: string; title: string; job_id: string | null; status: "pending" | "running" | "done" | "failed" | "cancelled"; error: string | null; stage: string | null; progress: number | null };
 type BatchQueue = { items: BatchItem[]; active: boolean };
 
@@ -879,6 +926,12 @@ function App() {
   const [materials, setMaterials] = useState<Material[]>([]);
   const [materialId, setMaterialId] = useState("");
   const [sourceUrl, setSourceUrl] = useState("");
+  const [weekly, setWeekly] = useState<WeeklyHot | null>(null);
+  const [weeklyBusy, setWeeklyBusy] = useState(false);
+  const [weeklyError, setWeeklyError] = useState("");
+  const [channelDraft, setChannelDraft] = useState("");
+  const [channelSaving, setChannelSaving] = useState(false);
+  const weeklyBusyRef = useRef(false);
   const [materialSourceTab, setMaterialSourceTab] = useState<"url" | "local">("url");
   const sourceRevision = useRef(0);
   const [authorized, setAuthorized] = useState(false);
@@ -1371,6 +1424,93 @@ function App() {
     setPoTokenStatus(settings.youtube_po_token ?? null);
     setApiKeyConfigured(Boolean(settings.deepseek_key_configured));
     setProxyConfigured(Boolean(settings.youtube_proxy_configured));
+  };
+  const loadWeekly = async () => {
+    try {
+      const data = await api<WeeklyHot>("/api/subscriptions/weekly");
+      setWeekly(data);
+      return data;
+    } catch (error) {
+      setWeeklyError(error instanceof Error ? error.message : "读取本周热片失败");
+      return null;
+    }
+  };
+  const refreshWeekly = async (channelId?: string) => {
+    if (weeklyBusyRef.current) return;
+    weeklyBusyRef.current = true;
+    setWeeklyBusy(true);
+    setWeeklyError("");
+    try {
+      const data = await api<WeeklyHot>("/api/subscriptions/weekly/refresh", {
+        method: "POST",
+        body: JSON.stringify({
+          cookies_from_browser: options.cookies_from_browser,
+          cookies_file: options.cookies_file,
+          youtube_proxy: options.youtube_proxy,
+          youtube_po_token_mode: options.youtube_po_token_mode,
+          channel_id: channelId || undefined,
+        }),
+      });
+      setWeekly(data);
+      if (data.refreshing) setWeeklyError("正在刷新，请稍候再试。");
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "刷新失败";
+      setWeeklyError(detail);
+      setMessage(`本周热片刷新失败：${detail}`);
+    } finally {
+      weeklyBusyRef.current = false;
+      setWeeklyBusy(false);
+    }
+  };
+  const saveWeeklyPrefs = async (patch: Partial<Pick<WeeklyHot, "window_days" | "top_k" | "fetch_count" | "cache_ttl_hours" | "show_thumbnails">>) => {
+    setChannelSaving(true);
+    try {
+      const data = await api<WeeklyHot>("/api/subscriptions/settings", { method: "POST", body: JSON.stringify(patch) });
+      setWeekly(data);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "保存列表设置失败");
+    } finally {
+      setChannelSaving(false);
+    }
+  };
+  const setWeeklyEnabled = async (enabled: boolean) => {
+    setChannelSaving(true);
+    try {
+      const data = await api<WeeklyHot>("/api/subscriptions/enabled", { method: "POST", body: JSON.stringify({ enabled }) });
+      setWeekly(data);
+      if (enabled && data.channels.length > 0 && data.stale) void refreshWeekly();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "保存关注开关失败");
+    } finally {
+      setChannelSaving(false);
+    }
+  };
+  const addSubscribedChannel = async () => {
+    const url = channelDraft.trim();
+    if (!url) return;
+    setChannelSaving(true);
+    try {
+      const data = await api<WeeklyHot>("/api/subscriptions", { method: "POST", body: JSON.stringify({ url }) });
+      setChannelDraft("");
+      setWeekly(data);
+      setMessage("已添加频道。");
+      if (data.enabled) void refreshWeekly();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "添加频道失败");
+    } finally {
+      setChannelSaving(false);
+    }
+  };
+  const removeSubscribedChannel = async (id: string) => {
+    setChannelSaving(true);
+    try {
+      setWeekly(await api<WeeklyHot>("/api/subscriptions/remove", { method: "POST", body: JSON.stringify({ id }) }));
+      setMessage("已取消关注。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "移除频道失败");
+    } finally {
+      setChannelSaving(false);
+    }
   };
   const loadRestorableJobs = async () => {
     const response = await api<{ jobs: RestorableJob[] }>("/api/jobs/restorable?limit=20");
@@ -2131,11 +2271,14 @@ function App() {
           loadSettings(),
           loadDependencies(),
           loadRestorableJobs(),
+          loadWeekly(),
         ]);
       })
-      .then(() => {
+      .then((results) => {
         setOnline(true);
         setMessage("本地服务已就绪。选择素材后即可开始处理。");
+        const weeklyData = results[5] as WeeklyHot | null;
+        if (weeklyData?.enabled && weeklyData.channels.length > 0 && weeklyData.stale) void refreshWeekly();
       })
       .catch(() => setMessage("未连接本地服务，请启动工作台 EXE。"));
   }, []);
@@ -2308,8 +2451,8 @@ function App() {
     setMetadataNotice("");
     setMetadataState("idle");
   };
-  const readMetadata = async () => {
-    const url = sourceUrl.trim();
+  const readMetadata = async (urlOverride?: string) => {
+    const url = (typeof urlOverride === "string" ? urlOverride : sourceUrl).trim();
     if (!url) {
       setMetadataState("error");
       setMetadataNotice("请先粘贴完整的视频链接，再读取标题与时长。");
@@ -2351,6 +2494,28 @@ function App() {
       setMetadataNotice(`读取失败：${detail}`);
       setMessage(`读取失败：${detail}`);
     }
+  };
+  const fillSourceFromHot = (url: string) => {
+    if (running) {
+      setMessage("当前阶段运行中，请先取消或等待完成后再切换素材。");
+      return;
+    }
+    if (job && !window.confirm(`修改素材链接会离开当前任务；原任务可在任务库重新载入。${dirty ? "当前未保存的字幕修改会丢失。" : ""}\n\n确定继续吗？`)) return;
+    if (!job && dirty && !confirmDiscardSubtitles("改用这条视频会清空当前未保存的字幕修改")) return;
+    if (job || selected) resetForSourceSwitch();
+    else sourceRevision.current += 1;
+    if (job || selected) setMessage("已切换到新链接草稿；原任务可在任务库重新载入。");
+    setBatchMode(false);
+    setMaterialSourceTab("url");
+    setMaterialId("");
+    setSourceUrl(url);
+    setMaterialDraftToken((value) => value + 1);
+    setFieldErrors((current) => ({ ...current, source_url: "" }));
+    setMetadata(null);
+    setMetadataNotice("");
+    setMetadataState("idle");
+    window.setTimeout(() => document.getElementById("source-url")?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
+    void readMetadata(url);
   };
   const importVideo = async (file: File) => {
     if (running) return setMessage("当前阶段运行中，请先取消或等待完成后再切换素材。");
@@ -3614,6 +3779,17 @@ function App() {
     }
   };
   const [rightsHint, setRightsHint] = useState(false);
+  const [weeklyField, setWeeklyField] = useState<{ key: string; value: string } | null>(null);
+  useEffect(() => {
+    if (!weeklyBusy) return;
+    const timer = window.setInterval(() => {
+      void api<WeeklyHot>("/api/subscriptions/weekly").then((data) => {
+        if (!weeklyBusyRef.current) return;
+        setWeekly((current) => current ? { ...current, channel_progress: data.channel_progress, refreshing: data.refreshing } : data);
+      }).catch(() => undefined);
+    }, 700);
+    return () => window.clearInterval(timer);
+  }, [weeklyBusy]);
   const chooseNativeMaterial = async () => {
     if (running) return setMessage("当前阶段运行中，请先取消或等待完成后再切换素材。");
     if (!authorized) {
@@ -3661,6 +3837,120 @@ function App() {
     } catch (error) { setMessage(error instanceof Error ? error.message : "选择成品视频失败"); }
   };
 
+  const weeklyFailures = weekly?.channel_results.filter((item) => !item.ok) ?? [];
+  const canRefreshWeekly = Boolean(weekly?.enabled && weekly.channels.length);
+  const weeklyRankedByViews = weekly?.sort_mode === "views";
+  const weeklyTitle = weeklyRankedByViews || !weekly?.videos.length ? "本周热片" : "本周新片";
+  const weeklyWindow = weekly?.window_days ?? 7;
+  const weeklyBusyLabel = weekly?.channel_progress ? `正在刷新 ${weekly.channel_progress.done}/${weekly.channel_progress.total}` : "正在刷新…";
+  const weeklySummary = !weekly
+    ? "读取关注列表…"
+    : !weekly.enabled
+      ? "未开启 · 展开查看说明"
+      : weekly.channels.length === 0
+        ? "还没有频道 · 展开查看说明"
+        : weeklyBusy
+          ? weeklyBusyLabel
+          : weeklyRankedByViews
+            ? `${weekly.videos.length} 条近 ${weeklyWindow} 天热片`
+            : `${weekly.videos.length} 条近 ${weeklyWindow} 天新片`;
+  const weeklyNumber = (key: "window_days" | "top_k" | "fetch_count" | "cache_ttl_hours", label: string, min: number, max: number) => (
+    <label>
+      {label}
+      <input
+        type="number"
+        min={min}
+        max={max}
+        value={weeklyField?.key === key ? weeklyField.value : String(weekly?.[key] ?? "")}
+        disabled={channelSaving || !weekly}
+        onFocus={() => setWeeklyField({ key, value: String(weekly?.[key] ?? "") })}
+        onChange={(event) => setWeeklyField({ key, value: event.target.value })}
+        onBlur={() => {
+          const raw = weeklyField?.key === key ? weeklyField.value : String(weekly?.[key] ?? "");
+          setWeeklyField(null);
+          const number = Number(raw);
+          if (weekly && Number.isFinite(number) && number !== weekly[key]) void saveWeeklyPrefs({ [key]: number });
+        }}
+      />
+    </label>
+  );
+  const weeklyHotCard = (
+    <details className={`workspace-card weekly-hot-card${weekly?.show_thumbnails === false ? " no-thumbs" : ""}`}>
+      <summary>
+        <b>{weeklyTitle}</b>
+        <span>{weeklySummary}</span>
+      </summary>
+      <div className="weekly-hot-body">
+        <div className="weekly-hot-toolbar">
+          <button type="button" onClick={() => void refreshWeekly()} disabled={!canRefreshWeekly || weeklyBusy} aria-busy={weeklyBusy}>
+            {weeklyBusy ? weeklyBusyLabel : weeklyFailures.length ? "全部重试" : "刷新"}
+          </button>
+          {weekly?.refreshed_at && <small>上次获取 {new Date(weekly.refreshed_at).toLocaleString()}</small>}
+        </div>
+        {!weekly && <div className="empty-editor"><b>正在读取关注列表</b><span>稍候即可查看本周热片。</span></div>}
+        {weeklyError && <p className="metadata-notice error" role="status">{weeklyError}</p>}
+        {weeklyFailures.map((item) => (
+          <p className="metadata-notice warning weekly-hot-failure" role="status" key={item.id}>
+            <span>{item.title || item.url}：{item.error || "读取失败"}</span>
+            <button type="button" onClick={() => void refreshWeekly(item.id)} disabled={weeklyBusy}>重试</button>
+          </p>
+        ))}
+        {weekly && !weekly.enabled && (
+          <div className="empty-editor">
+            <b>关注频道未开启</b>
+            <span>到设置里打开「启用周热」，添加 YouTube 频道后，这里会列出近 {weeklyWindow} 天的片子。</span>
+            <button type="button" onClick={() => setSettingsOpen(true)}>打开设置</button>
+          </div>
+        )}
+        {weekly?.enabled && weekly.channels.length === 0 && (
+          <div className="empty-editor">
+            <b>还没有关注的频道</b>
+            <span>在设置 → 关注频道里粘贴 https://www.youtube.com/@handle 或 /channel/UC… 链接。</span>
+            <button type="button" onClick={() => setSettingsOpen(true)}>去添加频道</button>
+          </div>
+        )}
+        {weekly?.enabled && weekly.channels.length > 0 && weekly.videos.length === 0 && !weeklyBusy && (
+          <div className="empty-editor">
+            <b>{weeklyFailures.length ? "没有拿到新片" : `这 ${weeklyWindow} 天没有新片`}</b>
+            <span>{weeklyFailures.length ? "失败的频道列在上面，可以重试该频道，或点「全部重试」。成功的频道会留在列表里。" : `已关注的频道在近 ${weeklyWindow} 天内没有带上传时间的视频。没有日期的不会出现在这里。`}</span>
+          </div>
+        )}
+        {weeklyBusy && (weekly?.videos.length ?? 0) === 0 && canRefreshWeekly && (
+          <div className="empty-editor">
+            <b>正在获取最近上传</b>
+            <span>每个频道读取最近约 {weekly?.fetch_count ?? 20} 条，只保留 {weeklyWindow} 天内、能读到上传时间的视频。</span>
+          </div>
+        )}
+        {weekly?.videos.map((entry) => {
+          const day = formatUploadDay(entry.upload_date);
+          return (
+            <div className="video-library-row" key={entry.url}>
+              {weekly?.show_thumbnails !== false && (entry.thumbnail_url
+                ? <WeeklyThumb src={entry.thumbnail_url} />
+                : <span className="weekly-hot-thumb" />)}
+              <div className="video-library-main">
+                <div className="video-library-title"><b title={entry.title}>{entry.title}</b></div>
+                <div className="video-library-meta">
+                  <span>{entry.channel_title || "频道"}</span>
+                  {weeklyRankedByViews && typeof entry.view_count === "number" && <span>{entry.view_count.toLocaleString()} 播放</span>}
+                  {typeof entry.duration === "number" && <span>{formatClock(entry.duration)}</span>}
+                  {day && <span>{day}</span>}
+                </div>
+              </div>
+              <div className="video-library-actions">
+                <button type="button" className="primary small" onClick={() => fillSourceFromHot(entry.url)} disabled={running}>翻译</button>
+              </div>
+            </div>
+          );
+        })}
+        {weekly?.enabled && weekly.channels.length > 0 && (
+          <p className="weekly-hot-note">{weeklyRankedByViews
+            ? "按播放量从高到低，播放量相同则较新的在前。数字来自频道页，没有逐条再打开视频。"
+            : "按上传时间从新到旧。播放量缺失时用这个顺序，也不逐条重抓。日期来自频道页的近似时间，可能有几小时偏差；太旧或没有日期的不会列入。"}</p>
+        )}
+      </div>
+    </details>
+  );
   const materialView = (
     <section className="workspace-card material-view">
       <header>
@@ -3741,7 +4031,7 @@ function App() {
         </label>
         <div className="inline-actions">
           <button
-            onClick={readMetadata}
+            onClick={() => void readMetadata()}
             disabled={running || metadataState === "loading"}
             aria-busy={metadataState === "loading"}
           >
@@ -6210,6 +6500,7 @@ function App() {
           </div>
         </nav>
         <section className={`main-workspace workspace-${view}`}>
+          {view === "material" && weeklyHotCard}
           {view === "material" && materialView}
           {view === "library" && libraryView}
           {view === "process" && processView}
@@ -6514,6 +6805,53 @@ function App() {
               同一地址用于元数据、视频、封面和浏览器验证；只保存在本机设置，不会写入任务历史或日志。
             </small>
           </label>
+          <div className="settings-section-label"><NavIcon name="video" className="app-icon" /><b>关注频道</b><span>{weeklyTitle}</span></div>
+          <label className="check settings-check">
+            <input
+              type="checkbox"
+              checked={weekly?.enabled ?? false}
+              disabled={channelSaving || !weekly}
+              onChange={(event) => void setWeeklyEnabled(event.target.checked)}
+            />
+            启用周热
+          </label>
+          <p className="drawer-note">打开后，素材页列出已关注频道近 {weeklyWindow} 天的视频。频道页带齐播放量时按播放量排，标题是「本周热片」；播放量缺失时按上传时间排，标题是「本周新片」。列表缓存约 {weekly?.cache_ttl_hours ?? 12} 小时，点刷新会立刻重取。关闭或还没有频道时，卡片仍留在素材页。</p>
+          <div className="settings-weekly-fields">
+            {weeklyNumber("window_days", "时间窗口（天）", 1, 30)}
+            {weeklyNumber("top_k", "最多显示", 1, 50)}
+            {weeklyNumber("fetch_count", "每频道拉取", 1, 50)}
+            {weeklyNumber("cache_ttl_hours", "缓存（小时）", 1, 168)}
+          </div>
+          <label className="check settings-check">
+            <input
+              type="checkbox"
+              checked={weekly?.show_thumbnails !== false}
+              disabled={channelSaving || !weekly}
+              onChange={(event) => void saveWeeklyPrefs({ show_thumbnails: event.target.checked })}
+            />
+            显示缩略图
+          </label>
+          <div className="settings-channels">
+            {(weekly?.channels ?? []).map((channel) => (
+              <div className="settings-channel-row" key={channel.id}>
+                <span>
+                  <b>{channel.title || "未命名频道"}</b>
+                  <small title={channel.url}>{channel.url}</small>
+                </span>
+                <button type="button" onClick={() => void removeSubscribedChannel(channel.id)} disabled={channelSaving}>移除</button>
+              </div>
+            ))}
+            {!weekly?.channels.length && <p className="drawer-note">还没有频道。粘贴频道主页或 /videos 链接。</p>}
+            <div className="settings-channel-add">
+              <input
+                value={channelDraft}
+                placeholder="https://www.youtube.com/@handle"
+                onChange={(event) => setChannelDraft(event.target.value)}
+                onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void addSubscribedChannel(); } }}
+              />
+              <button type="button" onClick={() => void addSubscribedChannel()} disabled={channelSaving || !channelDraft.trim()}>添加</button>
+            </div>
+          </div>
           <div className="settings-diagnostics">
             <div className="settings-section-label"><NavIcon name="book" className="app-icon" /><b>关于</b><span>v{appVersion || "—"}</span></div>
             <p className="drawer-note">诊断包包含最近日志、版本和已脱敏的本机设置，不含密钥、Cookies、登录状态或浏览器资料。</p>
