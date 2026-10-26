@@ -262,6 +262,7 @@ def _video_row(channel: dict, entry: dict, channel_title: str) -> dict | None:
         "channel_title": channel_title,
         "channel_url": channel["url"],
         "channel_id": channel["id"],
+        "thumbnail_url": entry.get("thumbnail_url") or None,
     }
 
 

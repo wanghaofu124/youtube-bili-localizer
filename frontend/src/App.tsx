@@ -732,6 +732,7 @@ type WeeklyHotVideo = {
   channel_title: string;
   channel_url: string;
   channel_id: string;
+  thumbnail_url?: string | null;
 };
 type WeeklyChannelResult = { id: string; url: string; title: string; ok: boolean; error: string | null; count: number };
 type WeeklyHot = {
@@ -747,6 +748,14 @@ type WeeklyHot = {
 const formatUploadDay = (value: string | null): string | null => {
   if (!value || !/^\d{8}$/.test(value)) return null;
   return `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`;
+};
+const formatClock = (seconds: number): string => {
+  const total = Math.max(0, Math.round(seconds));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const remain = total % 60;
+  const clock = `${minutes}:${String(remain).padStart(2, "0")}`;
+  return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remain).padStart(2, "0")}` : clock;
 };
 type BatchItem = { id: string; url: string; title: string; job_id: string | null; status: "pending" | "running" | "done" | "failed" | "cancelled"; error: string | null; stage: string | null; progress: number | null };
 type BatchQueue = { items: BatchItem[]; active: boolean };
@@ -3852,12 +3861,15 @@ function App() {
           const day = formatUploadDay(entry.upload_date);
           return (
             <div className="video-library-row" key={entry.url}>
+              {entry.thumbnail_url
+                ? <img className="weekly-hot-thumb" src={entry.thumbnail_url} alt="" referrerPolicy="no-referrer" />
+                : <span className="weekly-hot-thumb" />}
               <div className="video-library-main">
                 <div className="video-library-title"><b title={entry.title}>{entry.title}</b></div>
                 <div className="video-library-meta">
                   <span>{entry.channel_title || "频道"}</span>
+                  {typeof entry.duration === "number" && <span>{formatClock(entry.duration)}</span>}
                   {day && <span>{day}</span>}
-                  {typeof entry.duration === "number" && <span>时长 {Math.round(entry.duration)} 秒</span>}
                 </div>
               </div>
               <div className="video-library-actions">

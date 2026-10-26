@@ -1950,6 +1950,7 @@ def _flat_entries(info: dict, url: str, *, with_dates: bool) -> list[dict[str, A
             upload_date, timestamp = _upload_fields(entry)
             row["upload_date"] = upload_date
             row["timestamp"] = timestamp
+            row["thumbnail_url"] = _best_thumbnail_url(entry)
             channel = entry.get("channel") or entry.get("uploader") or ""
             if channel:
                 row["channel"] = channel

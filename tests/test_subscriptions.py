@@ -119,6 +119,10 @@ def test_channel_listing_reuses_flat_extract_and_metadata_access(monkeypatch):
                     "title": "Clip",
                     "duration": 12,
                     "timestamp": 1_700_000_000,
+                    "thumbnails": [
+                        {"url": "https://i.ytimg.com/vi/abcdefghijk/hqdefault.jpg", "width": 480, "height": 360},
+                        {"url": "https://i.ytimg.com/vi/abcdefghijk/sddefault.jpg", "width": 640, "height": 480},
+                    ],
                 }],
             }
 
@@ -151,6 +155,7 @@ def test_channel_listing_reuses_flat_extract_and_metadata_access(monkeypatch):
     assert listed["entries"][0]["url"] == "https://www.youtube.com/watch?v=abcdefghijk"
     assert listed["entries"][0]["upload_date"] == "20231114"
     assert listed["entries"][0]["timestamp"] == 1_700_000_000
+    assert listed["entries"][0]["thumbnail_url"] == "https://i.ytimg.com/vi/abcdefghijk/sddefault.jpg"
 
 
 def test_plain_playlist_listing_stays_flat_without_access_opts(monkeypatch):
