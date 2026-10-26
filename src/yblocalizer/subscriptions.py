@@ -351,6 +351,19 @@ def refresh_weekly_hot(access: dict, now: float | None = None) -> dict:
                     "error": result["error"],
                     "count": kept,
                 })
+            old_videos = _load_cache()["videos"]
+            for result in channel_results:
+                if result["ok"]:
+                    continue
+                for item in old_videos:
+                    if item.get("channel_id") != result["id"] or item.get("url") in seen:
+                        continue
+                    timestamp = item.get("timestamp") if isinstance(item.get("timestamp"), int) else None
+                    if not _in_window(timestamp, stamp):
+                        continue
+                    seen.add(item["url"])
+                    videos.append(item)
+                    result["count"] += 1
             videos.sort(key=lambda item: item["timestamp"], reverse=True)
             _save_subscriptions(current)
             _save_cache(_iso(stamp), videos, channel_results)

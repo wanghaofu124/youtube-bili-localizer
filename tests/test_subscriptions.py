@@ -74,6 +74,47 @@ def test_weekly_refresh_ranks_by_upload_time_and_isolates_failures(monkeypatch):
     assert removed["videos"] == []
 
 
+def test_failed_channel_keeps_previous_in_window_videos(monkeypatch):
+    monkeypatch.setattr("yblocalizer.subscriptions.REQUEST_GAP_SECONDS", 0)
+    add_channel("https://www.youtube.com/@good")
+    add_channel("https://www.youtube.com/@bad")
+    set_subscriptions_enabled(True)
+    recent = int(NOW - 3600)
+    too_old = int(datetime(2026, 10, 19, tzinfo=timezone.utc).timestamp())
+    state = {"bad_down": False}
+
+    def fake_list(url, *_args, **_kwargs):
+        if url.endswith("/@bad/videos"):
+            if state["bad_down"]:
+                raise RuntimeError("channel down")
+            return {"title": "Bad", "entries": [
+                {"url": "https://www.youtube.com/watch?v=keep", "title": "Keep", "duration": 20, "timestamp": recent, "upload_date": "20261026", "thumbnail_url": "https://i.ytimg.com/vi/keep/hq.jpg"},
+                {"url": "https://www.youtube.com/watch?v=drop", "title": "Drop", "duration": 5, "timestamp": too_old, "thumbnail_url": "https://i.ytimg.com/vi/drop/hq.jpg"},
+            ]}
+        return {"title": "Good", "entries": [
+            {"url": "https://www.youtube.com/watch?v=gone", "title": "Gone", "duration": 8, "timestamp": recent},
+            {"url": "https://www.youtube.com/watch?v=stay", "title": "Stay", "duration": 9, "timestamp": recent + 10},
+        ] if not state["bad_down"] else [
+            {"url": "https://www.youtube.com/watch?v=stay", "title": "Stay", "duration": 9, "timestamp": recent + 10},
+        ]}
+
+    monkeypatch.setattr("yblocalizer.subscriptions.list_channel_uploads", fake_list)
+    access = {"cookies_from_browser": None, "cookies_file": None, "proxy": None, "po_token_mode": "off"}
+    first = refresh_weekly_hot(access, now=NOW)
+    assert [item["title"] for item in first["videos"]] == ["Stay", "Gone", "Keep"]
+    state["bad_down"] = True
+    second = refresh_weekly_hot(access, now=NOW)
+    assert [item["title"] for item in second["videos"]] == ["Stay", "Keep"]
+    kept = next(item for item in second["videos"] if item["title"] == "Keep")
+    assert kept["channel_title"] == "Bad"
+    assert kept["duration"] == 20
+    assert kept["upload_date"] == "20261026"
+    assert kept["thumbnail_url"] == "https://i.ytimg.com/vi/keep/hq.jpg"
+    failed = next(item for item in second["channel_results"] if not item["ok"])
+    assert failed["error"] == "channel down"
+    assert failed["count"] == 1
+
+
 def test_disabled_refresh_does_not_call_ytdlp(monkeypatch):
     called = []
     monkeypatch.setattr("yblocalizer.subscriptions.list_channel_uploads", lambda *_args, **_kwargs: called.append(True))
