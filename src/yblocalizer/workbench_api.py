@@ -50,6 +50,7 @@ _DEFAULT_USER_DATA_ROOT.mkdir(parents=True, exist_ok=True)
 load_dotenv(_DEFAULT_USER_DATA_ROOT / ".env")
 
 from .download import DownloadProposalMismatch, DownloadResolutionMismatch, YouTubeAccessError, get_video_metadata, list_playlist_entries, po_token_provider_status
+from .subscriptions import add_channel, refresh_weekly_hot, remove_channel, set_subscriptions_enabled, subscription_view, weekly_snapshot
 from .dub import DUB_MIX_MODES
 from .dependencies import (
     voxcpm_status,
@@ -4206,6 +4207,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "youtube_proxy_configured": bool(os.getenv("YBLOCALIZER_YOUTUBE_PROXY")),
                 "youtube_po_token": po_token_provider_status(),
             }); return
+        if path == "/api/subscriptions":
+            self._json(subscription_view()); return
+        if path == "/api/subscriptions/weekly":
+            self._json(weekly_snapshot()); return
         if path == "/api/tutorial-preferences":
             self._json(_read_tutorial_preferences()); return
         if path == "/api/diagnostics":
@@ -4570,6 +4575,38 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             except ValueError as exc: self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             else: self._json({"saved": True})
             return
+        if path == "/api/subscriptions":
+            try:
+                url = require_text(payload.get("url", ""), "url", MAX_URL_LENGTH, allow_empty=False)
+                self._json(add_channel(url))
+            except InputValidationError as exc:
+                self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/subscriptions/remove":
+            try:
+                channel_id = require_text(payload.get("id", ""), "id", 32, allow_empty=False)
+                self._json(remove_channel(channel_id))
+            except InputValidationError as exc:
+                self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/subscriptions/enabled":
+            try:
+                self._json(set_subscriptions_enabled(require_boolean(payload.get("enabled"), "enabled")))
+            except InputValidationError as exc:
+                self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/subscriptions/weekly/refresh":
+            try:
+                self._json(refresh_weekly_hot(self._weekly_access(payload)))
+            except InputValidationError as exc:
+                self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
+            except ValueError as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
         if path == "/api/templates":
             try:
                 name = require_text(payload.get("name", ""), "name", 50, allow_empty=False)
@@ -4863,6 +4900,27 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self._json(exc.payload(), HTTPStatus.BAD_REQUEST); return
         if delete_custom_template(name, platform=platform): self._json({"deleted": True, "platform": platform})
         else: self._json({"error": "Only custom templates can be deleted."}, HTTPStatus.NOT_FOUND)
+
+    def _weekly_access(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Cookies, proxy and PO Token mode, with the same env fallback as metadata."""
+        cookies_file = require_text(payload.get("cookies_file", ""), "cookies_file", 1024) or os.getenv("YBLOCALIZER_COOKIES_FILE", "").strip()
+        cookies_from_browser = require_text(payload.get("cookies_from_browser", ""), "cookies_from_browser", 32).lower()
+        if not cookies_from_browser:
+            cookies_from_browser = os.getenv("YBLOCALIZER_COOKIES_FROM_BROWSER", "").strip().lower()
+        if cookies_from_browser and cookies_from_browser not in {"chrome", "edge", "firefox", "brave", "chromium"}:
+            raise InputValidationError("YouTube Cookies 来源无效。", code="invalid_choice", field="cookies_from_browser")
+        if cookies_file:
+            cookies_from_browser = ""
+        proxy = require_text(payload.get("youtube_proxy", ""), "youtube_proxy", MAX_URL_LENGTH) or os.getenv("YBLOCALIZER_YOUTUBE_PROXY", "").strip()
+        po_token_mode = require_text(payload.get("youtube_po_token_mode", "auto"), "youtube_po_token_mode", 16).lower() or "auto"
+        if po_token_mode not in {"auto", "off"}:
+            raise InputValidationError("YouTube 浏览器验证模式必须是 auto 或 off。", code="invalid_choice", field="youtube_po_token_mode")
+        return {
+            "cookies_file": cookies_file or None,
+            "cookies_from_browser": cookies_from_browser or None,
+            "proxy": proxy or None,
+            "po_token_mode": po_token_mode,
+        }
 
     def _save_settings(self, payload: dict[str, Any]) -> None:
         translator = require_text(payload.get("translator", "deepseek"), "translator", 32, allow_empty=False).lower()

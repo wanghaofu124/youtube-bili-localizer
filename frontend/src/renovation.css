@@ -842,3 +842,26 @@ details[open] > .studio-drawer-summary { border-bottom: 1px solid var(--line); }
 .dub-unavailable { grid-column: 1 / -1; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-soft); font-size: 12px; line-height: 1.6; }
 .dub-unavailable b { color: var(--danger); }
 .dub-help { display: block; margin-top: 4px; padding: 6px 8px; border: 1px dashed var(--line); border-radius: 5px; color: var(--muted); }
+
+.weekly-hot-card > summary { display: flex; align-items: baseline; gap: 10px; padding: 14px 18px; cursor: pointer; list-style: none; }
+.weekly-hot-card > summary::-webkit-details-marker { display: none; }
+.weekly-hot-card > summary b { font-family: var(--font-display); font-size: 20px; }
+.weekly-hot-card > summary span { color: var(--muted); font-size: 12px; }
+.weekly-hot-card > summary::after { content: "⌄"; margin-left: auto; color: var(--muted); }
+.weekly-hot-card[open] > summary { border-bottom: 1px solid var(--line); }
+.weekly-hot-body { display: grid; gap: 8px; padding: 10px 0 4px; }
+.weekly-hot-toolbar { display: flex; align-items: center; gap: 10px; padding: 0 18px; }
+.weekly-hot-toolbar small { color: var(--muted); font-size: 11px; }
+.weekly-hot-card .metadata-notice { margin: 0 18px; }
+.weekly-hot-card .empty-editor { min-height: 132px; padding: 12px 18px 16px; }
+.weekly-hot-card .empty-editor button { justify-self: center; }
+.weekly-hot-card .video-library-row { grid-template-columns: minmax(0, 1fr) auto; min-height: 64px; }
+.weekly-hot-note { margin: 0; padding: 0 18px 12px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.settings-drawer .settings-check { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.settings-channels { display: grid; gap: 8px; width: 100%; }
+.settings-channel-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.settings-channel-row > span { min-width: 0; display: grid; flex: 1; }
+.settings-channel-row b, .settings-channel-row small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.settings-channel-row small { color: var(--muted); font-size: 11px; }
+.settings-channel-add { display: flex; gap: 8px; }
+.settings-channel-add input { flex: 1; min-width: 0; }
