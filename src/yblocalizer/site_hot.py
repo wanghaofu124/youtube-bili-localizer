@@ -28,6 +28,7 @@ CACHE_NAME = "site-hot.json"
 SEARCH_SP = "CAMSBAgDEAE%3D"
 FETCH_ITEMS = "1:100"
 SHORTS_MAX_SECONDS = 60
+LONG_VIDEO_SECONDS = 45 * 60
 SITE_TOP = 40
 WORKERS = 4
 REQUEST_GAP_SECONDS = 0.75
@@ -38,6 +39,7 @@ LIVE_STATUSES = {"is_live", "is_upcoming", "post_live"}
 # 综合 is the translation-friendly set. Music, film, vlogs and news stay on their own chips,
 # otherwise their view counts fill the default list.
 _MUSIC_RE = re.compile(r"official music video|\(song\)|\blyrics\b", re.IGNORECASE)
+_LIVE_VOD_RE = re.compile(r"is\s+live|livestream|live\s+stream", re.IGNORECASE)
 CATEGORIES: list[tuple[str, str, list[str]]] = [
     ("mix", "综合", ["ai", "tech", "gaming", "science", "explained", "programming", "documentary"]),
     ("tech", "科技/AI", ["ai", "tech"]),
@@ -151,6 +153,31 @@ def _musicish(row: dict) -> bool:
     return _MUSIC_RE.search(row["title"]) is not None
 
 
+def _live_vod(row: dict) -> bool:
+    return _LIVE_VOD_RE.search(f"{row.get('title') or ''} {row.get('channel_title') or ''}") is not None
+
+
+def _too_long(row: dict) -> bool:
+    duration = row.get("duration")
+    return isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration > LONG_VIDEO_SECONDS
+
+
+def _mix_tier(row: dict) -> int:
+    """0 normal, 1 live replay, 2 longer than 45 minutes."""
+    if _live_vod(row):
+        return 1
+    if _too_long(row):
+        return 2
+    return 0
+
+
+def _channel_key(row: dict) -> str:
+    channel_id = str(row.get("channel_id") or "").strip()
+    if channel_id:
+        return f"id:{channel_id}"
+    return f"name:{str(row.get('channel_title') or '').strip().lower()}"
+
+
 def _site_row(entry: dict) -> dict | None:
     url = _video_url(str(entry.get("url") or ""))
     if url is None or entry.get("live_status") in LIVE_STATUSES:
@@ -177,7 +204,11 @@ def _site_row(entry: dict) -> dict | None:
 
 
 def merge_site_entries(groups: list[list[dict]], *, demote_music: bool = False) -> list[dict]:
-    """Dedupe by video, drop Shorts and livestreams, rank by view count."""
+    """Dedupe by video, drop Shorts and livestreams, rank by view count.
+
+    The mix list also demotes music, live replays, and videos longer than 45
+    minutes, then keeps at most two videos from each channel.
+    """
     best: dict[str, dict] = {}
     for group in groups:
         for entry in group:
@@ -188,9 +219,30 @@ def merge_site_entries(groups: list[list[dict]], *, demote_music: bool = False) 
             if previous is None or (row["view_count"] or -1) > (previous["view_count"] or -1):
                 best[row["url"]] = row
     videos = list(best.values())
+    if demote_music:
+        videos.sort(
+            key=lambda item: (
+                2 - _mix_tier(item),
+                not _musicish(item),
+                item["view_count"] is not None,
+                item["view_count"] or 0,
+                item.get("timestamp") or 0,
+            ),
+            reverse=True,
+        )
+        kept: list[dict] = []
+        counts: dict[str, int] = {}
+        for item in videos:
+            key = _channel_key(item)
+            if counts.get(key, 0) >= 2:
+                continue
+            counts[key] = counts.get(key, 0) + 1
+            kept.append(item)
+            if len(kept) >= SITE_TOP:
+                break
+        return kept
     videos.sort(
         key=lambda item: (
-            not _musicish(item) if demote_music else True,
             item["view_count"] is not None,
             item["view_count"] or 0,
             item.get("timestamp") or 0,

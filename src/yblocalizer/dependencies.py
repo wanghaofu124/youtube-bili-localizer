@@ -67,6 +67,7 @@ OLLAMA_MODEL_TAGS: dict[str, str] = {
     "ollama-translategemma-12b": "translategemma:12b",
 }
 OLLAMA_SPECIALIZED_TRANSLATION_MODELS = frozenset({"translategemma:12b"})
+_OLLAMA_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}(?::[A-Za-z0-9][A-Za-z0-9._-]{0,40})?$")
 _SCAN_CACHE_TTL_SECONDS = 10.0
 _scan_cache: dict[tuple[str, str], tuple[float, list[Path]]] = {}
 _scan_cache_lock = threading.Lock()
@@ -373,8 +374,25 @@ def _ollama_json(path: str, *, timeout: float = 2.0) -> dict[str, Any]:
     return value
 
 
+def normalize_ollama_model_tag(value: str) -> str:
+    """Accept one Ollama model name. Recommended tags are optional, not a full download set."""
+    text = str(value or "").strip()
+    if text == "translategemma:4b":
+        text = "translategemma:12b"
+    if text == "qwen3.5:27b":
+        text = "qwen3.5:9b"
+    if _OLLAMA_TAG_RE.fullmatch(text) is None:
+        raise ValueError("Ollama 模型名要写成一个名称，例如 qwen3.5:4b 或 llama3.1:8b。")
+    return text
+
+
+def ollama_model_present(selected: str, installed: set[str] | list[str]) -> bool:
+    names = {item.strip() for item in installed if str(item).strip()}
+    return selected in names or f"{selected}:latest" in names
+
+
 def ollama_local_status() -> dict[str, Any]:
-    """Return runtime and allowlisted-model status without loading a model."""
+    """Return runtime and installed-model status without loading a model."""
     executable = resolve_command("ollama")
     try:
         _ollama_json("/api/version")
@@ -389,12 +407,14 @@ def ollama_local_status() -> dict[str, Any]:
                 "runtime_state": "unavailable", "runtime_available": False,
                 "runtime_message": "Ollama 已响应，但无法读取已安装模型。请检查 Ollama 后重试。",
                 "cli_available": bool(executable),
+                "installed_models": [],
                 "models": {dependency_id: False for dependency_id in OLLAMA_MODEL_TAGS},
             }
         return {
             "runtime_state": "ready", "runtime_available": True,
             "runtime_message": "Ollama 正在运行。",
             "cli_available": bool(executable),
+            "installed_models": sorted(name for name in installed if name),
             "models": {dependency_id: tag in installed for dependency_id, tag in OLLAMA_MODEL_TAGS.items()},
         }
     except (HTTPError, URLError, OSError, TimeoutError, ValueError, json.JSONDecodeError):
@@ -406,6 +426,7 @@ def ollama_local_status() -> dict[str, Any]:
             "runtime_state": state, "runtime_available": False,
             "runtime_message": message,
             "cli_available": bool(executable),
+            "installed_models": [],
             "models": {dependency_id: False for dependency_id in OLLAMA_MODEL_TAGS},
         }
 

@@ -59,7 +59,9 @@ from .dependencies import (
     DependencyManager,
     clear_dependency_cache,
     dependency_statuses,
+    normalize_ollama_model_tag,
     ollama_local_status,
+    ollama_model_present,
     require_whisper_model,
     resolve_command,
 )
@@ -101,6 +103,7 @@ from .publish_text import (
     save_custom_template,
 )
 from .translate import ai_provider_request_info, compact_overflowing_subtitles, generate_publish_metadata, save_publish_metadata, translate_single_cue
+from .translation_setup import key_page_for, list_translation_presets, resolve_translation_choice, saved_translation, translation_preset
 from .render import burn_subtitles, subtitle_line_capacity
 from .subtitle import translated_layout_issues
 from .subtitle_sentence_plan import (
@@ -139,6 +142,7 @@ from .asr_review import _atomic_json, _file_fingerprint, _path_signature, next_r
 
 LOGGER = logging.getLogger("yblocalizer.workbench")
 TUTORIAL_VERSION = 1
+SETUP_VERSION = 1
 TUTORIAL_PREFERENCES_MAX_BYTES = 4096
 JOB_ID_PATTERN = r"(?=[^/]{1,128}(?:/|$))[\w-]+(?:\.[\w-]+)*"
 
@@ -225,6 +229,25 @@ def _validate_public_http_url(value: Any, field: str = "source_url") -> str:
         raise InputValidationError(
             "视频链接不能指向本机或局域网地址。", code="private_url", field=field,
         )
+    return url
+
+
+_OPENABLE_VIDEO_HOSTS = frozenset({
+    "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
+    "youtu.be", "www.youtu.be",
+    "youtube-nocookie.com", "www.youtube-nocookie.com",
+    "bilibili.com", "www.bilibili.com", "m.bilibili.com", "space.bilibili.com",
+    "b23.tv", "www.b23.tv",
+})
+
+
+def _openable_video_url(value: Any) -> str:
+    """A YouTube or Bilibili link safe to hand to the system browser."""
+    url = _validate_public_http_url(value, "url")
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").rstrip(".").lower()
+    if host not in _OPENABLE_VIDEO_HOSTS or not (parsed.path or parsed.query):
+        raise InputValidationError("只能打开 YouTube 或 B 站视频链接。", code="invalid_url", field="url")
     return url
 
 
@@ -321,10 +344,15 @@ def _probe_translation_service(provider: str, model: str | None = None) -> tuple
         local = ollama_local_status()
         if not local["runtime_available"]:
             return False, str(local["runtime_message"])
-        selected_model = model or "qwen3.5:4b"
-        model_id = next((key for key, tag in OLLAMA_MODEL_TAGS.items() if tag == selected_model), None)
-        if not model_id or not local["models"].get(model_id, False):
-            return False, f"本地模型 {selected_model} 尚未下载；请在依赖中心下载后重新检查。"
+        try:
+            selected_model = normalize_ollama_model_tag(model or "qwen3.5:4b")
+        except ValueError as exc:
+            return False, str(exc)
+        known_id = next((key for key, tag in OLLAMA_MODEL_TAGS.items() if tag == selected_model), None)
+        known_ready = bool(known_id and (local.get("models") or {}).get(known_id))
+        if not known_ready and not ollama_model_present(selected_model, local.get("installed_models") or []):
+            detail = "只需要下载这一个。" if known_id else "填写本机已经有的模型名即可，不会自动下载其他模型。"
+            return False, f"Ollama 里还没有 {selected_model}。{detail}"
         return True, f"Ollama 与本地模型 {selected_model} 可用；翻译请求只发送到本机。"
     key_name = "DEEPSEEK_API_KEY" if normalized == "deepseek" else "OPENAI_API_KEY"
     api_key = os.getenv(key_name, "").strip()
@@ -436,6 +464,45 @@ def _write_tutorial_preferences(payload: dict[str, Any]) -> None:
     if type(version) is not int or version != TUTORIAL_VERSION:
         raise InputValidationError("教程偏好版本无效。", code="invalid_value", field="dismissedVersion")
     path = _tutorial_preferences_path()
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:10]}.tmp")
+    with _tutorial_preferences_lock:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(json.dumps({"dismissedVersion": version}, ensure_ascii=False), encoding="utf-8")
+            os.replace(temporary, path)
+        except OSError:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+
+def _setup_preferences_path() -> Path:
+    return USER_DATA_ROOT / "setup-preferences.json"
+
+
+def _read_setup_preferences() -> dict[str, int]:
+    path = _setup_preferences_path()
+    try:
+        if not path.is_file() or path.stat().st_size > TUTORIAL_PREFERENCES_MAX_BYTES:
+            return {"dismissedVersion": 0}
+        value = json.loads(path.read_text(encoding="utf-8"))
+        version = value.get("dismissedVersion") if isinstance(value, dict) else None
+        if type(version) is not int or version < 0:
+            return {"dismissedVersion": 0}
+        return {"dismissedVersion": version}
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return {"dismissedVersion": 0}
+
+
+def _write_setup_preferences(payload: dict[str, Any]) -> None:
+    if set(payload) != {"dismissedVersion"}:
+        raise InputValidationError("准备页偏好字段无效。", code="invalid_payload")
+    version = payload.get("dismissedVersion")
+    if type(version) is not int or version != SETUP_VERSION:
+        raise InputValidationError("准备页偏好版本无效。", code="invalid_value", field="dismissedVersion")
+    path = _setup_preferences_path()
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:10]}.tmp")
     with _tutorial_preferences_lock:
         try:
@@ -4172,6 +4239,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "version": __version__,
                 "csrf_token": self.csrf_token,
                 "defaults": default_options(str(OUTPUT_ROOT)),
+                "translation_presets": list_translation_presets(),
+                **saved_translation(),
                 "capabilities": capabilities(),
                 "demo": {
                     "name": "authorized-demo-10s.mp4", "duration_seconds": 10,
@@ -4201,6 +4270,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 "voxcpm_help": dub_status["voxcpm_help"],
                 "deepseek_key_configured": bool(os.getenv("DEEPSEEK_API_KEY")),
                 "openai_key_configured": bool(os.getenv("OPENAI_API_KEY")),
+                "translation_presets": list_translation_presets(),
+                **saved_translation(),
                 "default_output_dir": default_output_dir,
                 "cookies_from_browser": os.getenv("YBLOCALIZER_COOKIES_FROM_BROWSER", ""),
                 "cookies_file": cookies_file,
@@ -4221,6 +4292,8 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/tutorial-preferences":
             self._json(_read_tutorial_preferences()); return
+        if path == "/api/setup-preferences":
+            self._json(_read_setup_preferences()); return
         if path == "/api/diagnostics":
             self._json(self._diagnostics()); return
         if path == "/api/dependencies":
@@ -4395,6 +4468,35 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             except OSError:
                 self._json({"error": "教程偏好无法保存。", "code": "preference_write_failed"}, HTTPStatus.INTERNAL_SERVER_ERROR); return
             self._json({"saved": True, "dismissedVersion": TUTORIAL_VERSION}); return
+        if path == "/api/setup-preferences":
+            try:
+                _write_setup_preferences(payload)
+            except InputValidationError as exc:
+                self._json(exc.payload(), HTTPStatus.BAD_REQUEST); return
+            except OSError:
+                self._json({"error": "准备页偏好无法保存。", "code": "preference_write_failed"}, HTTPStatus.INTERNAL_SERVER_ERROR); return
+            self._json({"saved": True, "dismissedVersion": SETUP_VERSION}); return
+        if path == "/api/setup/open-key-page":
+            try:
+                opened = webbrowser.open(key_page_for(str(payload.get("preset") or "deepseek")), new=2, autoraise=True)
+            except InputValidationError as exc:
+                self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
+            except (OSError, webbrowser.Error):
+                self._json({"error": "无法打开密钥页面。"}, HTTPStatus.BAD_GATEWAY)
+            else:
+                self._json({"ok": True, "opened": bool(opened)})
+            return
+        if path == "/api/open-url":
+            try:
+                url = _openable_video_url(payload.get("url"))
+                opened = webbrowser.open(url, new=2, autoraise=True)
+            except InputValidationError as exc:
+                self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
+            except (OSError, webbrowser.Error):
+                self._json({"error": "无法打开原链接。"}, HTTPStatus.BAD_GATEWAY)
+            else:
+                self._json({"ok": True, "opened": bool(opened)})
+            return
         if not self._require_external_ai_consent(path, payload):
             return
         if path == "/api/dependencies/ollama/start":
@@ -4578,10 +4680,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 self._json({"error": "清空术语表需要确认。"}, HTTPStatus.BAD_REQUEST); return
             self._json({"entries": save_glossary(global_glossary_path(OUTPUT_ROOT), entries)}); return
         if path == "/api/settings":
-            try: self._save_settings(payload)
+            try: saved = self._save_settings(payload)
             except InputValidationError as exc: self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
             except ValueError as exc: self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
-            else: self._json({"saved": True})
+            else: self._json({"saved": True, **saved})
             return
         if path == "/api/subscriptions":
             try:
@@ -4959,11 +5061,36 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             "po_token_mode": po_token_mode,
         }
 
-    def _save_settings(self, payload: dict[str, Any]) -> None:
+    def _save_settings(self, payload: dict[str, Any]) -> dict[str, str]:
+        preset_id = str(payload.get("translation_preset") or "").strip()
         translator = require_text(payload.get("translator", "deepseek"), "translator", 32, allow_empty=False).lower()
         key = require_text(payload.get("api_key", ""), "api_key", 1024)
-        if translator not in {"deepseek", "openai", "ollama"}:
+        if translator not in {"deepseek", "openai", "ollama", "none"}:
             raise InputValidationError("设置中的翻译器无效。", code="invalid_choice", field="translator")
+        saved: dict[str, str] = {}
+        if translator == "none":
+            preset_id = ""
+            key = ""
+            _upsert_env(USER_DATA_ROOT / ".env", {"YBLOCALIZER_TRANSLATOR": "none"})
+            os.environ["YBLOCALIZER_TRANSLATOR"] = "none"
+            saved = {"translator": "none", "translate_model": "", "translation_preset": "", "translation_base_url": ""}
+        if preset_id:
+            chosen = translation_preset(preset_id)
+            existing_key = ""
+            if chosen and chosen["engine"] == "deepseek":
+                existing_key = os.getenv("DEEPSEEK_API_KEY", "")
+            elif chosen and chosen["engine"] == "openai" and os.getenv("YBLOCALIZER_TRANSLATION_PRESET", "") == preset_id:
+                existing_key = os.getenv("OPENAI_API_KEY", "")
+            updates, saved = resolve_translation_choice(
+                preset_id,
+                key,
+                str(payload.get("base_url") or ""),
+                str(payload.get("translate_model") or ""),
+                existing_key,
+            )
+            _upsert_env(USER_DATA_ROOT / ".env", updates)
+            os.environ.update(updates)
+            key = ""
         cookies_from_browser = require_text(payload.get("cookies_from_browser", ""), "cookies_from_browser", 32).lower()
         cookies_file = require_text(payload.get("cookies_file", ""), "cookies_file", 1024)
         proxy_supplied = "youtube_proxy" in payload
@@ -4997,6 +5124,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             env_key = "DEEPSEEK_API_KEY" if translator == "deepseek" else "OPENAI_API_KEY"
             _upsert_env(USER_DATA_ROOT / ".env", {env_key: key})
             os.environ[env_key] = key
+        return saved
 
     def _outputs_snapshot(self, root: Path) -> dict[str, Any]:
         root = root.resolve()

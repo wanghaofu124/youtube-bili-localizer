@@ -15,7 +15,7 @@ import pytest
 from yblocalizer import db as job_db
 from yblocalizer.runtime import PipelineEvent, PipelineStage
 from yblocalizer.transcribe import WhisperCudaOutOfMemory
-from yblocalizer.workbench_api import DEMO_VIDEO, DemoJob, Material, WorkbenchHandler, WorkbenchJobs, _ffconcat_path, _upsert_env, _resolve_output_root, _recovery_for_error, _safe_options, _probe_translation_service, build_server, public_path, stage_from_log
+from yblocalizer.workbench_api import DEMO_VIDEO, DemoJob, Material, WorkbenchHandler, WorkbenchJobs, _ffconcat_path, _openable_video_url, _read_setup_preferences, _upsert_env, _write_setup_preferences, _resolve_output_root, _recovery_for_error, _safe_options, _probe_translation_service, build_server, public_path, stage_from_log
 from yblocalizer.workbench_config import InputValidationError, default_options, normalize_options, options_for_public, options_for_storage, options_from_storage, preflight
 
 
@@ -171,6 +171,35 @@ def test_prepare_cannot_overwrite_running_or_revive_cancelled_job(monkeypatch: p
     assert not worker.is_alive()
     assert job.status == "cancelled"
     assert job.checks == []
+
+
+def test_setup_preferences_record_one_dismissal() -> None:
+    assert _read_setup_preferences() == {"dismissedVersion": 0}
+    _write_setup_preferences({"dismissedVersion": 1})
+    assert _read_setup_preferences() == {"dismissedVersion": 1}
+    with pytest.raises(InputValidationError):
+        _write_setup_preferences({"dismissedVersion": 2})
+
+
+@pytest.mark.parametrize("url", [
+    "https://www.youtube.com/watch?v=nM21hVqvhmk",
+    "https://youtu.be/nM21hVqvhmk",
+    "https://www.bilibili.com/video/BV1xx411c7mD",
+    "https://b23.tv/abcdef",
+])
+def test_openable_video_url_accepts_youtube_and_bilibili(url: str) -> None:
+    assert _openable_video_url(url) == url
+
+
+@pytest.mark.parametrize("url", [
+    "https://example.com/watch?v=nM21hVqvhmk",
+    "file:///C:/video.mp4",
+    "https://127.0.0.1/watch?v=nM21hVqvhmk",
+    "https://www.youtube.com",
+])
+def test_openable_video_url_rejects_other_targets(url: str) -> None:
+    with pytest.raises(InputValidationError):
+        _openable_video_url(url)
 
 
 @pytest.mark.parametrize("url", ["example.com/video", "ftp://example.com/video", "https://"])

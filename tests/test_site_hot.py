@@ -30,6 +30,48 @@ def test_merge_drops_shorts_and_live_then_ranks_by_views():
     assert rows[2]["upload_date"] == "20261020"
 
 
+def _clip(video_id: str, title: str, views: int, **extra) -> dict:
+    row = {
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "title": title,
+        "duration": 600,
+        "view_count": views,
+        "timestamp": 1,
+        "channel": "Chan",
+        "channel_id": "UC0",
+    }
+    row.update(extra)
+    return row
+
+
+def test_mix_caps_channels_and_demotes_live_vods_and_long_videos():
+    groups = [[
+        _clip("aaaaaaaaaaa", "Third", 300, channel="Same", channel_id="UC1"),
+        _clip("bbbbbbbbbbb", "Second", 400, channel="Same", channel_id="UC1"),
+        _clip("ccccccccccc", "First", 500, channel="Same", channel_id="UC1"),
+        _clip("ddddddddddd", "Other", 50, channel="Other", channel_id="UC2"),
+        _clip("eeeeeeeeeee", "PAJI IS LIVE night", 9_000_000, channel="PAJI IS LIVE", channel_id="UC3"),
+        _clip("fffffffffff", "Long doc", 8_000_000, duration=46 * 60, channel="Docs", channel_id="UC4"),
+        _clip("ggggggggggg", "Live Insaan week", 7_000_000, channel="Live Insaan", channel_id="UC5"),
+        _clip("hhhhhhhhhhh", "Normal", 100, channel="Normal", channel_id="UC6"),
+        _clip("iiiiiiiiiii", "Exactly", 200, duration=45 * 60, channel="Edge", channel_id="UC7"),
+    ]]
+    ranked = merge_site_entries(groups, demote_music=True)
+    assert [item["title"] for item in ranked] == [
+        "Live Insaan week",
+        "First",
+        "Second",
+        "Exactly",
+        "Normal",
+        "Other",
+        "PAJI IS LIVE night",
+        "Long doc",
+    ]
+    plain = merge_site_entries(groups)
+    assert plain[0]["title"] == "PAJI IS LIVE night"
+    assert "Third" in [item["title"] for item in plain]
+
+
 def test_failed_refresh_keeps_cache_and_mix_skips_music(monkeypatch):
     monkeypatch.setattr("yblocalizer.site_hot.REQUEST_GAP_SECONDS", 0)
     empty = site_snapshot()

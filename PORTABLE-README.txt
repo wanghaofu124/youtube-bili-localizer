@@ -1,4 +1,4 @@
-YouTube Bili Localizer v0.3.0 portable package
+YouTube Bili Localizer v0.3.2 portable package
 
 1. Extract this ZIP to a folder where your Windows account can write files.
 2. Start YouTubeBiliLocalizer.exe from the extracted folder.
