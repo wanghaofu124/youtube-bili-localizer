@@ -69,6 +69,10 @@ def _ensure_playwright_browsers() -> None:
 _ensure_playwright_browsers()
 
 
+_APP_ID = "YouTubeBiliLocalizer.Workbench"
+_ICON_PATH = ASSET_ROOT / "assets" / "app-icon.ico"
+
+
 class DesktopBridge:
     """Small, explicit native-only API used by the local workbench.
 
@@ -143,6 +147,10 @@ def main() -> int:
         if choice == 1:
             webbrowser.open(WEBVIEW2_DOWNLOAD_URL)
         return 2
+    if sys.platform == "win32":
+        import ctypes
+        # Own taskbar identity so the window is not grouped under pythonw.exe.
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_APP_ID)
     # Use an OS-assigned loopback port.  A user may still have an older EXE
     # open while trying a new release; a fixed port would make the new window
     # silently attach to that older local service instead of its own backend.
@@ -174,7 +182,7 @@ def main() -> int:
         # 注意：不要启用 debug=True。它会打开 WebView2 的浏览器快捷键/DevTools，
         # 已观察到处理任务时窗口被异常关闭（仅剩 RADAR 内存预警，无崩溃记录）。
         # 右键复制由前端自定义菜单实现。
-        webview.start(gui="edgechromium")
+        webview.start(gui="edgechromium", icon=str(_ICON_PATH))
     finally:
         server.shutdown()
         server.server_close()

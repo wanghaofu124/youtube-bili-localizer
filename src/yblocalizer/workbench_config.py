@@ -6,7 +6,7 @@ from pathlib import Path
 import shutil
 from typing import Any, Callable
 
-from .dependencies import DEFAULT_VOXCPM_MODEL_DIR, DEFAULT_VOXCPM_PYTHON, OLLAMA_MODEL_TAGS, dependency_capabilities, ollama_local_status, voxcpm_status
+from .dependencies import DEFAULT_VOXCPM_MODEL_DIR, DEFAULT_VOXCPM_PYTHON, OLLAMA_MODEL_TAGS, dependency_capabilities, normalize_ollama_model_tag, ollama_local_status, ollama_model_present, voxcpm_status
 from .download import po_token_provider_status
 from .ocr_subtitle import _normalize_ocr_language, available_ocr_languages, ocr_language_ready
 from .render import render_encoder_status
@@ -208,6 +208,17 @@ def _text(value: Any) -> str:
     return "" if value is None else str(value).strip()
 
 
+def _saved_translator() -> str:
+    value = os.getenv("YBLOCALIZER_TRANSLATOR", "").strip().lower()
+    if value in {"deepseek", "openai", "ollama", "none"}:
+        return value
+    return "deepseek"
+
+
+def _saved_translate_model() -> str:
+    return os.getenv("YBLOCALIZER_TRANSLATE_MODEL", "").strip()[:128]
+
+
 def default_options(output_dir: str = "outputs/workbench_demo") -> dict[str, Any]:
     """The sole public default set used by the workbench and its API clients."""
     return {
@@ -221,7 +232,7 @@ def default_options(output_dir: str = "outputs/workbench_demo") -> dict[str, Any
         "beam_size": 5, "asr_hint": "", "asr_vad_mode": "standard", "ocr_interval": 0.5, "ocr_crop_ratio": 0.30, "ocr_min_chars": 3,
         "ocr_language": "eng",
         "subtitle_margin_ratio": 0.055, "render_crf": 20,
-        "translator": "deepseek", "target_lang": "zh-Hans", "translate_model": "",
+        "translator": _saved_translator(), "target_lang": "zh-Hans", "translate_model": _saved_translate_model(),
         "deepseek_thinking": "disabled",
         "llm_pricing_mode": "auto", "llm_custom_pricing": {},
         "smart_translation": True, "smart_subtitle_layout": True,
@@ -267,20 +278,13 @@ def normalize_options(value: Any, output_dir: str, *, strict: bool = True) -> di
             raise InputValidationError(str(exc), field="llm_custom_pricing") from exc
         custom_pricing = {}
         llm_pricing_mode = "auto"
-    # Keep saved user preferences and older job manifests usable after the
-    # TranslateGemma 4B choice was replaced by the tested 12B model.
-    if translator == "ollama" and translate_model == "translategemma:4b":
-        translate_model = "translategemma:12b"
-    # Return saved preferences from the 27B trial to the supported 9B model.
-    if translator == "ollama" and translate_model == "qwen3.5:27b":
-        translate_model = "qwen3.5:9b"
-    if translator == "ollama" and translate_model and translate_model not in OLLAMA_MODEL_TAGS.values():
-        if strict:
-            raise InputValidationError(
-                "Ollama 仅支持依赖中心中已登记的本地模型。",
-                code="invalid_choice", field="translate_model",
-            )
-        translate_model = None
+    if translator == "ollama" and translate_model:
+        try:
+            translate_model = normalize_ollama_model_tag(translate_model)
+        except ValueError as exc:
+            if strict:
+                raise InputValidationError(str(exc), code="invalid_choice", field="translate_model") from exc
+            translate_model = None
     audio_channel = str(raw.get("audio_channel") or "mix").strip().lower()
     if audio_channel not in {"mix", "left", "right"}:
         raise InputValidationError("声道必须是 mix、left 或 right。", code="invalid_choice", field="audio_channel")
@@ -455,8 +459,12 @@ def preflight(
             else:
                 model = options["translate_model"] or "qwen3.5:4b"
                 model_id = next((key for key, tag in OLLAMA_MODEL_TAGS.items() if tag == model), None)
-                if model_id and not local["models"].get(model_id, False):
-                    add_block(model_id, f"本地模型 {model} 尚未下载。请在依赖中心点击“下载模型”；完成后无需重启。")
+                if ollama_model_present(model, local.get("installed_models") or []):
+                    pass
+                elif model_id and not local["models"].get(model_id, False):
+                    add_block(model_id, f"还没有 {model}。只需要下载这一个，其他本地模型不用一起下。")
+                elif not model_id:
+                    add_block("ollama-model-missing", f"Ollama 里还没有 {model}。填写本机已经有的模型名即可，不会自动下载其他模型。")
     if needs("acquire") and source_url and options["youtube_po_token_mode"] == "auto":
         po_status = po_token_provider_status()
         if not po_status["available"]:

@@ -19,9 +19,17 @@ from .dependencies import (
     OLLAMA_BASE_URL,
     OLLAMA_MODEL_TAGS,
     OLLAMA_SPECIALIZED_TRANSLATION_MODELS,
+    normalize_ollama_model_tag,
     ollama_local_status,
+    ollama_model_present,
     resolve_command,
 )
+
+
+def _openai_request_base_url() -> str | None:
+    """Use a saved compatible endpoint. Unset keeps the official OpenAI default."""
+    value = os.getenv("OPENAI_BASE_URL", "").strip()
+    return value or None
 
 
 def ai_provider_request_info(provider: str, model: str | None = None) -> tuple[str, str, str, bool]:
@@ -228,7 +236,7 @@ def compact_overflowing_subtitles(
     max_attempts = max(1, min(2, int(max_attempts)))
     if provider_key == "openai":
         selected_model = model or os.getenv("OPENAI_TRANSLATE_MODEL", "gpt-4.1-mini")
-        api_key_env, base_url = "OPENAI_API_KEY", None
+        api_key_env, base_url = "OPENAI_API_KEY", _openai_request_base_url()
     elif provider_key == "deepseek":
         selected_model = model or os.getenv("DEEPSEEK_TRANSLATE_MODEL", "deepseek-v4-flash")
         api_key_env = "DEEPSEEK_API_KEY"
@@ -539,7 +547,7 @@ def translate_segments(
             model=model or os.getenv("OPENAI_TRANSLATE_MODEL", "gpt-4.1-mini"),
             batch_size=batch_size,
             api_key_env="OPENAI_API_KEY",
-            base_url=None,
+            base_url=_openai_request_base_url(),
             provider_name="OpenAI",
             smart_translation=smart_translation,
             checkpoint_path=checkpoint_path,
@@ -657,7 +665,7 @@ def correct_source_segments(
             model=model or os.getenv("OPENAI_TRANSLATE_MODEL", "gpt-4.1-mini"),
             batch_size=batch_size,
             api_key_env="OPENAI_API_KEY",
-            base_url=None,
+            base_url=_openai_request_base_url(),
             source_title=source_title,
             source_description=source_description,
             cancel_check=cancel_check,
@@ -728,7 +736,7 @@ def generate_publish_metadata(
             target_lang=target_lang,
             model=model or os.getenv("OPENAI_TRANSLATE_MODEL", "gpt-4.1-mini"),
             api_key_env="OPENAI_API_KEY",
-            base_url=None,
+            base_url=_openai_request_base_url(),
             provider_name="OpenAI",
             cancel_check=cancel_check,
         )
@@ -761,16 +769,20 @@ def generate_publish_metadata(
 
 
 def _require_ollama_model(model: str | None) -> str:
-    selected = model or "qwen3.5:4b"
-    dependency_id = next((key for key, tag in OLLAMA_MODEL_TAGS.items() if tag == selected), None)
-    if not dependency_id:
-        raise RuntimeError("Ollama 仅支持依赖中心中已登记的本地模型。")
+    try:
+        selected = normalize_ollama_model_tag(model or "qwen3.5:4b")
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     status = ollama_local_status()
     if not status["runtime_available"]:
         raise RuntimeError(str(status["runtime_message"]))
-    if not status["models"].get(dependency_id, False):
-        raise RuntimeError(f"Ollama 本地模型 {selected} 尚未下载。请在依赖中心下载后重新运行翻译阶段。")
-    return selected
+    installed = status.get("installed_models") or []
+    if ollama_model_present(selected, installed):
+        return selected
+    dependency_id = next((key for key, tag in OLLAMA_MODEL_TAGS.items() if tag == selected), None)
+    if dependency_id:
+        raise RuntimeError(f"还没有 {selected}。只需要下载这一个模型，其他本地模型不用一起下。")
+    raise RuntimeError(f"Ollama 里还没有 {selected}。填写本机已经有的模型名即可，不会自动下载其他模型。")
 
 
 def _source_correction_enabled() -> bool:

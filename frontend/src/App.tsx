@@ -2,11 +2,23 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { publishStageButton, sameTaskOption, stageAvailability, workflowPrimaryLabel, type StageName } from "./workflowState";
 import { retainVisibleVideoLibrarySelection, selectableVideoLibraryIds, videoLibraryCategory, videoLibraryMatches, type VideoLibraryCategory } from "./videoLibrary";
 import { cueNeedsReview, replaceLiteral } from "./subtitleEditor";
+import { SetupModal, TranslationPresetFields, type TranslationPreset } from "./SetupModal";
 import { TutorialModal, type TutorialAction } from "./TutorialModal";
 
 type View = "material" | "library" | "process" | "subtitle" | "publish" | "files";
 const CURRENT_TUTORIAL_VERSION = 1;
 const TUTORIAL_STORAGE_KEY = "ybl-onboarding";
+const CURRENT_SETUP_VERSION = 1;
+const SETUP_STORAGE_KEY = "ybl-first-setup";
+const readSetupDismissed = () => {
+  try {
+    const raw = localStorage.getItem(SETUP_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) as { dismissedVersion?: unknown } : null;
+    return parsed?.dismissedVersion === CURRENT_SETUP_VERSION;
+  } catch {
+    return false;
+  }
+};
 const readTutorialDismissed = () => {
   try {
     const raw = localStorage.getItem(TUTORIAL_STORAGE_KEY);
@@ -752,14 +764,74 @@ type WeeklyHot = {
   channel_progress?: { done: number; total: number } | null;
   sort_mode?: "views" | "recent";
 };
+type SiteHot = {
+  category: string;
+  categories: { id: string; label: string }[];
+  region: string;
+  regions: { id: string; label: string }[];
+  cached_region: string | null;
+  videos: WeeklyHotVideo[];
+  refreshed_at: string | null;
+  stale: boolean;
+  refreshing?: boolean;
+  progress?: { done: number; total: number; category: string } | null;
+  error: string | null;
+  query_errors: string[];
+  sort_mode?: "views";
+};
+function siteNeedsAutoRefresh(data: SiteHot): boolean {
+  const neverFetched = data.videos.length === 0 && data.refreshed_at == null;
+  return data.stale || neverFetched;
+}
+
+type SiteDurationBand = "all" | "voice" | "mid" | "longer";
+
+function siteDurationMatches(duration: number | null, band: SiteDurationBand): boolean {
+  if (band === "all") return true;
+  if (typeof duration !== "number") return false;
+  const minutes = duration / 60;
+  if (band === "voice") return minutes >= 8 && minutes <= 25;
+  if (band === "mid") return minutes > 25 && minutes <= 45;
+  return minutes > 45;
+}
+
+const SITE_DURATION_BANDS: { id: SiteDurationBand; label: string }[] = [
+  { id: "all", label: "全部" },
+  { id: "voice", label: "8–25 分钟" },
+  { id: "mid", label: "25–45 分钟" },
+  { id: "longer", label: "更长" },
+];
+
+function thumbnailCandidates(src: string): string[] {
+  const id = src.match(/\/vi(?:_webp)?\/([A-Za-z0-9_-]{11})\//)?.[1] ?? "";
+  // Signed hq720 links expire, and hqdefault/mqdefault stall on this network.
+  // sddefault, the first frame, and the small default image answer.
+  if (!id) return src ? [src] : [];
+  return [
+    `https://i.ytimg.com/vi/${id}/sddefault.jpg`,
+    `https://i.ytimg.com/vi/${id}/0.jpg`,
+    `https://i.ytimg.com/vi/${id}/default.jpg`,
+  ];
+}
+
 function WeeklyThumb({ src }: { src: string }) {
-  const [failed, setFailed] = useState(false);
-  if (failed) return <span className="weekly-hot-thumb" />;
-  return <img className="weekly-hot-thumb" src={src} alt="" referrerPolicy="no-referrer" onError={() => setFailed(true)} />;
+  const candidates = thumbnailCandidates(src);
+  const [index, setIndex] = useState(0);
+  if (index >= candidates.length) return <span className="weekly-hot-thumb is-placeholder" aria-hidden="true" />;
+  return <img className="weekly-hot-thumb" src={candidates[index]} alt="" onError={() => setIndex((value) => value + 1)} />;
 }
 const formatUploadDay = (value: string | null): string | null => {
   if (!value || !/^\d{8}$/.test(value)) return null;
   return `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`;
+};
+const formatDaysAgo = (timestamp: number | null): string | null => {
+  if (!timestamp) return null;
+  const upload = new Date(timestamp * 1000);
+  const now = new Date();
+  const days = Math.round((Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - Date.UTC(upload.getUTCFullYear(), upload.getUTCMonth(), upload.getUTCDate())) / 86400000);
+  if (days <= 0) return "今天";
+  if (days === 1) return "昨天";
+  return `${days} 天前`;
 };
 const formatClock = (seconds: number): string => {
   const total = Math.max(0, Math.round(seconds));
@@ -932,6 +1004,16 @@ function App() {
   const [channelDraft, setChannelDraft] = useState("");
   const [channelSaving, setChannelSaving] = useState(false);
   const weeklyBusyRef = useRef(false);
+  const [hotTab, setHotTab] = useState<"site" | "channels">("site");
+  const [site, setSite] = useState<SiteHot | null>(null);
+  const [siteCategory, setSiteCategory] = useState("mix");
+  const [siteDurationBand, setSiteDurationBand] = useState<SiteDurationBand>("all");
+  const [siteBusy, setSiteBusy] = useState(false);
+  const [siteError, setSiteError] = useState("");
+  const siteBusyRef = useRef(false);
+  const siteCategoryRef = useRef("mix");
+  const siteRegionRef = useRef("US");
+  const siteAutoTriedRef = useRef(new Set<string>());
   const [materialSourceTab, setMaterialSourceTab] = useState<"url" | "local">("url");
   const sourceRevision = useRef(0);
   const [authorized, setAuthorized] = useState(false);
@@ -1109,6 +1191,22 @@ function App() {
   const [dismissedVersion, setDismissedVersion] = useState<number | null>(null);
   const [sessionDismissed, setSessionDismissed] = useState(readTutorialDismissed);
   const tutorialDismissed = sessionDismissed || dismissedVersion === CURRENT_TUTORIAL_VERSION;
+  const [setupLoading, setSetupLoading] = useState(true);
+  const [setupDismissedVersion, setSetupDismissedVersion] = useState<number | null>(null);
+  const [setupSessionDismissed, setSetupSessionDismissed] = useState(readSetupDismissed);
+  const [setupKey, setSetupKey] = useState("");
+  const [setupPreset, setSetupPreset] = useState("deepseek");
+  const [setupBase, setSetupBase] = useState("");
+  const [setupModel, setSetupModel] = useState("");
+  const [translationPresets, setTranslationPresets] = useState<TranslationPreset[]>([]);
+  const [translationPreset, setTranslationPreset] = useState("");
+  const [serviceBaseUrl, setServiceBaseUrl] = useState("");
+  const [presetDirty, setPresetDirty] = useState(false);
+  const [setupBusy, setSetupBusy] = useState(false);
+  const [setupActive, setSetupActive] = useState<"ffmpeg" | "whisper" | "">("");
+  const [setupProgress, setSetupProgress] = useState("");
+  const [setupError, setSetupError] = useState("");
+  const setupDismissed = setupSessionDismissed || setupDismissedVersion === CURRENT_SETUP_VERSION;
   const tutorialTriggerRef = useRef<HTMLButtonElement>(null);
   const [dependenciesOpen, setDependenciesOpen] = useState(false);
   const [apiKey, setApiKey] = useState("");
@@ -1171,6 +1269,7 @@ function App() {
     () => (localStorage.getItem("ybl-mode") as "basic" | "advanced") || "basic",
   );
   const [apiKeyConfigured, setApiKeyConfigured] = useState<boolean | null>(null);
+  const [openaiKeyConfigured, setOpenaiKeyConfigured] = useState<boolean | null>(null);
   const [cookiesFileValid, setCookiesFileValid] = useState<boolean | null>(null);
   const [poTokenStatus, setPoTokenStatus] = useState<{ available: boolean; browser_path: string | null } | null>(null);
   const [publishSession, setPublishSession] = useState<{
@@ -1219,12 +1318,13 @@ function App() {
 
   const selected = materials.find((item) => item.id === materialId);
   const ollamaRuntimeDependency = dependencies.find((item) => item.id === "ollama-runtime");
-  const localModelTag = options.translate_model || "translategemma:12b";
-  const localModelDependencyId = localModelTag === "qwen3.5:9b"
-    ? "ollama-qwen35-9b"
-    : localModelTag === "translategemma:12b"
-      ? "ollama-translategemma-12b"
-      : "ollama-qwen35-4b";
+  const localModelTag = options.translate_model || "qwen3.5:4b";
+  const knownLocalModels: Record<string, string> = {
+    "qwen3.5:4b": "ollama-qwen35-4b",
+    "qwen3.5:9b": "ollama-qwen35-9b",
+    "translategemma:12b": "ollama-translategemma-12b",
+  };
+  const localModelDependencyId = knownLocalModels[options.translate_model] ?? "";
   const selectedLocalModelDependency = dependencies.find((item) => item.id === localModelDependencyId);
   const materialSourceReady = materialSourceTab === "url" ? Boolean(sourceUrl.trim()) : Boolean(selected);
   const running = ["queued", "running", "preparing", "cancelling"].includes(
@@ -1358,12 +1458,38 @@ function App() {
     const localModels = ["qwen3.5:4b", "qwen3.5:9b", "translategemma:12b"];
     if (value === "ollama" && options.translator !== "ollama") {
       onlineTranslateModel.current = localModels.includes(options.translate_model) ? "" : options.translate_model;
-      updateOptions("translate_model", "translategemma:12b");
+      updateOptions("translate_model", "qwen3.5:4b");
       setApiKey("");
+      setTranslationPreset("ollama");
+      setPresetDirty(true);
     } else if (value !== "ollama" && options.translator === "ollama") {
       updateOptions("translate_model", onlineTranslateModel.current);
+      if (value === "deepseek" || value === "openai") {
+        setTranslationPreset(value);
+        setPresetDirty(true);
+      }
+    } else if (value === "deepseek" || value === "openai") {
+      const selected = translationPresets.find((item) => item.id === translationPreset);
+      if (selected?.engine !== value) {
+        setTranslationPreset(value);
+        setPresetDirty(true);
+      }
     }
     updateOptions("translator", value);
+  };
+  const selectTranslationPreset = (id: string) => {
+    const preset = translationPresets.find((item) => item.id === id);
+    if (!preset) return;
+    const localModels = ["qwen3.5:4b", "qwen3.5:9b", "translategemma:12b"];
+    if (preset.engine === "ollama" && options.translator !== "ollama") {
+      onlineTranslateModel.current = localModels.includes(options.translate_model) ? "" : options.translate_model;
+    }
+    setTranslationPreset(id);
+    setServiceBaseUrl(preset.base_url);
+    setPresetDirty(true);
+    setApiKey("");
+    updateOptions("translator", preset.engine);
+    updateOptions("translate_model", preset.model || preset.model_choices[0]?.id || "");
   };
   const reportApiError = (error: unknown, fallback: string) => {
     if (error instanceof ApiError && error.field) {
@@ -1400,6 +1526,10 @@ function App() {
       cookies_file_valid?: boolean | null;
       deepseek_key_configured?: boolean;
       openai_key_configured?: boolean;
+      translation_presets?: TranslationPreset[];
+      translation_preset?: string;
+      translation_base_url?: string;
+      translate_model?: string;
       default_output_dir?: string;
       youtube_proxy_configured?: boolean;
       youtube_po_token?: { available: boolean; browser_path: string | null };
@@ -1423,6 +1553,13 @@ function App() {
     setCookiesFileValid(settings.cookies_file_valid ?? null);
     setPoTokenStatus(settings.youtube_po_token ?? null);
     setApiKeyConfigured(Boolean(settings.deepseek_key_configured));
+    setOpenaiKeyConfigured(Boolean(settings.openai_key_configured));
+    if (settings.translation_presets?.length) setTranslationPresets(settings.translation_presets);
+    if (settings.translation_preset) setTranslationPreset(settings.translation_preset);
+    if (settings.translation_base_url) setServiceBaseUrl(settings.translation_base_url);
+    if (settings.translate_model) {
+      setOptions((current) => current.translate_model ? current : { ...current, translate_model: settings.translate_model! });
+    }
     setProxyConfigured(Boolean(settings.youtube_proxy_configured));
   };
   const loadWeekly = async () => {
@@ -1510,6 +1647,97 @@ function App() {
       setMessage(error instanceof Error ? error.message : "移除频道失败");
     } finally {
       setChannelSaving(false);
+    }
+  };
+  const loadSite = async (category = siteCategoryRef.current) => {
+    try {
+      const data = await api<SiteHot>(`/api/trending?category=${encodeURIComponent(category)}`);
+      if (siteCategoryRef.current !== category) return data;
+      siteRegionRef.current = data.region;
+      setSite(data);
+      setSiteCategory(data.category);
+      return data;
+    } catch (error) {
+      setSiteError(error instanceof Error ? error.message : "读取热片失败");
+      return null;
+    }
+  };
+  const siteAutoKey = (category: string, region: string) => `${category}\n${region}`;
+  const claimSiteAutoRefresh = (data: SiteHot | null | undefined) => {
+    if (!data || !siteNeedsAutoRefresh(data)) return false;
+    const key = siteAutoKey(data.category, data.region);
+    if (siteAutoTriedRef.current.has(key)) return false;
+    siteAutoTriedRef.current.add(key);
+    return true;
+  };
+  const refreshSite = async () => {
+    if (siteBusyRef.current) return;
+    const category = siteCategoryRef.current;
+    const requestedRegion = siteRegionRef.current;
+    siteBusyRef.current = true;
+    setSiteBusy(true);
+    setSiteError("");
+    try {
+      const data = await api<SiteHot>("/api/trending/refresh", {
+        method: "POST",
+        body: JSON.stringify({
+          category,
+          ...(site ? { region: requestedRegion } : {}),
+          cookies_from_browser: options.cookies_from_browser,
+          cookies_file: options.cookies_file,
+          youtube_proxy: options.youtube_proxy,
+          youtube_po_token_mode: options.youtube_po_token_mode,
+        }),
+      });
+      if (data.refreshing) siteAutoTriedRef.current.delete(siteAutoKey(category, requestedRegion));
+      if (siteCategoryRef.current === category && siteRegionRef.current === requestedRegion) {
+        siteRegionRef.current = data.region;
+        setSite(data);
+        setSiteCategory(data.category);
+      }
+      if (data.refreshing) setSiteError("正在刷新，请稍候再试。");
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "刷新失败";
+      setSiteError(detail);
+      setMessage(`热片刷新失败：${detail}`);
+    } finally {
+      siteBusyRef.current = false;
+      setSiteBusy(false);
+      const nextCategory = siteCategoryRef.current;
+      const nextRegion = siteRegionRef.current;
+      if (nextCategory !== category || nextRegion !== requestedRegion) {
+        void loadSite(nextCategory).then((data) => {
+          if (siteCategoryRef.current !== nextCategory || siteRegionRef.current !== nextRegion || siteBusyRef.current) return;
+          if (claimSiteAutoRefresh(data)) void refreshSite();
+        });
+      }
+    }
+  };
+  const selectSiteCategory = (id: string) => {
+    siteCategoryRef.current = id;
+    setSiteCategory(id);
+    setSiteError("");
+    void loadSite(id).then((data) => {
+      if (!data || siteCategoryRef.current !== id || siteBusyRef.current) return;
+      if (claimSiteAutoRefresh(data)) void refreshSite();
+    });
+  };
+  const saveSiteRegion = async (region: string) => {
+    siteRegionRef.current = region;
+    setSite((current) => current ? { ...current, region } : current);
+    try {
+      const data = await api<SiteHot>("/api/trending/region", {
+        method: "POST",
+        body: JSON.stringify({ region, category: siteCategoryRef.current }),
+      });
+      if (siteCategoryRef.current === data.category) {
+        siteRegionRef.current = data.region;
+        setSite(data);
+      }
+      if (siteCategoryRef.current !== data.category || siteRegionRef.current !== data.region || siteBusyRef.current) return;
+      if (claimSiteAutoRefresh(data)) void refreshSite();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "保存地区失败");
     }
   };
   const loadRestorableJobs = async () => {
@@ -1834,10 +2062,22 @@ function App() {
       csrf_token: string;
       defaults: Options;
       capabilities: Record<string, Omit<Diagnostic, "id" | "message">>;
+      translation_presets?: TranslationPreset[];
+      translation_preset?: string;
+      translation_base_url?: string;
     }>("/api/bootstrap");
     csrfToken = bootstrap.csrf_token;
     setAppVersion(bootstrap.version);
     setOptions((current) => ({ ...current, ...bootstrap.defaults }));
+    if (bootstrap.translation_presets?.length) setTranslationPresets(bootstrap.translation_presets);
+    if (bootstrap.translation_preset) setTranslationPreset(bootstrap.translation_preset);
+    if (bootstrap.translation_base_url) setServiceBaseUrl(bootstrap.translation_base_url);
+    const initialPreset = bootstrap.translation_presets?.find((item) => item.id === (bootstrap.translation_preset || "deepseek")) ?? bootstrap.translation_presets?.[0];
+    if (initialPreset) {
+      setSetupPreset(initialPreset.id);
+      setSetupBase(initialPreset.base_url);
+      setSetupModel(bootstrap.defaults.translate_model || initialPreset.model || initialPreset.model_choices[0]?.id || "");
+    }
     setDiagnostics(Object.entries(bootstrap.capabilities).map(([id, item]) => ({
       id, ...item,
       message: item.available ? "已检测到。" : item.required ? "必需组件未安装。" : "可选组件未安装；不影响默认音频模式。",
@@ -1852,6 +2092,117 @@ function App() {
     } finally {
       setPreferencesLoading(false);
     }
+  };
+  const loadSetupPreferences = async () => {
+    try {
+      const preferences = await api<{ dismissedVersion: number }>("/api/setup-preferences");
+      setSetupDismissedVersion(preferences.dismissedVersion);
+    } catch {
+      setSetupSessionDismissed(readSetupDismissed());
+    } finally {
+      setSetupLoading(false);
+    }
+  };
+  const dismissSetup = () => {
+    setSetupDismissedVersion(CURRENT_SETUP_VERSION);
+    setSetupSessionDismissed(true);
+    try { localStorage.setItem(SETUP_STORAGE_KEY, JSON.stringify({ dismissedVersion: CURRENT_SETUP_VERSION })); } catch { /* Keep the dismissal for this session when storage is unavailable. */ }
+    if (!csrfToken) return;
+    void api<{ saved: boolean }>("/api/setup-preferences", {
+      method: "POST",
+      body: JSON.stringify({ dismissedVersion: CURRENT_SETUP_VERSION }),
+    }).catch(() => setMessage("准备页偏好未能保存，下次启动可能再次显示。"));
+  };
+  const waitForSetupInstall = async (jobId: string) => {
+    for (;;) {
+      const latest = await api<DependencyInstallJob>(`/api/dependencies/jobs/${jobId}`);
+      setSetupProgress(latest.message);
+      if (latest.status === "completed") return;
+      if (latest.status === "failed" || latest.status === "cancelled") {
+        throw new Error(latest.error || latest.message || "安装没有完成");
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 800));
+    }
+  };
+  const installSetupPiece = async (id: "ffmpeg" | "whisper-small") => {
+    setSetupActive(id === "ffmpeg" ? "ffmpeg" : "whisper");
+    setSetupProgress(id === "ffmpeg" ? "正在下载 FFmpeg…" : "正在下载语音模型…");
+    const response = await api<{ job: DependencyInstallJob }>(`/api/dependencies/${id}/install`, {
+      method: "POST",
+      body: JSON.stringify({ confirmed: true, ocr_language: "eng" }),
+    });
+    if (response.job.status === "failed" || response.job.status === "cancelled") {
+      throw new Error(response.job.error || response.job.message || "安装没有完成");
+    }
+    if (response.job.status !== "completed") await waitForSetupInstall(response.job.id);
+  };
+  const finishSetup = async () => {
+    if (setupBusy) return;
+    setSetupBusy(true);
+    setSetupError("");
+    try {
+      let rows = await loadDependencies(true);
+      if (!rows.some((item) => item.id === "ffmpeg" && item.available)) {
+        await installSetupPiece("ffmpeg");
+        rows = await loadDependencies(true);
+      }
+      if (!rows.some((item) => item.id === "whisper-small" && item.available)) {
+        await installSetupPiece("whisper-small");
+        rows = await loadDependencies(true);
+      }
+      if (!rows.some((item) => item.id === "ffmpeg" && item.available) || !rows.some((item) => item.id === "whisper-small" && item.available)) {
+        throw new Error("组件还没就绪，可以再点一次补齐。");
+      }
+      const preset = translationPresets.find((item) => item.id === setupPreset);
+      if (!preset) throw new Error("翻译服务列表还没载入，请稍后再试。");
+      const model = setupModel.trim() || preset.model || preset.model_choices[0]?.id || "";
+      const base = preset.base_editable ? setupBase.trim() : preset.base_url;
+      if (preset.needs_key && !preset.key_optional && !setupKey.trim()) {
+        throw new Error("请先填写密钥。还没有密钥时，可以点「以后再看」。");
+      }
+      if (preset.base_editable && !base) throw new Error("请填写接口地址。");
+      if (!model) throw new Error("请填写模型名。");
+      await api("/api/settings", {
+        method: "POST",
+        body: JSON.stringify({
+          translator: preset.engine,
+          translation_preset: preset.id,
+          api_key: setupKey.trim(),
+          base_url: base,
+          translate_model: model,
+          cookies_from_browser: options.cookies_from_browser,
+          cookies_file: options.cookies_file,
+        }),
+      });
+      updateOptions("translator", preset.engine);
+      updateOptions("translate_model", model);
+      setTranslationPreset(preset.id);
+      setServiceBaseUrl(base);
+      setSetupKey("");
+      if (preset.engine === "deepseek") setApiKeyConfigured(true);
+      if (preset.engine === "openai") setOpenaiKeyConfigured(true);
+      dismissSetup();
+      setMessage("这台电脑已准备好。");
+    } catch (error) {
+      setSetupError(error instanceof Error ? error.message : "准备没有完成");
+    } finally {
+      setSetupBusy(false);
+      setSetupActive("");
+    }
+  };
+  const selectSetupPreset = (id: string) => {
+    const preset = translationPresets.find((item) => item.id === id);
+    setSetupPreset(id);
+    setSetupError("");
+    if (!preset) return;
+    setSetupBase(preset.base_url);
+    setSetupModel(preset.model || preset.model_choices[0]?.id || "");
+    setSetupKey("");
+  };
+  const openKeyPage = (presetId: string) => {
+    void api("/api/setup/open-key-page", { method: "POST", body: JSON.stringify({ preset: presetId }) }).catch((error) => {
+      setSetupError(error instanceof Error ? error.message : "无法打开密钥页面");
+    });
   };
   const previewAuthorizedDemo = async () => {
     try {
@@ -2265,6 +2616,7 @@ function App() {
     loadBootstrap()
       .then(() => {
         void loadTutorialPreferences();
+        void loadSetupPreferences();
         return Promise.all([
           loadMaterials(),
           loadTemplates(),
@@ -2272,13 +2624,16 @@ function App() {
           loadDependencies(),
           loadRestorableJobs(),
           loadWeekly(),
+          loadSite(),
         ]);
       })
       .then((results) => {
         setOnline(true);
         setMessage("本地服务已就绪。选择素材后即可开始处理。");
         const weeklyData = results[5] as WeeklyHot | null;
+        const siteData = results[6] as SiteHot | null;
         if (weeklyData?.enabled && weeklyData.channels.length > 0 && weeklyData.stale) void refreshWeekly();
+        if (siteData && siteCategoryRef.current === siteData.category && !siteBusyRef.current && claimSiteAutoRefresh(siteData)) void refreshSite();
       })
       .catch(() => setMessage("未连接本地服务，请启动工作台 EXE。"));
   }, []);
@@ -2505,7 +2860,6 @@ function App() {
     if (job || selected) resetForSourceSwitch();
     else sourceRevision.current += 1;
     if (job || selected) setMessage("已切换到新链接草稿；原任务可在任务库重新载入。");
-    setBatchMode(false);
     setMaterialSourceTab("url");
     setMaterialId("");
     setSourceUrl(url);
@@ -2516,6 +2870,44 @@ function App() {
     setMetadataState("idle");
     window.setTimeout(() => document.getElementById("source-url")?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
     void readMetadata(url);
+  };
+  const batchHasUrl = (url: string) => {
+    const lines = batchText.split(/\r?\n/).map((line) => line.trim());
+    return lines.includes(url) || batchEntries.some((entry) => entry.url === url);
+  };
+  const addHotToBatch = (entry: WeeklyHotVideo) => {
+    if (running || batchBusy) {
+      setMessage("当前阶段运行中，请先取消或等待完成后再加入批量。");
+      return;
+    }
+    const page = document.scrollingElement;
+    const pageTop = page?.scrollTop ?? 0;
+    const list = document.querySelector(".weekly-hot-list");
+    const listTop = list instanceof HTMLElement ? list.scrollTop : 0;
+    setMaterialSourceTab("url");
+    setBatchText((current) => {
+      const lines = current.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      if (lines.includes(entry.url)) return current;
+      const trimmed = current.replace(/\s+$/, "");
+      return trimmed ? `${trimmed}\n${entry.url}` : entry.url;
+    });
+    setBatchEntries((current) => {
+      if (current.length === 0) return current;
+      if (current.some((row) => row.url === entry.url)) {
+        return current.map((row) => row.url === entry.url ? { ...row, selected: true, title: row.title || entry.title } : row);
+      }
+      return [...current, { url: entry.url, title: entry.title, duration: entry.duration, selected: true }];
+    });
+    setMessage("已加入批量链接。");
+    window.requestAnimationFrame(() => {
+      if (page) page.scrollTop = pageTop;
+      if (list instanceof HTMLElement) list.scrollTop = listTop;
+    });
+  };
+  const openOriginalVideo = (url: string) => {
+    void api("/api/open-url", { method: "POST", body: JSON.stringify({ url }) }).catch((error) => {
+      setMessage(error instanceof Error ? error.message : "无法打开原链接");
+    });
   };
   const importVideo = async (file: File) => {
     if (running) return setMessage("当前阶段运行中，请先取消或等待完成后再切换素材。");
@@ -3388,7 +3780,9 @@ function App() {
     savingSettingsRef.current = true;
     setSavingSettings(true);
     try {
-      await api("/api/settings", {
+      const selected = translationPresets.find((item) => item.id === translationPreset);
+      const presetMatches = selected?.engine === options.translator;
+      const saved = await api<{ translator?: string; translate_model?: string; translation_preset?: string; translation_base_url?: string }>("/api/settings", {
         method: "POST",
         body: JSON.stringify({
           translator: options.translator,
@@ -3396,8 +3790,20 @@ function App() {
           cookies_from_browser: options.cookies_from_browser,
           cookies_file: options.cookies_file,
           ...(proxyDirty ? { youtube_proxy: options.youtube_proxy } : {}),
+          ...(presetDirty && presetMatches ? {
+            translation_preset: selected.id,
+            base_url: selected.base_editable ? serviceBaseUrl : selected.base_url,
+            translate_model: options.translate_model,
+          } : {}),
         }),
       });
+      if (saved.translator) updateOptions("translator", saved.translator);
+      if (saved.translate_model !== undefined && saved.translation_preset) updateOptions("translate_model", saved.translate_model);
+      if (saved.translation_preset) setTranslationPreset(saved.translation_preset);
+      if (saved.translation_base_url) setServiceBaseUrl(saved.translation_base_url);
+      if (saved.translator === "deepseek") setApiKeyConfigured(true);
+      if (saved.translator === "openai") setOpenaiKeyConfigured(true);
+      setPresetDirty(false);
       setApiKey("");
       if (proxyDirty) setProxyConfigured(Boolean(options.youtube_proxy));
       setProxyDirty(false);
@@ -3790,6 +4196,19 @@ function App() {
     }, 700);
     return () => window.clearInterval(timer);
   }, [weeklyBusy]);
+  useEffect(() => {
+    if (!siteBusy) return;
+    const category = siteCategoryRef.current;
+    const timer = window.setInterval(() => {
+      void api<SiteHot>(`/api/trending?category=${encodeURIComponent(category)}`).then((data) => {
+        if (!siteBusyRef.current || siteCategoryRef.current !== category) return;
+        setSite((current) => current && current.category === category
+          ? { ...current, progress: data.progress, refreshing: data.refreshing }
+          : current);
+      }).catch(() => undefined);
+    }, 700);
+    return () => window.clearInterval(timer);
+  }, [siteBusy]);
   const chooseNativeMaterial = async () => {
     if (running) return setMessage("当前阶段运行中，请先取消或等待完成后再切换素材。");
     if (!authorized) {
@@ -3854,6 +4273,20 @@ function App() {
           : weeklyRankedByViews
             ? `${weekly.videos.length} 条近 ${weeklyWindow} 天热片`
             : `${weekly.videos.length} 条近 ${weeklyWindow} 天新片`;
+  const siteLabel = site?.categories.find((item) => item.id === siteCategory)?.label ?? "综合";
+  const siteBusyLabel = site?.progress && site.progress.category === siteCategory
+    ? `正在刷新 ${site.progress.done}/${site.progress.total}`
+    : "正在刷新…";
+  const siteSummary = !site
+    ? "正在读取…"
+    : siteBusy
+      ? siteBusyLabel
+      : "按本周播放量搜索";
+  const weeklyHasChannels = Boolean(weekly?.enabled && weekly.channels.length > 0);
+  const siteVideos = (site && site.category === siteCategory ? site.videos : []).filter((entry) => siteDurationMatches(entry.duration, siteDurationBand));
+  const siteRegions = site?.regions ?? [{ id: "US", label: "美国" }, { id: "GB", label: "英国" }, { id: "", label: "不限" }];
+  const siteFailedQueries = (site?.query_errors ?? []).map((item) => item.split(":")[0]).filter(Boolean);
+  const siteReady = Boolean(site && site.category === siteCategory);
   const weeklyNumber = (key: "window_days" | "top_k" | "fetch_count" | "cache_ttl_hours", label: string, min: number, max: number) => (
     <label>
       {label}
@@ -3874,83 +4307,210 @@ function App() {
       />
     </label>
   );
+  const hotVideoRow = (entry: WeeklyHotVideo, when: string | null, showViews: boolean, row?: { rank?: number; showStatLabels?: boolean }) => {
+    const filled = !batchMode && sourceUrl === entry.url;
+    const queued = batchMode && batchHasUrl(entry.url);
+    const showStatLabels = row?.showStatLabels === true;
+    const showRankColumn = row !== undefined && "rank" in row;
+    return (
+      <div className={`video-library-row${showRankColumn ? " has-rank" : ""}`} key={entry.url}>
+        {showRankColumn && <span className="weekly-hot-rank">{row.rank ?? ""}</span>}
+        {weekly?.show_thumbnails !== false && (
+          <div className="weekly-hot-thumb-wrap">
+            {entry.thumbnail_url
+              ? <WeeklyThumb src={entry.thumbnail_url} />
+              : <span className="weekly-hot-thumb is-placeholder" aria-hidden="true" />}
+            {typeof entry.duration === "number" && <span className="weekly-hot-duration">{formatClock(entry.duration)}</span>}
+          </div>
+        )}
+        <div className="video-library-main">
+          <p className="weekly-hot-eyebrow">{entry.channel_title || "频道"}</p>
+          <div className="video-library-title"><b title={entry.title}>{entry.title}</b></div>
+          <div className="weekly-hot-stats" aria-label="视频数据">
+            {showViews && typeof entry.view_count === "number" && (
+              <div className="weekly-hot-stat views">
+                {showStatLabels && <span className="weekly-hot-stat-label">播放量</span>}
+                <span className="weekly-hot-stat-value">{entry.view_count.toLocaleString()}</span>
+              </div>
+            )}
+            {typeof entry.duration === "number" && (
+              <div className="weekly-hot-stat">
+                {showStatLabels && <span className="weekly-hot-stat-label">时长</span>}
+                <span className="weekly-hot-stat-value">{formatClock(entry.duration)}</span>
+              </div>
+            )}
+            {when && (
+              <div className="weekly-hot-stat">
+                {showStatLabels && <span className="weekly-hot-stat-label">上传</span>}
+                <span className="weekly-hot-stat-value">{when}</span>
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="video-library-actions">
+          <button type="button" className="small open-original" onMouseDown={(event) => event.preventDefault()} onClick={() => openOriginalVideo(entry.url)}>原链接</button>
+          <button type="button" className="small use-video" onMouseDown={(event) => event.preventDefault()} onClick={() => batchMode ? addHotToBatch(entry) : fillSourceFromHot(entry.url)} disabled={running || batchBusy || filled || queued}>{batchMode ? (queued ? "已加入" : "加入批量") : (filled ? "已填入" : "用这条")}</button>
+        </div>
+      </div>
+    );
+  };
   const weeklyHotCard = (
     <details className={`workspace-card weekly-hot-card${weekly?.show_thumbnails === false ? " no-thumbs" : ""}`}>
       <summary>
-        <b>{weeklyTitle}</b>
-        <span>{weeklySummary}</span>
+        <b>{hotTab === "channels" ? weeklyTitle : "本周热片"}</b>
+        <span>{hotTab === "site" ? siteSummary : weeklySummary}</span>
       </summary>
       <div className="weekly-hot-body">
         <div className="weekly-hot-toolbar">
-          <button type="button" onClick={() => void refreshWeekly()} disabled={!canRefreshWeekly || weeklyBusy} aria-busy={weeklyBusy}>
-            {weeklyBusy ? weeklyBusyLabel : weeklyFailures.length ? "全部重试" : "刷新"}
-          </button>
-          {weekly?.refreshed_at && <small>上次获取 {new Date(weekly.refreshed_at).toLocaleString()}</small>}
-        </div>
-        {!weekly && <div className="empty-editor"><b>正在读取关注列表</b><span>稍候即可查看本周热片。</span></div>}
-        {weeklyError && <p className="metadata-notice error" role="status">{weeklyError}</p>}
-        {weeklyFailures.map((item) => (
-          <p className="metadata-notice warning weekly-hot-failure" role="status" key={item.id}>
-            <span>{item.title || item.url}：{item.error || "读取失败"}</span>
-            <button type="button" onClick={() => void refreshWeekly(item.id)} disabled={weeklyBusy}>重试</button>
-          </p>
-        ))}
-        {weekly && !weekly.enabled && (
-          <div className="empty-editor">
-            <b>关注频道未开启</b>
-            <span>到设置里打开「启用周热」，添加 YouTube 频道后，这里会列出近 {weeklyWindow} 天的片子。</span>
-            <button type="button" onClick={() => setSettingsOpen(true)}>打开设置</button>
-          </div>
-        )}
-        {weekly?.enabled && weekly.channels.length === 0 && (
-          <div className="empty-editor">
-            <b>还没有关注的频道</b>
-            <span>在设置 → 关注频道里粘贴 https://www.youtube.com/@handle 或 /channel/UC… 链接。</span>
-            <button type="button" onClick={() => setSettingsOpen(true)}>去添加频道</button>
-          </div>
-        )}
-        {weekly?.enabled && weekly.channels.length > 0 && weekly.videos.length === 0 && !weeklyBusy && (
-          <div className="empty-editor">
-            <b>{weeklyFailures.length ? "没有拿到新片" : `这 ${weeklyWindow} 天没有新片`}</b>
-            <span>{weeklyFailures.length ? "失败的频道列在上面，可以重试该频道，或点「全部重试」。成功的频道会留在列表里。" : `已关注的频道在近 ${weeklyWindow} 天内没有带上传时间的视频。没有日期的不会出现在这里。`}</span>
-          </div>
-        )}
-        {weeklyBusy && (weekly?.videos.length ?? 0) === 0 && canRefreshWeekly && (
-          <div className="empty-editor">
-            <b>正在获取最近上传</b>
-            <span>每个频道读取最近约 {weekly?.fetch_count ?? 20} 条，只保留 {weeklyWindow} 天内、能读到上传时间的视频。</span>
-          </div>
-        )}
-        {weekly?.videos.map((entry) => {
-          const day = formatUploadDay(entry.upload_date);
-          return (
-            <div className="video-library-row" key={entry.url}>
-              {weekly?.show_thumbnails !== false && (entry.thumbnail_url
-                ? <WeeklyThumb src={entry.thumbnail_url} />
-                : <span className="weekly-hot-thumb" />)}
-              <div className="video-library-main">
-                <div className="video-library-title"><b title={entry.title}>{entry.title}</b></div>
-                <div className="video-library-meta">
-                  <span>{entry.channel_title || "频道"}</span>
-                  {weeklyRankedByViews && typeof entry.view_count === "number" && <span>{entry.view_count.toLocaleString()} 播放</span>}
-                  {typeof entry.duration === "number" && <span>{formatClock(entry.duration)}</span>}
-                  {day && <span>{day}</span>}
-                </div>
-              </div>
-              <div className="video-library-actions">
-                <button type="button" className="primary small" onClick={() => fillSourceFromHot(entry.url)} disabled={running}>翻译</button>
-              </div>
+          {weeklyHasChannels && (
+            <div className="weekly-hot-tabs" role="tablist">
+              <button type="button" className={hotTab === "site" ? "selected" : ""} aria-selected={hotTab === "site"} onClick={() => setHotTab("site")}>本周搜索</button>
+              <button type="button" className={hotTab === "channels" ? "selected" : ""} aria-selected={hotTab === "channels"} onClick={() => setHotTab("channels")}>关注频道</button>
             </div>
-          );
-        })}
-        {weekly?.enabled && weekly.channels.length > 0 && (
-          <p className="weekly-hot-note">{weeklyRankedByViews
-            ? "按播放量从高到低，播放量相同则较新的在前。数字来自频道页，没有逐条再打开视频。"
-            : "按上传时间从新到旧。播放量缺失时用这个顺序，也不逐条重抓。日期来自频道页的近似时间，可能有几小时偏差；太旧或没有日期的不会列入。"}</p>
+          )}
+          {hotTab === "site" ? (
+            <div className="weekly-hot-tools">
+              <button type="button" onClick={() => void refreshSite()} disabled={siteBusy} aria-busy={siteBusy}>
+                {siteBusy ? siteBusyLabel : "刷新"}
+              </button>
+              <label className="weekly-hot-region">
+                搜索地区
+                <select
+                  aria-label="搜索地区"
+                  value={site?.region ?? "US"}
+                  disabled={siteBusy || !site}
+                  onChange={(event) => void saveSiteRegion(event.target.value)}
+                >
+                  {siteRegions.map((item) => <option key={item.id || "any"} value={item.id}>{item.label}</option>)}
+                </select>
+              </label>
+              {siteReady && site?.refreshed_at && <small>上次获取 {new Date(site.refreshed_at).toLocaleString()}</small>}
+              {!weeklyHasChannels && (
+                <button type="button" className="weekly-hot-quiet" onClick={() => setHotTab("channels")}>关注频道</button>
+              )}
+            </div>
+          ) : weeklyHasChannels ? (
+            <div className="weekly-hot-tools">
+              <button type="button" onClick={() => void refreshWeekly()} disabled={!canRefreshWeekly || weeklyBusy} aria-busy={weeklyBusy}>
+                {weeklyBusy ? weeklyBusyLabel : weeklyFailures.length ? "全部重试" : "刷新"}
+              </button>
+              {weekly?.refreshed_at && <small>上次获取 {new Date(weekly.refreshed_at).toLocaleString()}</small>}
+            </div>
+          ) : (
+            <div className="weekly-hot-tools">
+              <button type="button" className="weekly-hot-quiet" onClick={() => setHotTab("site")}>返回热片</button>
+            </div>
+          )}
+        </div>
+        {hotTab === "site" ? (
+          <>
+            <div className="weekly-hot-cats" role="tablist" aria-label="分类">
+              {(site?.categories ?? []).map((item) => (
+                <button type="button" key={item.id} className={item.id === siteCategory ? "selected" : ""} aria-selected={item.id === siteCategory} onClick={() => selectSiteCategory(item.id)}>
+                  {item.label}
+                </button>
+              ))}
+            </div>
+            <div className="weekly-hot-cats weekly-hot-bands" role="tablist" aria-label="时长">
+              {SITE_DURATION_BANDS.map((item) => (
+                <button type="button" key={item.id} className={item.id === siteDurationBand ? "selected" : ""} aria-selected={item.id === siteDurationBand} onClick={() => setSiteDurationBand(item.id)}>
+                  {item.label}
+                </button>
+              ))}
+            </div>
+            {siteReady && site?.category === "mix" && (
+              <p className="weekly-hot-note">综合是科技、游戏、科普和编程。音乐、影视、生活、资讯在各自的分类里。</p>
+            )}
+            {!site && <div className="empty-editor"><b>正在读取热片</b><span>稍候即可查看近一周播放量较高的视频。</span></div>}
+            {siteError && <p className="metadata-notice error" role="status">{siteError}</p>}
+            {siteReady && site?.error && <p className="metadata-notice error" role="status">{site.error}</p>}
+            {siteReady && site?.refreshed_at && site.cached_region !== site.region && !siteBusy && (
+              <p className="metadata-notice warning" role="status">地区已改，下面暂时仍是上次的列表。</p>
+            )}
+            {siteReady && siteFailedQueries.length > 0 && !site?.error && (
+              <p className="metadata-notice warning" role="status">部分搜索词没有拉到：{siteFailedQueries.join("、")}。下面是这次拿到的结果。</p>
+            )}
+            {site && !siteReady && !siteError && (
+              <div className="empty-editor"><b>正在读取{siteLabel}</b><span>稍候。</span></div>
+            )}
+            {siteReady && site && site.videos.length === 0 && !siteBusy && (
+              <div className="empty-editor">
+                <b>{site.error ? "没有拿到视频" : "还没有列表"}</b>
+                <span>{site.error ? "上次如果有列表会留在这里。" : "会按本周播放量自动获取。"}</span>
+              </div>
+            )}
+            {siteReady && site && site.videos.length > 0 && siteVideos.length === 0 && !siteBusy && (
+              <div className="empty-editor">
+                <b>这个时长里没有片子</b>
+                <span>换一个时长，或看全部。</span>
+              </div>
+            )}
+            {siteBusy && siteReady && (site?.videos.length ?? 0) === 0 && (
+              <div className="empty-editor">
+                <b>正在搜索本周热门</b>
+                <span>按这个分类的词搜索近一周视频，去掉 Shorts 和直播后按播放量排列。</span>
+              </div>
+            )}
+            {siteReady && siteVideos.length > 0 && (
+              <div className="weekly-hot-list">
+                {siteVideos.map((entry, index) => hotVideoRow(entry, formatDaysAgo(entry.timestamp), true, {
+                  rank: index < 3 ? index + 1 : undefined,
+                  showStatLabels: index === 0,
+                }))}
+              </div>
+            )}
+          </>
+        ) : (
+          <>
+            {!weekly && <div className="empty-editor"><b>正在读取关注列表</b><span>稍候即可查看本周热片。</span></div>}
+            {weeklyError && <p className="metadata-notice error" role="status">{weeklyError}</p>}
+            {weeklyFailures.map((item) => (
+              <p className="metadata-notice warning weekly-hot-failure" role="status" key={item.id}>
+                <span>{item.title || item.url}：{item.error || "读取失败"}</span>
+                <button type="button" onClick={() => void refreshWeekly(item.id)} disabled={weeklyBusy}>重试</button>
+              </p>
+            ))}
+            {weekly && !weekly.enabled && (
+              <div className="empty-editor">
+                <b>关注频道未开启</b>
+                <span>到设置里打开「启用周热」，添加 YouTube 频道后，这里会列出近 {weeklyWindow} 天的片子。</span>
+                <button type="button" onClick={() => setSettingsOpen(true)}>打开设置</button>
+              </div>
+            )}
+            {weekly?.enabled && weekly.channels.length === 0 && (
+              <div className="empty-editor">
+                <b>还没有关注的频道</b>
+                <span>在设置 → 关注频道里粘贴 https://www.youtube.com/@handle 或 /channel/UC… 链接。</span>
+                <button type="button" onClick={() => setSettingsOpen(true)}>去添加频道</button>
+              </div>
+            )}
+            {weekly?.enabled && weekly.channels.length > 0 && weekly.videos.length === 0 && !weeklyBusy && (
+              <div className="empty-editor">
+                <b>{weeklyFailures.length ? "没有拿到新片" : `这 ${weeklyWindow} 天没有新片`}</b>
+                <span>{weeklyFailures.length ? "失败的频道列在上面，可以重试该频道，或点「全部重试」。成功的频道会留在列表里。" : `已关注的频道在近 ${weeklyWindow} 天内没有带上传时间的视频。没有日期的不会出现在这里。`}</span>
+              </div>
+            )}
+            {weeklyBusy && (weekly?.videos.length ?? 0) === 0 && canRefreshWeekly && (
+              <div className="empty-editor">
+                <b>正在获取最近上传</b>
+                <span>每个频道读取最近约 {weekly?.fetch_count ?? 20} 条，只保留 {weeklyWindow} 天内、能读到上传时间的视频。</span>
+              </div>
+            )}
+            {weekly?.videos.map((entry, index) => hotVideoRow(entry, formatUploadDay(entry.upload_date), weeklyRankedByViews, { showStatLabels: index === 0 }))}
+            {weekly?.enabled && weekly.channels.length > 0 && (
+              <p className="weekly-hot-note">{weeklyRankedByViews
+                ? "按播放量从高到低，播放量相同则较新的在前。数字来自频道页，没有逐条再打开视频。"
+                : "按上传时间从新到旧。播放量缺失时用这个顺序，也不逐条重抓。日期来自频道页的近似时间，可能有几小时偏差；太旧或没有日期的不会列入。"}</p>
+            )}
+          </>
         )}
       </div>
     </details>
   );
+  const ffmpegReady = dependencies.some((item) => item.id === "ffmpeg" && item.available);
+  const whisperReady = dependencies.some((item) => item.id === "whisper-small" && item.available);
+  const setupTranslationReady = apiKeyConfigured === true || openaiKeyConfigured === true || options.translator === "ollama";
+  const setupOpen = !setupLoading && !setupDismissed && dependencies.length > 0 && apiKeyConfigured !== null && openaiKeyConfigured !== null && (!ffmpegReady || !whisperReady || !setupTranslationReady);
   const materialView = (
     <section className="workspace-card material-view">
       <header>
@@ -3958,7 +4518,7 @@ function App() {
         <h1>添加素材</h1>
         <p>选择视频链接或本地文件；仅处理你已获授权的内容。</p>
       </header>
-      {!preferencesLoading && !tutorialDismissed && (
+      {!preferencesLoading && !setupOpen && !tutorialDismissed && (
         <div className="welcome-banner tutorial-welcome">
           <div>
             <b>第一次使用？先看新手教程</b>
@@ -3968,7 +4528,7 @@ function App() {
           <button className="secondary small" onClick={dismissTutorial}>以后再看</button>
         </div>
       )}
-      {apiKeyConfigured === false && options.translator === "deepseek" && (
+      {!setupOpen && apiKeyConfigured === false && options.translator === "deepseek" && (
         <div className="welcome-banner">
           <div>
             <b>首次使用提示</b>
@@ -3984,7 +4544,7 @@ function App() {
           </button>
         </div>
       )}
-      {diagnostics.some((check) => check.required && !check.available) && (
+      {!setupOpen && diagnostics.some((check) => check.required && !check.available) && (
         <section className="diagnostics-banner" aria-label="首次使用依赖检查">
           <div>
             <b>开始前还需安装 {diagnostics.filter((check) => check.required && !check.available).map((check) => check.label).join("、")}</b>
@@ -4046,7 +4606,7 @@ function App() {
         <div className="form-grid">
           <label>
             视频链接（每行一个）
-            <textarea value={batchText} rows={5} maxLength={20000} placeholder="每行一个 YouTube / B 站链接，或一个播放列表链接" onChange={(event) => setBatchText(event.target.value)} />
+            <textarea id="batch-urls" value={batchText} rows={5} maxLength={20000} placeholder="每行一个 YouTube / B 站链接，或一个播放列表链接。热片里可点「加入批量」。" onChange={(event) => setBatchText(event.target.value)} />
           </label>
           <div className="inline-actions">
             <button onClick={() => void parseBatch()} disabled={batchBusy || !batchText.trim()} aria-busy={batchBusy}>
@@ -4444,10 +5004,14 @@ function App() {
         <b>本地翻译 · {localModelTag}</b>
         <p>
           {ollamaRuntimeDependency?.state === "ready"
-            ? selectedLocalModelDependency?.available
-              ? "模型已就绪。翻译内容只发给本机 Ollama，不需要 API Key。"
+            ? !options.translate_model
+              ? "先选一个模型，或填写本机已经有的模型名。不会一次下载全部模型。"
+            : !localModelDependencyId
+              ? `使用本机已有的 ${localModelTag}。这里不会再下载其他模型。`
+            : selectedLocalModelDependency?.available
+              ? "这个模型已在本机。翻译内容只发给 Ollama，不需要 API Key，也不会下载其他模型。"
               : selectedLocalModelDependency?.installable
-                ? "这个模型尚未下载。点击下载后会显示进度；完成后无需重启应用。"
+                ? "只差这一个模型。点下载只会拉取当前选中的模型。"
                 : selectedLocalModelDependency?.state === "blocked"
                   ? selectedLocalModelDependency.message
                   : "正在检查模型状态…"
@@ -4555,26 +5119,30 @@ function App() {
               value={options.translator}
               onChange={(event) => changeTranslator(event.target.value)}
             >
-              <option value="deepseek">DeepSeek（在线付费）</option>
-              <option value="openai">OpenAI（在线付费）</option>
-              <option value="ollama">Ollama（本机运行，无 API 费用）</option>
+              <option value="deepseek">DeepSeek（在线）</option>
+              <option value="openai">OpenAI 兼容接口（含 Kimi、智谱、通义、本机服务）</option>
+              <option value="ollama">Ollama（本机）</option>
               <option value="none">不翻译</option>
             </select>
-            <FieldGuide summary="把源字幕翻译为目标语言。" detail={options.translator === "ollama" ? "Ollama 在本机运行，不需要 API Key，也不会把字幕发送到云端。需先安装 Ollama，再明确下载模型；模型不包含在 EXE 中。" : "DeepSeek/OpenAI 会调用在线 API，可能产生费用；不翻译只适合保留原文或调试提取结果。"} badges={options.translator === "none" ? [] : options.translator === "ollama" ? ["本机运行", "需下载模型"] : ["可能产生费用"]} />
+            <FieldGuide summary="把源字幕翻译为目标语言。" detail={options.translator === "ollama" ? "Ollama 在本机运行，不需要 API Key。推荐模型里选一个，或填写本机已经有的模型名；不会把几个模型一起下载。" : options.translator === "openai" ? "这一项走 OpenAI 兼容接口。具体厂商、本机地址、模型名和密钥在接口设置里选择，并按那里的配置要求填写。" : "DeepSeek 会调用在线 API，可能产生费用。其他厂商和本机服务在接口设置里选择。不翻译只适合保留原文或调试提取结果。"} badges={options.translator === "none" ? [] : options.translator === "ollama" ? ["本机运行", "只下载所选"] : ["可能产生费用"]} />
           </label>
            <label>
              翻译模型
              {options.translator === "ollama" ? (
-               <select value={localModelTag} onChange={(event) => updateOptions("translate_model", event.target.value)}>
-                 <option value="qwen3.5:4b">Qwen 3.5 4B · 约 3.4 GB（通用，推荐）</option>
-                 <option value="qwen3.5:9b">Qwen 3.5 9B · 约 6.6 GB</option>
-                 <option value="translategemma:12b">TranslateGemma 12B · 约 8.1 GB（专用翻译，需复核）</option>
+               <select value={["qwen3.5:4b", "qwen3.5:9b", "translategemma:12b"].includes(options.translate_model) ? options.translate_model : "__custom__"} onChange={(event) => updateOptions("translate_model", event.target.value === "__custom__" ? "" : event.target.value)}>
+                 <option value="qwen3.5:4b">Qwen 3.5 4B · 约 3.4 GB（选这一个即可）</option>
+                 <option value="qwen3.5:9b">Qwen 3.5 9B · 约 6.6 GB（选这一个即可）</option>
+                 <option value="translategemma:12b">TranslateGemma 12B · 约 8.1 GB（选这一个即可）</option>
+                 <option value="__custom__">本机已经有的其他模型</option>
                </select>
              ) : (
                <input value={options.translate_model} disabled={options.translator === "none"} maxLength={128} placeholder="留空使用服务默认模型" onChange={(event) => updateOptions("translate_model", event.target.value)} />
              )}
              {fieldErrors.translate_model && <small className="field-error">{fieldErrors.translate_model}</small>}
-             {options.translator === "ollama" && <FieldGuide summary="模型文件需要单独下载到本机。" detail={localModelTag === "translategemma:12b" ? "TranslateGemma 专门用于多语言翻译；应用使用专用翻译提示并逐条请求，保留字幕编号。模型不执行通用模型语义切句与源文校对；较大的模型文件和运行时内存占用也更高。" : "选择只会更改方案，不会自动下载。下载完成后状态会实时刷新，不需要重启应用。"} badges={["首次下载需要联网", "模型不随 EXE 打包"]} />}
+             {options.translator === "ollama" && !["qwen3.5:4b", "qwen3.5:9b", "translategemma:12b"].includes(options.translate_model) && (
+               <input value={options.translate_model} maxLength={128} placeholder="例如 llama3.1:8b，只填这一个" onChange={(event) => updateOptions("translate_model", event.target.value)} />
+             )}
+             {options.translator === "ollama" && <FieldGuide summary="只使用你选中的那一个模型。" detail={localModelTag === "translategemma:12b" ? "TranslateGemma 专门用于多语言翻译。选它不会把另外两个模型一起下载。" : "推荐项里选一个，或填写本机 Ollama 已经有的名字。点下载时只拉取当前这一个。"} badges={["不会一次下载全部", "已有模型可直接填"]} />}
            </label>
            <label>
              目标语言
@@ -4811,19 +5379,20 @@ function App() {
             value={options.translator}
             onChange={(event) => changeTranslator(event.target.value)}
           >
-            <option value="deepseek">DeepSeek（在线付费）</option>
-            <option value="openai">OpenAI（在线付费）</option>
-            <option value="ollama">Ollama（本机运行，无 API 费用）</option>
+            <option value="deepseek">DeepSeek（在线）</option>
+            <option value="openai">OpenAI 兼容接口（含 Kimi、智谱、通义、本机服务）</option>
+            <option value="ollama">Ollama（本机）</option>
             <option value="none">不翻译</option>
           </select>
         </label>
         <label>
           翻译模型
           {options.translator === "ollama" ? (
-            <select value={localModelTag} onChange={(event) => updateOptions("translate_model", event.target.value)}>
-              <option value="qwen3.5:4b">Qwen 3.5 4B · 约 3.4 GB（通用，推荐）</option>
-              <option value="qwen3.5:9b">Qwen 3.5 9B · 约 6.6 GB</option>
-              <option value="translategemma:12b">TranslateGemma 12B · 约 8.1 GB（专用翻译，需复核）</option>
+            <select value={["qwen3.5:4b", "qwen3.5:9b", "translategemma:12b"].includes(options.translate_model) ? options.translate_model : "__custom__"} onChange={(event) => updateOptions("translate_model", event.target.value === "__custom__" ? "" : event.target.value)}>
+              <option value="qwen3.5:4b">Qwen 3.5 4B · 约 3.4 GB（选这一个即可）</option>
+              <option value="qwen3.5:9b">Qwen 3.5 9B · 约 6.6 GB（选这一个即可）</option>
+              <option value="translategemma:12b">TranslateGemma 12B · 约 8.1 GB（选这一个即可）</option>
+              <option value="__custom__">本机已经有的其他模型</option>
             </select>
           ) : (
             <input
@@ -4833,6 +5402,9 @@ function App() {
               placeholder="使用默认模型"
               onChange={(event) => updateOptions("translate_model", event.target.value)}
             />
+          )}
+          {options.translator === "ollama" && !["qwen3.5:4b", "qwen3.5:9b", "translategemma:12b"].includes(options.translate_model) && (
+            <input value={options.translate_model} maxLength={128} placeholder="例如 llama3.1:8b，只填这一个" onChange={(event) => updateOptions("translate_model", event.target.value)} />
           )}
           {fieldErrors.translate_model && <small className="field-error">{fieldErrors.translate_model}</small>}
         </label>
@@ -6705,28 +7277,20 @@ function App() {
           </div>
            <p className="settings-intro">按翻译服务和下载访问分组。密钥只会写入本机 `.env`，不会通过接口重新读取或显示。</p>
            <div className="settings-section-label"><NavIcon name="translate" className="app-icon" /><b>翻译服务</b><span>在线 API / 本地模型</span></div>
-          <label>
-             翻译服务（在线 / 本地）
-          <select
-            value={options.translator}
-            onChange={(event) => changeTranslator(event.target.value)}
-          >
-              <option value="deepseek">DeepSeek</option>
-              <option value="openai">OpenAI</option>
-              <option value="ollama">Ollama 本地模型</option>
-            </select>
-          </label>
-          {options.translator === "ollama" ? (
-            <p className="drawer-note">Ollama 不需要 API Key。模型状态会在依赖中心动态检测。</p>
-           ) : <label>
-             在线服务 API Key
-            <input
-              type="password"
-              value={apiKey}
-              placeholder="仅在需要更新时填写"
-              onChange={(event) => setApiKey(event.target.value)}
-            />
-          </label>}
+          <TranslationPresetFields
+            presets={translationPresets}
+            presetId={translationPreset || "deepseek"}
+            baseUrl={serviceBaseUrl}
+            model={options.translate_model}
+            apiKey={apiKey}
+            disabled={savingSettings}
+            onPresetChange={selectTranslationPreset}
+            onBaseChange={(value) => { setServiceBaseUrl(value); setPresetDirty(true); }}
+            onModelChange={(value) => { updateOptions("translate_model", value); setPresetDirty(true); }}
+            onKeyChange={setApiKey}
+            onOpenKeyPage={() => openKeyPage(translationPreset || "deepseek")}
+          />
+          <p className="drawer-note">保存后，下次打开仍使用这里选中的服务。在线密钥只写入本机，不会回显。换到另一个兼容厂商时，会覆盖上一次的兼容密钥。</p>
            <div className="settings-section-label"><NavIcon name="download" className="app-icon" /><b>下载访问</b><span>Cookies、验证和代理</span></div>
           <label>
             YouTube Cookies 来源
@@ -6815,7 +7379,7 @@ function App() {
             />
             启用周热
           </label>
-          <p className="drawer-note">打开后，素材页列出已关注频道近 {weeklyWindow} 天的视频。频道页带齐播放量时按播放量排，标题是「本周热片」；播放量缺失时按上传时间排，标题是「本周新片」。列表缓存约 {weekly?.cache_ttl_hours ?? 12} 小时，点刷新会立刻重取。关闭或还没有频道时，卡片仍留在素材页。</p>
+          <p className="drawer-note">打开并添加频道后，素材页会把「关注频道」和「本周搜索」并排。频道页带齐播放量时按播放量排，标题是「本周热片」；播放量缺失时按上传时间排，标题是「本周新片」。列表缓存约 {weekly?.cache_ttl_hours ?? 12} 小时，点刷新会立刻重取。还没有频道时，热片卡片右侧有一个「关注频道」入口。热片列表不依赖这里的开关。</p>
           <div className="settings-weekly-fields">
             {weeklyNumber("window_days", "时间窗口（天）", 1, 30)}
             {weeklyNumber("top_k", "最多显示", 1, 50)}
@@ -6985,6 +7549,28 @@ function App() {
             </footer>
           </section>
         </div>
+      )}
+      {setupOpen && (
+        <SetupModal
+          presets={translationPresets}
+          presetId={setupPreset}
+          baseUrl={setupBase}
+          model={setupModel}
+          ffmpegReady={ffmpegReady}
+          modelReady={whisperReady}
+          keyValue={setupKey}
+          busy={setupBusy}
+          active={setupActive}
+          progress={setupProgress}
+          error={setupError}
+          onPresetChange={selectSetupPreset}
+          onBaseChange={setSetupBase}
+          onModelChange={setSetupModel}
+          onKeyChange={setSetupKey}
+          onOpenKeyPage={() => openKeyPage(setupPreset)}
+          onInstall={() => void finishSetup()}
+          onSkip={dismissSetup}
+        />
       )}
       {tutorialOpen && <TutorialModal onClose={closeTutorial} onAction={handleTutorialAction} />}
       {shortcutHelpOpen && (

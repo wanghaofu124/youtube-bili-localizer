@@ -1956,6 +1956,15 @@ def _flat_entries(info: dict, url: str, *, with_dates: bool) -> list[dict[str, A
             channel = entry.get("channel") or entry.get("uploader") or ""
             if channel:
                 row["channel"] = channel
+            channel_id = str(entry.get("channel_id") or entry.get("uploader_id") or "")
+            if channel_id:
+                row["channel_id"] = channel_id
+            channel_url = str(entry.get("channel_url") or entry.get("uploader_url") or "")
+            if channel_url:
+                row["channel_url"] = channel_url
+            live_status = entry.get("live_status")
+            if isinstance(live_status, str) and live_status:
+                row["live_status"] = live_status
         return row
 
     entries = info.get("entries")

@@ -148,7 +148,7 @@ def llm_rewrite(options: Any) -> Callable[[str, float], str | None]:
         env = {"deepseek": "DEEPSEEK_API_KEY", "openai": "OPENAI_API_KEY", "ollama": "YBLOCALIZER_OLLAMA"}[provider]
         base_url = {
             "deepseek": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-            "openai": None, "ollama": f"{dependencies.OLLAMA_BASE_URL}/v1",
+            "openai": os.getenv("OPENAI_BASE_URL", "").strip() or None, "ollama": f"{dependencies.OLLAMA_BASE_URL}/v1",
         }[provider]
         model = ai_provider_request_info(provider, getattr(options, "translate_model", None))[1]
         limit = max(2, int(len(text) / ratio * 0.9))
