@@ -117,6 +117,7 @@ def _transcribe_audio_in_process(
         if note:
             logger(note)
         try:
+            model_started = time.perf_counter()
             model = WhisperModel(
                 str(require_whisper_model(model_size)),
                 device=resolved_device,
@@ -124,6 +125,8 @@ def _transcribe_audio_in_process(
                 cpu_threads=thread_limit,
                 num_workers=1,
             )
+            model_seconds = time.perf_counter() - model_started
+            logger(f"Whisper 模型加载用时 {model_seconds:.2f} 秒。")
             # word_timestamps=True：用词级起止覆盖 VAD 粗块。只读 segment.start/end
             # 时，有 BGM/空镜的视频会把一句台词拖到下一段说话前（实测可超过 50 秒）。
             vad_profile = _vad_profile(vad_mode)
@@ -142,6 +145,7 @@ def _transcribe_audio_in_process(
                 "word_timestamps": True,
             }
             info = None
+            recognition_started = time.perf_counter()
             try:
                 whisper_segments, info = model.transcribe(
                     str(audio_path),
@@ -159,6 +163,8 @@ def _transcribe_audio_in_process(
             for item in whisper_segments:
                 check()
                 whisper_items.append(item)
+            recognition_seconds = time.perf_counter() - recognition_started
+            recovery_seconds = 0.0
             raw_words = _timed_words_with_fallback(whisper_items)
             raw_words_path = raw_words_path_for_segments(segments_json)
             save_words(raw_words_path, raw_words)
@@ -167,6 +173,7 @@ def _transcribe_audio_in_process(
                 normalized_words = normalize_word_stream(raw_words, stats=normalization_stats)
                 recovery_audit: dict[str, object] = {}
                 detected_language = str(getattr(info, "language", "") or "").strip() or None
+                recovery_started = time.perf_counter()
                 all_words = _recover_vad_speech_gaps(
                     audio_path, model, normalized_words, transcribe_kwargs, check, logger,
                     normalization_stats=normalization_stats,
@@ -174,6 +181,7 @@ def _transcribe_audio_in_process(
                     recovery_audit=recovery_audit,
                     vad_profile=vad_profile,
                 )
+                recovery_seconds = time.perf_counter() - recovery_started
                 save_words(words_path_for_segments(segments_json), all_words)
                 segments = pack_cues_from_words(all_words)
                 logger(f"按说话时间切分：{len(all_words)} 词 → {len(segments)} 条字幕。")
@@ -185,6 +193,7 @@ def _transcribe_audio_in_process(
                 for item in whisper_items:
                     segments.extend(_segments_from_whisper(item))
                 words_path_for_segments(segments_json).unlink(missing_ok=True)
+            logger(f"Whisper 实际转写用时 {recognition_seconds:.2f} 秒，漏词复核用时 {recovery_seconds:.2f} 秒。")
             segments = _coalesce_micro_segments(segments)
             suspect_intervals: list[dict[str, object]] = [
                 {"start": float(getattr(item, "start", 0.0)), "end": float(getattr(item, "end", 0.0)),
@@ -199,6 +208,11 @@ def _transcribe_audio_in_process(
             audio_duration = _audio_duration_seconds(audio_path)
             audit = {
                 "audio_duration_seconds": audio_duration,
+                "timings": {
+                    "model_load_seconds": round(model_seconds, 3),
+                    "recognition_seconds": round(recognition_seconds, 3),
+                    "recovery_seconds": round(recovery_seconds, 3),
+                },
                 "raw": _word_clock_audit(raw_words, audio_duration=audio_duration),
                 "normalized": _word_clock_audit(normalized_words, audio_duration=audio_duration),
                 "recovered": _word_clock_audit(all_words, audio_duration=audio_duration),

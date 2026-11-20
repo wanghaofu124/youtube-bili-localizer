@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from .dependencies import DEFAULT_VOXCPM_MODEL_DIR, DEFAULT_VOXCPM_PYTHON, OLLAMA_MODEL_TAGS, dependency_capabilities, normalize_ollama_model_tag, ollama_local_status, ollama_model_present, voxcpm_status
 from .download import po_token_provider_status
+from .source_sites import is_youtube_url
 from .ocr_subtitle import _normalize_ocr_language, available_ocr_languages, ocr_language_ready
 from .render import render_encoder_status
 from .performance import normalize_resource_profile
@@ -225,7 +226,7 @@ def default_options(output_dir: str = "outputs/workbench_demo") -> dict[str, Any
         "title": "", "require_reuse_allowed": False,
         "cookies_from_browser": "", "cookies_file": "", "max_seconds": 10,
         "youtube_po_token_mode": "auto", "youtube_proxy": "",
-        "download_quality": "1080p", "render_encoder": "auto",
+        "download_quality": "1080p", "render_encoder": "auto", "output_mode": "video",
         "resource_profile": "balanced",
         "subtitle_source": "audio", "prefer_platform_subtitles": True,
         "whisper_model_size": "small", "source_language": "", "audio_channel": "mix",
@@ -238,6 +239,7 @@ def default_options(output_dir: str = "outputs/workbench_demo") -> dict[str, Any
         "smart_translation": True, "smart_subtitle_layout": True,
         "font_name": "Microsoft YaHei", "font_size": 24,
         "subtitle_display_mode": "translated", "subtitle_preset": "soft", "subtitle_color": "白色",
+        "subtitle_placement": "overlay",
         "subtitle_outline_color": "黑色", "subtitle_effect": "描边",
         "output_dir": output_dir, "description": "", "tags": [],
         "publish_to_bilibili": False, "include_source_link": True,
@@ -299,6 +301,16 @@ def normalize_options(value: Any, output_dir: str, *, strict: bool = True) -> di
     display_mode = str(raw["subtitle_display_mode"])
     if display_mode not in {"translated", "bilingual-source-first", "bilingual-translation-first"}:
         raise InputValidationError("字幕显示模式无效。", code="invalid_choice", field="subtitle_display_mode")
+    output_mode = str(raw["output_mode"])
+    if output_mode not in {"video", "subtitles"}:
+        if strict:
+            raise InputValidationError("输出目标无效。", code="invalid_choice", field="output_mode")
+        output_mode = "video"
+    subtitle_placement = str(raw["subtitle_placement"])
+    if subtitle_placement not in {"overlay", "bottom-bar"}:
+        if strict:
+            raise InputValidationError("字幕位置无效。", code="invalid_choice", field="subtitle_placement")
+        subtitle_placement = "overlay"
     subtitle_preset = str(raw["subtitle_preset"])
     if subtitle_preset not in {"soft", "compact", "equal"}:
         if strict:
@@ -370,6 +382,7 @@ def normalize_options(value: Any, output_dir: str, *, strict: bool = True) -> di
         "smart_subtitle_layout": raw["smart_subtitle_layout"] if strict else bool(raw["smart_subtitle_layout"]),
         "font_name": str(raw["font_name"]).strip() or "Microsoft YaHei", "font_size": font_size,
         "subtitle_display_mode": display_mode, "subtitle_preset": subtitle_preset,
+        "output_mode": output_mode, "subtitle_placement": subtitle_placement,
         "subtitle_color": _color(raw["subtitle_color"], "&H00FFFFFF"),
         "subtitle_outline_color": _color(raw["subtitle_outline_color"], "&H00000000"),
         "subtitle_outline": 0 if effect in {"阴影", "无"} else 1,
@@ -465,7 +478,7 @@ def preflight(
                     add_block(model_id, f"还没有 {model}。只需要下载这一个，其他本地模型不用一起下。")
                 elif not model_id:
                     add_block("ollama-model-missing", f"Ollama 里还没有 {model}。填写本机已经有的模型名即可，不会自动下载其他模型。")
-    if needs("acquire") and source_url and options["youtube_po_token_mode"] == "auto":
+    if needs("acquire") and source_url and is_youtube_url(source_url) and options["youtube_po_token_mode"] == "auto":
         po_status = po_token_provider_status()
         if not po_status["available"]:
             add_warn("youtube_po_provider_missing", "安装包缺少 YouTube 自动浏览器验证组件；将使用 yt-dlp 常规模式，受限视频可能失败。")

@@ -7,7 +7,7 @@ a JSON cache of flat yt-dlp tab results, not a second download pipeline.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -25,6 +25,8 @@ CACHE_NAME = "weekly-hot.json"
 MAX_CHANNELS = 30
 CHANNEL_WORKERS = 3
 REQUEST_GAP_SECONDS = 0.75
+# Only recent upload dates are compared; Shanghai is UTC+8 with no DST.
+SHANGHAI = timezone(timedelta(hours=8))
 
 _PREF_BOUNDS = {
     "window_days": (1, 30, 7),
@@ -104,6 +106,7 @@ def _preferences(data: dict) -> dict:
         for key, (low, high, default) in _PREF_BOUNDS.items()
     }
     prefs["show_thumbnails"] = data.get("show_thumbnails") is not False
+    prefs["sort_mode"] = data.get("sort_mode") if data.get("sort_mode") in {"views", "recent"} else "views"
     return prefs
 
 
@@ -171,23 +174,25 @@ def _save_cache(refreshed_at: str, videos: list[dict], channel_results: list[dic
     })
 
 
-def _order_videos(videos: list[dict]) -> str:
-    """Return ``views`` or ``recent`` and sort ``videos`` in place.
+def _order_videos(videos: list[dict], sort_mode: str = "views") -> str:
+    """Sort ``videos`` in place by the saved ``sort_mode``.
 
-    Flat tab rows often include ``view_count``. The list is ranked by plays
-    only when every row has one, so the label can say 热. A missing count
-    (including an older cache row) keeps upload order and the 新片 label.
-    Nothing re-opens each video to fill the count.
+    ``views`` ranks by play count and keeps rows without a count at the end.
+    ``recent`` ranks by upload time. The caller slices ``top_k`` afterwards.
     """
-    if videos and all(isinstance(item.get("view_count"), int) for item in videos):
-        videos.sort(key=lambda item: (item["view_count"], item.get("timestamp") or 0), reverse=True)
-        return "views"
-    videos.sort(key=lambda item: item.get("timestamp") or 0, reverse=True)
-    return "recent"
+    if sort_mode == "recent":
+        videos.sort(key=lambda item: item.get("timestamp") or 0, reverse=True)
+        return "recent"
+    videos.sort(key=lambda item: (
+        not isinstance(item.get("view_count"), int),
+        -(item["view_count"] if isinstance(item.get("view_count"), int) else 0),
+        -(item.get("timestamp") or 0),
+    ))
+    return "views"
 
 
 def _in_window(timestamp: int | None, now: float, window_days: int) -> bool:
-    """Keep uploads from the last `window_days` UTC calendar days.
+    """Keep uploads from the last `window_days` Asia/Shanghai calendar days.
 
     approximate_date snaps to midnight, so a strict hour cutoff drops the
     oldest day once the clock passes midnight. One future day is allowed
@@ -195,8 +200,8 @@ def _in_window(timestamp: int | None, now: float, window_days: int) -> bool:
     """
     if timestamp is None:
         return False
-    upload_day = datetime.fromtimestamp(timestamp, timezone.utc).date()
-    today = datetime.fromtimestamp(now, timezone.utc).date()
+    upload_day = datetime.fromtimestamp(timestamp, SHANGHAI).date()
+    today = datetime.fromtimestamp(now, SHANGHAI).date()
     delta = (today - upload_day).days
     return -1 <= delta <= window_days - 1
 
@@ -262,7 +267,7 @@ def weekly_snapshot(now: float | None = None) -> dict:
     if enabled:
         videos = [item for item in cache["videos"] if item.get("channel_id") in ids and _in_window(item.get("timestamp"), stamp, window_days)]
         results = [item for item in cache["channel_results"] if item.get("id") in ids]
-    sort_mode = _order_videos(videos)
+    sort_mode = _order_videos(videos, subs["sort_mode"])
     if enabled:
         videos = videos[:subs["top_k"]]
     refreshed = _parse_stamp(cache.get("refreshed_at"))
@@ -340,6 +345,10 @@ def update_subscription_settings(patch: dict) -> dict:
             data[key] = min(high, max(low, number))
         if "show_thumbnails" in patch:
             data["show_thumbnails"] = patch["show_thumbnails"] is True
+        if "sort_mode" in patch:
+            if patch["sort_mode"] not in {"views", "recent"}:
+                raise ValueError("排序方式只能是 views 或 recent。")
+            data["sort_mode"] = patch["sort_mode"]
         _save_subscriptions(data)
     return weekly_snapshot()
 
@@ -486,7 +495,7 @@ def refresh_weekly_hot(access: dict, now: float | None = None, channel_id: str |
                     "error": result["error"],
                     "count": kept,
                 })
-            _order_videos(videos)
+            _order_videos(videos, current["sort_mode"])
             _save_subscriptions(current)
             _save_cache(_iso(stamp), videos, channel_results)
         _progress_stop()

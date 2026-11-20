@@ -5,6 +5,8 @@ import "./styles.css";
 import "./illustrations.css";
 import "./metadata-feedback.css";
 import "./renovation.css";
+import "./material-workbench.css";
+import "./subtitle-style.css";
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode><App /></StrictMode>,

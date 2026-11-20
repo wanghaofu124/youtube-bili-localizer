@@ -1428,9 +1428,16 @@ def test_deepseek_preflight_accepts_legacy_flash_alias(monkeypatch: pytest.Monke
     assert ready and "验证通过" in message
 
 
-def test_ollama_options_reject_unregistered_model() -> None:
-    with pytest.raises(InputValidationError, match="已登记"):
+def test_ollama_options_reject_invalid_model_name() -> None:
+    with pytest.raises(InputValidationError) as captured:
         normalize_options({"translator": "ollama", "translate_model": "somewhere/unknown:latest"}, "outputs")
+    assert captured.value.code == "invalid_choice"
+    assert captured.value.field == "translate_model"
+
+
+def test_ollama_options_accept_custom_local_model() -> None:
+    options = normalize_options({"translator": "ollama", "translate_model": "llama3.1:8b"}, "outputs")
+    assert options["translate_model"] == "llama3.1:8b"
 
 
 def test_translategemma_is_an_allowed_local_translation_model() -> None:

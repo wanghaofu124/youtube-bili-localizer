@@ -24,6 +24,10 @@ from .dependencies import default_user_data_root, resolve_command
 from .models import VideoJob
 from .runtime import CancellationRequested
 from .performance import download_rate_limit, lower_process_priority, normalize_resource_profile
+from .browser_media import browser_video_facts, download_browser_media
+from .public_posts import PUBLIC_POST_SITES, download_public_post, public_post_entry, resolve_public_post
+from .source_sites import is_youtube_url as _source_is_youtube
+from .source_sites import require_supported_video_url, site_for_url, video_id_for_url, vimeo_player_url
 from .util import require_command, slugify
 
 
@@ -403,6 +407,17 @@ def _youtube_access_opts(proxy: str | None, po_token_mode: str, client: str = "m
     if browser_path:
         extractor_args["youtubepot-wpc"] = {"browser_path": [str(browser_path)]}
     opts["extractor_args"] = extractor_args
+    return opts
+
+
+def _media_access_opts(url: str, proxy: str | None, po_token_mode: str, client: str = "mweb") -> dict:
+    """YouTube keeps PO Token and player_client. Other sites only receive the proxy."""
+    if _source_is_youtube(url):
+        return _youtube_access_opts(proxy, po_token_mode, client=client)
+    opts: dict = {}
+    valid_proxy = _validate_proxy(proxy)
+    if valid_proxy:
+        opts["proxy"] = valid_proxy
     return opts
 
 
@@ -982,13 +997,35 @@ def _format_for_quality(
             raise DownloadProposalMismatch("画质确认记录不完整，无法安全开始下载。")
 
     cap = heights.get(normalized)
-    filters = "" if minimum_resolution is None else f"[width>={width_floor}][height>={height_floor}]"
+    floor = "" if minimum_resolution is None else f"[width>={width_floor}][height>={height_floor}]"
+
+    def branch(extra: str) -> str:
+        # Video-only is last. Portrait posts report the long side as height,
+        # and some of them have no separate audio stream to merge.
+        return f"bestvideo{extra}+bestaudio/best{extra}/bestvideo{extra}"
+
+    if cap is None:
+        return branch(floor)
+    return "/".join((branch(floor + f"[height<={cap}]"), branch(floor + f"[width<={cap}]")))
+
+
+def _format_selector(
+    url: str,
+    quality: str,
+    minimum_resolution: tuple[int, int] | None = None,
+) -> str:
+    """Vimeo also publishes an encrypted stream at the same height as its direct file."""
+    base = _format_for_quality(quality, minimum_resolution)
+    if site_for_url(url) != "vimeo":
+        return base
+    normalized = str(quality or "1080p").strip().lower()
+    cap = {"720p": 720, "1080p": 1080}.get(normalized)
+    direct = "best[protocol^=http][ext=mp4]"
     if cap is not None:
-        filters += f"[height<={cap}]"
-    # Each alternative carries the same confirmed-resolution floor. yt-dlp may
-    # use a muxed stream when that is the best available match, but can never
-    # fall through to an unbounded low-resolution "best" format.
-    return f"bestvideo{filters}+bestaudio/best{filters}"
+        direct += f"[height<={cap}]"
+    if minimum_resolution is not None:
+        direct += f"[width>={int(minimum_resolution[0])}][height>={int(minimum_resolution[1])}]"
+    return f"{direct}/{base}"
 
 
 def _quarantine_below_resolution(
@@ -1085,8 +1122,7 @@ def _probe_video_dimensions(path: Path) -> tuple[int, int] | None:
 
 
 def _is_youtube_url(url: str) -> bool:
-    host = (urlparse(url).hostname or "").lower()
-    return host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com")
+    return _source_is_youtube(url)
 
 
 def _platform_subtitle_languages(source_language: str | None) -> list[str]:
@@ -1146,7 +1182,7 @@ def _try_download_platform_subtitles(
         "extractor_retries": 0,
     }
     options.update(_js_runtime_opts())
-    options.update(_youtube_access_opts(proxy, po_token_mode))
+    options.update(_media_access_opts(url, proxy, po_token_mode))
     if cookies_file:
         options["cookiefile"] = cookies_file
     elif cookies_from_browser:
@@ -1258,6 +1294,8 @@ def get_video_metadata(
     download_quality: str = "1080p",
 ) -> VideoMetadata:
     _validate_video_url(url)
+    requested_url = url
+    url = vimeo_player_url(url) or url
     try:
         import yt_dlp
     except ImportError as exc:
@@ -1273,8 +1311,17 @@ def get_video_metadata(
         "extractor_retries": 1,
     }
     opts.update(_js_runtime_opts())
-    opts.update(_youtube_access_opts(proxy, po_token_mode))
-    opts["format"] = _format_for_quality(download_quality)
+    opts.update(_media_access_opts(url, proxy, po_token_mode))
+    opts["format"] = _format_selector(url, download_quality)
+    public_failure: Exception | None = None
+    if site_for_url(requested_url) in PUBLIC_POST_SITES and video_id_for_url(requested_url):
+        try:
+            facts = resolve_public_post(requested_url, proxy)
+            if facts and facts.get("media_url"):
+                return _metadata_from_public_post(facts, requested_url)
+            public_failure = RuntimeError("这条公开帖子里没有可下载的视频。")
+        except Exception as exc:
+            public_failure = exc
     if cookies_file:
         _validate_cookies_file(cookies_file)
         opts["cookiefile"] = cookies_file
@@ -1284,7 +1331,22 @@ def get_video_metadata(
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as exc:
-        _raise_with_youtube_hint(exc, cookies_from_browser, po_token_mode)
+        if public_failure is not None:
+            raise public_failure
+        if _browser_media_site(requested_url):
+            facts = browser_video_facts(requested_url, proxy)
+            return VideoMetadata(
+                title=facts.get("title"),
+                duration=facts.get("duration"),
+                license=None,
+                view_count=None,
+                webpage_url=facts.get("webpage_url") or requested_url,
+                thumbnail_url=facts.get("thumbnail_url"),
+                max_width=facts.get("width"),
+                max_height=facts.get("height"),
+                quality_proposal=None,
+            )
+        _raise_download_failure(url, exc, cookies_from_browser, po_token_mode)
     max_width, max_height = _max_video_size(info)
     return VideoMetadata(
         title=info.get("title"),
@@ -1321,6 +1383,8 @@ def download_with_ytdlp(
     check = cancel_check or legacy_check_cancelled
     profile = normalize_resource_profile(resource_profile)
     _validate_video_url(url)
+    requested_url = url
+    url = vimeo_player_url(url) or url
     try:
         import yt_dlp
     except ImportError as exc:
@@ -1355,7 +1419,7 @@ def download_with_ytdlp(
             progress(1.0)
 
     opts = {
-        "format": _format_for_quality(download_quality, minimum_resolution),
+        "format": _format_selector(url, download_quality, minimum_resolution),
         "merge_output_format": "mp4",
         "outtmpl": outtmpl,
         "noplaylist": True,
@@ -1395,7 +1459,8 @@ def download_with_ytdlp(
     if rate_limit is not None:
         opts["ratelimit"] = rate_limit
     opts.update(_js_runtime_opts())
-    opts.update(_youtube_access_opts(proxy, po_token_mode))
+    youtube = _is_youtube_url(url)
+    opts.update(_media_access_opts(url, proxy, po_token_mode))
     if max_seconds:
         require_command("ffmpeg")
         opts["download_ranges"] = yt_dlp.utils.download_range_func(None, [(0, max_seconds)])
@@ -1432,7 +1497,7 @@ def download_with_ytdlp(
             # The common path performs a single extraction per client.  A
             # metadata-only preflight is retained solely when the user explicitly
             # requires YouTube's CC/reuse flag before any media is downloaded.
-            if require_reuse_allowed:
+            if require_reuse_allowed and youtube:
                 license_info = ydl.extract_info(url, download=False)
                 license_text = license_info.get("license") or ""
                 if "reuse allowed" not in license_text.lower():
@@ -1441,7 +1506,8 @@ def download_with_ytdlp(
                         "如果你确认已获得处理或转载授权，请在素材页取消勾选「仅接受 CC reuse allowed」后重新开始任务。"
                     )
             if (
-                _needs_po_token(_selected_player_client(trial_opts))
+                youtube
+                and _needs_po_token(_selected_player_client(trial_opts))
                 and hasattr(ydl, "process_video_result")
             ):
                 # 需要令牌的客户端偶尔会返回"高清流缺少地址"的清单（令牌未被接受）。
@@ -1456,7 +1522,8 @@ def download_with_ytdlp(
                         log("重新获取后高清流仍缺地址，按当前可用格式继续。")
                 return ydl.process_video_result(probe)
             if (
-                max_seconds
+                youtube
+                and max_seconds
                 and _range_prefix_enabled()
                 and hasattr(ydl, "process_video_result")
             ):
@@ -1489,7 +1556,8 @@ def download_with_ytdlp(
                     if log:
                         log(f"前缀分块下载失败，改用 yt-dlp 截取：{_safe_diagnostic_text(str(exc))[:160]}")
             if (
-                not max_seconds
+                youtube
+                and not max_seconds
                 and _range_streaming_enabled()
                 and hasattr(ydl, "process_video_result")
             ):
@@ -1525,26 +1593,71 @@ def download_with_ytdlp(
             return ydl.extract_info(url, download=True)
 
     def _extract_with_ffmpeg_detail(trial_opts: dict) -> dict:
+        nonlocal needs_local_trim
         try:
             return _extract_once(trial_opts)
         except Exception as exc:
             tail = _last_ffmpeg_stderr_line(ffmpeg_stderr)
+            message = f"{exc}: {tail}" if tail else str(exc)
+            if (
+                not youtube
+                and max_seconds
+                and trial_opts.get("download_ranges")
+                and ("Invalid data" in message or "ffmpeg exited" in message)
+            ):
+                if log:
+                    log("按秒截取读不到分片，改为下载后再截取前几秒。")
+                retry_opts = dict(trial_opts)
+                retry_opts.pop("download_ranges", None)
+                retry_opts.pop("force_keyframes_at_cuts", None)
+                needs_local_trim = True
+                return _extract_once(retry_opts)
             if "ffmpeg exited" in str(exc) and tail:
                 raise RuntimeError(f"{exc}: {tail}") from exc
             raise
 
     ffmpeg_stderr: list = []
+    needs_local_trim = False
+    public_failure: Exception | None = None
+    if site_for_url(requested_url) in PUBLIC_POST_SITES and video_id_for_url(requested_url):
+        try:
+            return _finish_public_download(
+                requested_url,
+                work_dir,
+                proxy,
+                max_seconds,
+                quality_proposal,
+                log,
+                download_quality=download_quality,
+                prefer_platform_subtitles=prefer_platform_subtitles,
+                source_language=source_language,
+                cookies_from_browser=cookies_from_browser,
+                cookies_file=cookies_file,
+                po_token_mode=po_token_mode,
+                cancel_check=check,
+                yt_dlp_module=yt_dlp,
+            )
+        except (CancellationRequested, DownloadProposalMismatch):
+            raise
+        except Exception as exc:
+            public_failure = exc
+            if log:
+                log(f"公开页面这次没有保存成视频：{exc}")
     try:
         check()
         partial_snapshots = _snapshot_existing_partials(work_dir, log)
         with _cancellable_external_ffmpeg(check, profile) as ffmpeg_stderr:
-            info = _extract_with_client_chain(
-                opts=opts,
-                url=url,
-                proxy=proxy,
-                po_token_mode=po_token_mode,
-                log=log,
-                extract=_extract_with_ffmpeg_detail,
+            info = (
+                _extract_with_client_chain(
+                    opts=opts,
+                    url=url,
+                    proxy=proxy,
+                    po_token_mode=po_token_mode,
+                    log=log,
+                    extract=_extract_with_ffmpeg_detail,
+                )
+                if youtube
+                else _extract_with_ffmpeg_detail(opts)
             )
         check()
     except Exception as exc:
@@ -1559,7 +1672,14 @@ def download_with_ytdlp(
                 f"当前源站没有达到已确认的 {width}×{height} 视频流，本次未下载较低画质。"
                 "请重新读取素材信息，并在确认新的画质方案后重试。"
             ) from exc
-        _raise_with_youtube_hint(exc, cookies_from_browser, po_token_mode)
+        if _browser_media_site(requested_url):
+            return _finish_browser_download(
+                requested_url, work_dir, proxy, max_seconds, quality_proposal, log,
+                cancel_check=check, download_quality=download_quality,
+            )
+        if public_failure is not None:
+            raise public_failure
+        _raise_download_failure(url, exc, cookies_from_browser, po_token_mode)
 
     try:
         video_id = info.get("id") or slugify(info.get("title") or "video")
@@ -1573,6 +1693,9 @@ def download_with_ytdlp(
             )
         if not video_files:
             raise RuntimeError(f"Download finished but no video file was found in {work_dir}")
+        if needs_local_trim:
+            from .browser_media import _trim_copy
+            _trim_copy(video_files[0], int(max_seconds), check)
 
         selected_dimensions = _selected_video_dimensions(info or {})
         actual_dimensions = _probe_video_dimensions(video_files[0])
@@ -1615,7 +1738,7 @@ def download_with_ytdlp(
     thumbnail_url = _best_thumbnail_url(info)
     thumbnail_path = _download_thumbnail(thumbnail_url, work_dir, video_id, proxy) if thumbnail_url else None
     source_subtitles = None
-    if prefer_platform_subtitles and _is_youtube_url(url):
+    if prefer_platform_subtitles and site_for_url(url):
         source_subtitles = _try_download_platform_subtitles(
             yt_dlp, url, work_dir, outtmpl, video_id, source_language,
             cookies_from_browser, cookies_file, proxy, po_token_mode, check, log,
@@ -1623,7 +1746,7 @@ def download_with_ytdlp(
 
     job = VideoJob(
         job_id=work_dir.name,
-        source=url,
+        source=requested_url,
         source_kind="url",
         work_dir=work_dir,
         title=title or info.get("title"),
@@ -1654,6 +1777,158 @@ def import_local_video(path: Path, work_dir: Path, title: str | None = None) -> 
         title=title or path.stem,
         raw_video=destination,
     )
+
+
+def _browser_media_site(url: str) -> bool:
+    return site_for_url(url) in {"tiktok", "rumble"}
+
+
+def _metadata_from_public_post(facts: dict[str, Any], url: str) -> VideoMetadata:
+    def size(key: str) -> int | None:
+        try:
+            number = int(facts.get(key) or 0)
+        except (TypeError, ValueError):
+            return None
+        return number if number > 0 else None
+
+    return VideoMetadata(
+        title=facts.get("title"),
+        duration=facts.get("duration"),
+        license=None,
+        view_count=None,
+        webpage_url=facts.get("webpage_url") or url,
+        thumbnail_url=None,
+        max_width=size("width"),
+        max_height=size("height"),
+        quality_proposal=None,
+    )
+
+
+def _finish_public_download(
+    url: str,
+    work_dir: Path,
+    proxy: str | None,
+    max_seconds: int | None,
+    quality_proposal: dict | None,
+    log,
+    download_quality: str = "1080p",
+    prefer_platform_subtitles: bool = True,
+    source_language: str | None = None,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | None = None,
+    po_token_mode: str = "auto",
+    cancel_check: Callable[[], None] | None = None,
+    yt_dlp_module=None,
+) -> VideoJob:
+    destination = work_dir / "public-post.mp4"
+    check = cancel_check or (lambda: None)
+    check()
+    facts = download_public_post(
+        url,
+        destination,
+        proxy=proxy,
+        max_seconds=max_seconds,
+        log=log,
+        download_quality=download_quality,
+        cancel_check=check,
+    )
+    check()
+    actual = _probe_video_dimensions(destination)
+    if not actual:
+        raise RuntimeError("下载后无法通过 ffprobe 读取视频分辨率。")
+    if quality_proposal:
+        _format_meets_proposal(
+            {"width": actual[0], "height": actual[1], "has_audio": bool(facts.get("has_audio"))},
+            quality_proposal,
+        )
+    if log:
+        log(f"公开页面已保存视频：{actual[0]}×{actual[1]}。")
+    source_subtitles = None
+    if prefer_platform_subtitles and yt_dlp_module is not None:
+        source_subtitles = _try_download_platform_subtitles(
+            yt_dlp_module,
+            url,
+            work_dir,
+            str(work_dir / "%(id)s.%(ext)s"),
+            video_id_for_url(url) or destination.stem,
+            source_language,
+            cookies_from_browser,
+            cookies_file,
+            proxy,
+            po_token_mode,
+            check,
+            log,
+        )
+    return VideoJob(
+        job_id=work_dir.name,
+        source=url,
+        source_kind="url",
+        work_dir=work_dir,
+        title=facts.get("title"),
+        raw_video=destination,
+        source_subtitles=source_subtitles,
+        webpage_url=facts.get("webpage_url") or url,
+        thumbnail_url=facts.get("thumbnail_url"),
+    )
+
+
+def _finish_browser_download(
+    url: str,
+    work_dir: Path,
+    proxy: str | None,
+    max_seconds: int | None,
+    quality_proposal: dict | None,
+    log,
+    cancel_check: Callable[[], None] | None = None,
+    download_quality: str = "1080p",
+) -> VideoJob:
+    destination = work_dir / "browser-media.mp4"
+    check = cancel_check or (lambda: None)
+    check()
+    facts = download_browser_media(
+        url, destination, proxy=proxy, max_seconds=max_seconds, log=log,
+        cancel_check=check, download_quality=download_quality,
+    )
+    check()
+    actual = _probe_video_dimensions(destination)
+    if not actual:
+        raise RuntimeError("下载后无法通过 ffprobe 读取视频分辨率。")
+    if quality_proposal:
+        _format_meets_proposal(
+            {"width": actual[0], "height": actual[1], "has_audio": True},
+            quality_proposal,
+        )
+    if log:
+        log(f"本机 Chrome 已保存视频：{actual[0]}×{actual[1]}。")
+    return VideoJob(
+        job_id=work_dir.name,
+        source=url,
+        source_kind="url",
+        work_dir=work_dir,
+        title=facts.get("title"),
+        raw_video=destination,
+        webpage_url=facts.get("webpage_url") or url,
+        thumbnail_url=facts.get("thumbnail_url"),
+    )
+
+
+def _raise_download_failure(
+    url: str,
+    exc: Exception,
+    cookies_from_browser: str | None,
+    po_token_mode: str,
+) -> None:
+    """YouTube keeps its PO Token hints. Other sites get a short site-level error."""
+    if _is_youtube_url(url):
+        _raise_with_youtube_hint(exc, cookies_from_browser, po_token_mode)
+    detail = _safe_diagnostic_text(str(exc))[:180]
+    if site_for_url(url) == "vimeo" and "DRM" in detail:
+        raise RuntimeError("这个 Vimeo 视频只提供加密流，当前下不了。") from exc
+    raise RuntimeError(
+        "这个站点没有返回可下载的视频。"
+        f"{detail} "
+        "需要登录或受地区限制时，使用你自己的 Cookies。"
+    ) from exc
 
 
 def _raise_with_youtube_hint(
@@ -1835,6 +2110,7 @@ def _validate_video_url(url: str) -> None:
     parsed = urlparse(url.strip())
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("请输入完整的 http(s) 视频链接，例如 https://www.youtube.com/watch?v=...")
+    require_supported_video_url(url)
 
 
 def _validate_cookies_file(path: str | None) -> None:
@@ -1946,11 +2222,13 @@ def _flat_entries(info: dict, url: str, *, with_dates: bool) -> list[dict[str, A
             "title": entry.get("title") or "",
             "duration": entry.get("duration"),
         }
+        thumbnail_url = _best_thumbnail_url(entry)
+        if thumbnail_url or with_dates:
+            row["thumbnail_url"] = thumbnail_url
         if with_dates:
             upload_date, timestamp = _upload_fields(entry)
             row["upload_date"] = upload_date
             row["timestamp"] = timestamp
-            row["thumbnail_url"] = _best_thumbnail_url(entry)
             view_count = entry.get("view_count")
             row["view_count"] = view_count if isinstance(view_count, int) else None
             channel = entry.get("channel") or entry.get("uploader") or ""
@@ -2007,10 +2285,10 @@ def _extract_flat_playlist(
     use_access = approximate_date or str(po_token_mode or "off").strip().lower() != "off"
     if use_access:
         opts.update(_js_runtime_opts())
-        opts.update(_youtube_access_opts(proxy, po_token_mode))
+        opts.update(_media_access_opts(url, proxy, po_token_mode))
     elif proxy:
         opts["proxy"] = _validate_proxy(proxy)
-    if approximate_date:
+    if approximate_date and _is_youtube_url(url):
         # Relative dates ("3 days ago") only parse reliably in English.
         # A non-English youtube:lang value drops upload_date entirely.
         extractor_args = dict(opts.get("extractor_args") or {})
@@ -2048,6 +2326,11 @@ def list_playlist_entries(
     sleep_requests: float | None = None,
 ) -> list[dict[str, Any]]:
     """Expand a playlist (or single video) URL into flat entries without downloading."""
+    if site_for_url(url) in PUBLIC_POST_SITES and video_id_for_url(url):
+        entry = public_post_entry(url, proxy)
+        if entry:
+            return [entry]
+        raise RuntimeError("这条公开帖子里没有可下载的视频。")
     info = _extract_flat_playlist(
         url,
         cookies_from_browser,

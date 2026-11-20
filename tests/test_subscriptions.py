@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from yblocalizer import download
 from yblocalizer.subscriptions import (
+    _in_window,
     _progress_view,
     add_channel,
     normalize_channel_videos_url,
@@ -18,6 +19,19 @@ from yblocalizer.workbench_api import WorkbenchHandler
 
 
 NOW = datetime(2026, 10, 26, 12, 0, tzinfo=timezone.utc).timestamp()
+
+
+def test_window_uses_shanghai_calendar_days_and_keeps_midnight_buffer():
+    # 16:30 UTC is already the next calendar day in Shanghai.
+    now = datetime(2026, 10, 26, 16, 30, tzinfo=timezone.utc).timestamp()
+    utc_oldest = int(datetime(2026, 10, 20, tzinfo=timezone.utc).timestamp())
+    shanghai_oldest = int(datetime(2026, 10, 21, tzinfo=timezone.utc).timestamp())
+    snapped_ahead = int(datetime(2026, 10, 27, 16, 0, tzinfo=timezone.utc).timestamp())
+    two_days_ahead = int(datetime(2026, 10, 28, 16, 0, tzinfo=timezone.utc).timestamp())
+    assert _in_window(utc_oldest, now, 7) is False
+    assert _in_window(shanghai_oldest, now, 7) is True
+    assert _in_window(snapped_ahead, now, 7) is True
+    assert _in_window(two_days_ahead, now, 7) is False
 
 
 def test_channel_url_normalizes_to_videos_tab():
@@ -68,7 +82,7 @@ def test_weekly_refresh_ranks_by_upload_time_and_isolates_failures(monkeypatch):
     monkeypatch.setattr("yblocalizer.subscriptions.list_channel_uploads", fake_list)
     view = refresh_weekly_hot({"cookies_from_browser": None, "cookies_file": None, "proxy": None, "po_token_mode": "off"}, now=NOW)
     assert [item["title"] for item in view["videos"]] == ["Newer", "Older", "Edge"]
-    assert view["sort_mode"] == "recent"
+    assert view["sort_mode"] == "views"
     assert view["stale"] is False
     failed = [item for item in view["channel_results"] if not item["ok"]]
     assert len(failed) == 1 and failed[0]["error"] == "channel down"
@@ -118,7 +132,7 @@ def test_failed_channel_keeps_previous_in_window_videos(monkeypatch):
     assert failed["count"] == 1
 
 
-def test_view_counts_rank_the_week_until_one_count_is_missing(monkeypatch):
+def test_view_counts_rank_the_week_and_missing_counts_stay_last(monkeypatch):
     monkeypatch.setattr("yblocalizer.subscriptions.REQUEST_GAP_SECONDS", 0)
     add_channel("https://www.youtube.com/@good")
     set_subscriptions_enabled(True)
@@ -141,9 +155,37 @@ def test_view_counts_rank_the_week_until_one_count_is_missing(monkeypatch):
     assert ranked["sort_mode"] == "views"
     rows["missing"] = True
     fallback = refresh_weekly_hot(access, now=NOW)
-    assert [item["title"] for item in fallback["videos"]] == ["Newer", "Older"]
-    assert fallback["videos"][0]["view_count"] is None
-    assert fallback["sort_mode"] == "recent"
+    assert [item["title"] for item in fallback["videos"]] == ["Older", "Newer"]
+    assert fallback["videos"][1]["view_count"] is None
+    assert fallback["sort_mode"] == "views"
+
+
+def test_recent_sort_uses_the_whole_window_before_top_k(monkeypatch):
+    monkeypatch.setattr("yblocalizer.subscriptions.REQUEST_GAP_SECONDS", 0)
+    add_channel("https://www.youtube.com/@good")
+    set_subscriptions_enabled(True)
+    update_subscription_settings({"top_k": 2})
+    newer = int(NOW - 3600)
+    middle = int(NOW - 2 * 3600)
+    older = int(NOW - 3 * 3600)
+    access = {"cookies_from_browser": None, "cookies_file": None, "proxy": None, "po_token_mode": "off"}
+
+    def fake_list(_url, *_args, **_kwargs):
+        return {"title": "Good", "entries": [
+            {"url": "https://www.youtube.com/watch?v=oldhot", "title": "Old hot", "duration": 12, "timestamp": older, "view_count": 1000},
+            {"url": "https://www.youtube.com/watch?v=midhot", "title": "Mid hot", "duration": 11, "timestamp": middle, "view_count": 900},
+            {"url": "https://www.youtube.com/watch?v=fresh", "title": "Fresh", "duration": 8, "timestamp": newer, "view_count": 10},
+        ]}
+
+    monkeypatch.setattr("yblocalizer.subscriptions.list_channel_uploads", fake_list)
+    ranked = refresh_weekly_hot(access, now=NOW)
+    assert [item["title"] for item in ranked["videos"]] == ["Old hot", "Mid hot"]
+    assert ranked["sort_mode"] == "views"
+    recent = update_subscription_settings({"sort_mode": "recent"})
+    assert recent["sort_mode"] == "recent"
+    assert [item["title"] for item in weekly_snapshot(now=NOW)["videos"]] == ["Fresh", "Mid hot"]
+    back = update_subscription_settings({"sort_mode": "views"})
+    assert [item["title"] for item in weekly_snapshot(now=NOW)["videos"]] == ["Old hot", "Mid hot"]
 
 
 def test_one_channel_retry_keeps_the_other_and_reports_progress(monkeypatch):
@@ -198,7 +240,7 @@ def test_one_channel_retry_keeps_the_other_and_reports_progress(monkeypatch):
     narrow = update_subscription_settings({"top_k": 1, "window_days": 0})
     assert narrow["top_k"] == 1
     assert narrow["window_days"] == 1
-    assert [item["title"] for item in narrow["videos"]] == ["Good clip"]
+    assert [item["title"] for item in weekly_snapshot(now=NOW)["videos"]] == ["Good clip"]
 
 
 def test_disabled_refresh_does_not_call_ytdlp(monkeypatch):
@@ -225,7 +267,7 @@ def test_weekly_route_returns_empty_snapshot():
     assert result["payload"]["show_thumbnails"] is True
     assert result["payload"]["cache_ttl_hours"] == 12
     assert result["payload"]["channel_progress"] is None
-    assert result["payload"]["sort_mode"] == "recent"
+    assert result["payload"]["sort_mode"] == "views"
 
 
 def test_channel_listing_reuses_flat_extract_and_metadata_access(monkeypatch):

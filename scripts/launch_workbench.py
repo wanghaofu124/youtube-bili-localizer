@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import webbrowser
+from collections import deque
 from pathlib import Path
 
 # Set the data root before importing any application modules.  Some modules
@@ -85,6 +86,43 @@ class DesktopBridge:
     def __init__(self, server: object) -> None:
         self._server = server
         self._window: webview.Window | None = None
+        self._dropped_materials: deque[Path] = deque(maxlen=1)
+        self._drop_listener_bound = False
+
+    def _bind_material_drop(self) -> None:
+        self._dropped_materials.clear()
+        if self._window is None or self._drop_listener_bound:
+            return
+        self._window.native.browser.webview.WebMessageReceived += self._receive_material_drop
+        self._drop_listener_bound = True
+
+    def _receive_material_drop(self, _sender, event) -> None:
+        if event.get_WebMessageAsJson() != '"FilesDropped"':
+            return
+        host, port = self._server.server_address[:2]
+        if event.get_Source().rstrip("/") != f"http://{host}:{port}":
+            return
+        from Microsoft.Web.WebView2.Core import CoreWebView2File
+
+        # Only the WebView2 file object carries the original path into Python.
+        self._dropped_materials.clear()
+        objects = event.get_AdditionalObjects()
+        if objects is None:
+            return
+        files = [item for item in objects if isinstance(item, CoreWebView2File)]
+        if len(files) == 1 and files[0].Path:
+            self._dropped_materials.append(Path(files[0].Path))
+
+    def _register_material(self, path: Path) -> dict[str, str]:
+        material = self._server.RequestHandlerClass.jobs.add_local_file(path, authorized=True)
+        return {"material_id": material.id, "name": material.name}
+
+    def import_dropped_material(self) -> dict[str, str]:
+        try:
+            path = self._dropped_materials.pop()
+        except IndexError as exc:
+            raise ValueError("无法读取拖入的文件，请重试或点击选择视频。") from exc
+        return self._register_material(path)
 
     def choose_publish_video(self) -> dict[str, str] | None:
         if self._window is None:
@@ -111,8 +149,7 @@ class DesktopBridge:
         )
         if not selected:
             return None
-        material = self._server.RequestHandlerClass.jobs.add_local_file(Path(selected[0]), authorized=True)
-        return {"material_id": material.id, "name": material.name}
+        return self._register_material(Path(selected[0]))
 
     def choose_output_dir(self) -> dict[str, str] | None:
         if self._window is None:
@@ -179,6 +216,7 @@ def main() -> int:
                 "windows.fileFilter.otherFiles": "其他文件类型",
             },
         )
+        bridge._window.events.before_load += bridge._bind_material_drop
         # 注意：不要启用 debug=True。它会打开 WebView2 的浏览器快捷键/DevTools，
         # 已观察到处理任务时窗口被异常关闭（仅剩 RADAR 内存预警，无崩溃记录）。
         # 右键复制由前端自定义菜单实现。

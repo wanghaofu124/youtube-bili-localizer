@@ -30,7 +30,9 @@ import wave
 import webbrowser
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import lru_cache
 from .llm_usage import LlmUsageTracker, usage_session, update_usage_index
+from .source_difficulty import hint_for_source
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -50,6 +52,7 @@ _DEFAULT_USER_DATA_ROOT.mkdir(parents=True, exist_ok=True)
 load_dotenv(_DEFAULT_USER_DATA_ROOT / ".env")
 
 from .download import DownloadProposalMismatch, DownloadResolutionMismatch, YouTubeAccessError, get_video_metadata, list_playlist_entries, po_token_provider_status
+from .source_sites import UnsupportedVideoSite, is_youtube_url, require_supported_video_url, site_for_url, youtube_video_id
 from .site_hot import refresh_site_hot, set_site_region, site_snapshot
 from .subscriptions import add_channel, refresh_weekly_hot, remove_channel, set_subscriptions_enabled, subscription_view, update_subscription_settings, weekly_snapshot
 from .dub import DUB_MIX_MODES
@@ -130,6 +133,7 @@ from .workflow import (
     invalidate_downstream,
     invalidation_stage,
     new_stage_states,
+    run_render,
     run_stage as run_workflow_stage,
     validate_media,
     validate_segments,
@@ -232,22 +236,31 @@ def _validate_public_http_url(value: Any, field: str = "source_url") -> str:
     return url
 
 
-_OPENABLE_VIDEO_HOSTS = frozenset({
-    "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
-    "youtu.be", "www.youtu.be",
-    "youtube-nocookie.com", "www.youtube-nocookie.com",
+def _require_supported_download_url(url: str, field: str = "source_url") -> str:
+    try:
+        return require_supported_video_url(url)
+    except UnsupportedVideoSite as exc:
+        raise InputValidationError(str(exc), code="unsupported_site", field=field) from exc
+
+
+_BILIBILI_OPEN_HOSTS = frozenset({
     "bilibili.com", "www.bilibili.com", "m.bilibili.com", "space.bilibili.com",
     "b23.tv", "www.b23.tv",
 })
 
 
 def _openable_video_url(value: Any) -> str:
-    """A YouTube or Bilibili link safe to hand to the system browser."""
+    """A listed source, or a Bilibili link, safe to hand to the system browser."""
     url = _validate_public_http_url(value, "url")
     parsed = urlparse(url)
     host = (parsed.hostname or "").rstrip(".").lower()
-    if host not in _OPENABLE_VIDEO_HOSTS or not (parsed.path or parsed.query):
-        raise InputValidationError("只能打开 YouTube 或 B 站视频链接。", code="invalid_url", field="url")
+    listed = site_for_url(url) is not None or host in _BILIBILI_OPEN_HOSTS
+    if not listed or not (parsed.path or parsed.query):
+        raise InputValidationError(
+            "只能打开已支持的视频或帖子链接，以及 B 站视频链接。",
+            code="invalid_url",
+            field="url",
+        )
     return url
 
 
@@ -700,6 +713,13 @@ def _safe_filename(value: str) -> str:
     return cleaned or "video.mp4"
 
 
+def _youtube_thumbnail_url(url: str) -> str | None:
+    video_id = youtube_video_id(url)
+    if video_id and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+        return f"https://i.ytimg.com/vi/{video_id}/sddefault.jpg"
+    return None
+
+
 def _probe_media(path: Path) -> tuple[float | None, int | None, int | None]:
     """Best-effort local metadata; importing remains usable without ffprobe."""
     command = [
@@ -714,6 +734,21 @@ def _probe_media(path: Path) -> tuple[float | None, int | None, int | None]:
         return round(duration, 2), int(stream.get("width") or 0) or None, int(stream.get("height") or 0) or None
     except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
         return None, None, None
+
+
+@lru_cache(maxsize=32)
+def _video_thumbnail(ffmpeg: Path, path: Path, _file_version: tuple[int, int]) -> bytes:
+    result = subprocess.run(
+        [str(ffmpeg), "-nostdin", "-v", "error", "-protocol_whitelist", "file",
+         "-threads", "1", "-i", str(path), "-map", "0:V:0", "-frames:v", "1",
+         "-vf", "scale=256:144:force_original_aspect_ratio=decrease:force_divisible_by=2",
+         "-threads", "1", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, timeout=5,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if not result.stdout:
+        raise ValueError("Video contains no preview frame.")
+    return result.stdout
 
 
 @dataclass(slots=True)
@@ -896,6 +931,7 @@ class DemoJob:
             "quality_consent": bool(self.options.get("quality_consent")),
             "llm_usage": usage_summary,
             "llm_usage_total": copy.deepcopy(self.artifacts.llm_usage_total),
+            "translation_hint": hint_for_source(self.artifacts.path("source_srt")),
         }
 
 
@@ -929,6 +965,14 @@ def _restored_created_at(record: dict[str, Any]) -> float:
     return 0.0
 
 
+@dataclass
+class SubtitlePreview:
+    job_id: str
+    token: str
+    directory: tempfile.TemporaryDirectory
+    path: Path
+
+
 class WorkbenchJobs:
     """Application service for live workbench jobs and persisted snapshots."""
 
@@ -941,6 +985,7 @@ class WorkbenchJobs:
         }
         self._running_id: str | None = None
         self._subtitle_model_action_id: str | None = None
+        self._subtitle_preview: SubtitlePreview | None = None
         self._preparing_ids: set[str] = set()
         self._worker: threading.Thread | None = None
         self._voice_review_worker: threading.Thread | None = None
@@ -1510,7 +1555,7 @@ class WorkbenchJobs:
     def create_url(self, source_url: str, device: str, compute_type: str, authorized: bool, options: dict[str, Any] | None = None) -> DemoJob:
         """Create a real yt-dlp task directly from an authorized HTTP(S) URL."""
         options = _safe_options(options)
-        source_url = _validate_public_http_url(source_url)
+        source_url = _require_supported_download_url(_validate_public_http_url(source_url))
         parsed = urlparse(source_url)
         if not authorized:
             raise ValueError("请先确认拥有处理或转载授权，再开始下载。")
@@ -1536,8 +1581,8 @@ class WorkbenchJobs:
         return job
 
     @staticmethod
-    def _pipeline_options(job: DemoJob) -> PipelineOptions:
-        options = job.options
+    def _pipeline_options(job: DemoJob, *, options: dict[str, Any] | None = None) -> PipelineOptions:
+        options = job.options if options is None else options
         source_url = job.material.source_url
         source = source_url or job.artifacts.source or str(job.material.path or "")
         return PipelineOptions(
@@ -1567,6 +1612,7 @@ class WorkbenchJobs:
             smart_subtitle_layout=options["smart_subtitle_layout"], font_name=options["font_name"],
             font_size=options["font_size"], subtitle_display_mode=options["subtitle_display_mode"],
             subtitle_preset=options.get("subtitle_preset", "soft"),
+            subtitle_placement=options.get("subtitle_placement", "overlay"),
             subtitle_color=options["subtitle_color"], subtitle_outline_color=options["subtitle_outline_color"],
             subtitle_outline=options["subtitle_outline"], subtitle_shadow=options["subtitle_shadow"],
             publish_to_bilibili=options["publish_to_bilibili"],
@@ -1704,16 +1750,19 @@ class WorkbenchJobs:
         job.workflow_version = WORKFLOW_VERSION
 
     @staticmethod
-    def _prepare_required_stages(job: DemoJob) -> set[str]:
-        """Return checks needed for the first incomplete workflow path."""
-        required: set[str] = set()
-        first_pending: int | None = None
-        for index, stage in enumerate(CORE_STAGES):
+    def _remaining_output_stages(job: DemoJob) -> list[str]:
+        core = CORE_STAGES[:-1] if job.options.get("output_mode") == "subtitles" else CORE_STAGES
+        for index, stage in enumerate(core):
             if job.stages.get(stage, {}).get("status") != "completed":
-                first_pending = index
-                break
-        if first_pending is not None:
-            required.update(CORE_STAGES[first_pending:])
+                return list(core[index:])
+        return []
+
+    @staticmethod
+    def _prepare_required_stages(job: DemoJob) -> set[str]:
+        """Return checks needed for the current output goal."""
+        required = set(WorkbenchJobs._remaining_output_stages(job))
+        if job.options.get("output_mode") == "subtitles":
+            return required
         if job.options.get("dub_enabled") and job.stages.get("dub", {}).get("status") != "completed":
             required.add("dub")
         if job.options.get("publish_to_bilibili") and job.stages.get("publish", {}).get("status") != "completed":
@@ -1777,13 +1826,14 @@ class WorkbenchJobs:
             add("download-scope", "下载范围与画质", "控制网络、磁盘和后续处理负载", "passed", f"将获取{scope}，画质上限为 {job.options['download_quality']}。")
             cookies_file = job.options.get("cookies_file")
             cookies_browser = job.options.get("cookies_from_browser")
-            if cookies_file:
-                valid = _cookies_file_has_login(Path(str(cookies_file)).expanduser())
-                add("youtube-cookies", "YouTube 登录凭据", "处理机器人验证或需要登录的视频", "passed" if valid else "blocking", "Cookies 文件包含登录凭据。" if valid else "Cookies 文件缺少 SID/LOGIN_INFO，请登录 YouTube 后重新导出。", "打开设置" if not valid else None)
-            elif cookies_browser:
-                add("youtube-cookies", "YouTube 登录凭据", "处理机器人验证或需要登录的视频", "warning", f"运行时将读取 {cookies_browser} 的登录 Cookies；请先关闭该浏览器以避免数据库被占用。", "打开设置")
-            else:
-                add("youtube-cookies", "YouTube 访问", "降低机器人验证导致的下载失败", "warning", "未配置 Cookies；公开视频可能可用，但 YouTube 风控时会阻止下载。", "打开设置")
+            if is_youtube_url(job.material.source_url):
+                if cookies_file:
+                    valid = _cookies_file_has_login(Path(str(cookies_file)).expanduser())
+                    add("youtube-cookies", "YouTube 登录凭据", "处理机器人验证或需要登录的视频", "passed" if valid else "blocking", "Cookies 文件包含登录凭据。" if valid else "Cookies 文件缺少 SID/LOGIN_INFO，请登录 YouTube 后重新导出。", "打开设置" if not valid else None)
+                elif cookies_browser:
+                    add("youtube-cookies", "YouTube 登录凭据", "处理机器人验证或需要登录的视频", "warning", f"运行时将读取 {cookies_browser} 的登录 Cookies；请先关闭该浏览器以避免数据库被占用。", "打开设置")
+                else:
+                    add("youtube-cookies", "YouTube 访问", "降低机器人验证导致的下载失败", "warning", "未配置 Cookies；公开视频可能可用，但 YouTube 风控时会阻止下载。", "打开设置")
             try:
                 metadata = get_video_metadata(
                     job.material.source_url,
@@ -1978,6 +2028,9 @@ class WorkbenchJobs:
                     job.status, job.stage = "draft", "设置已更新，请重新检查准备"
             elif changed_fields:
                 job.stage = "资源模式已更新" if changed_fields == {"resource_profile"} else "设置已更新"
+            if "output_mode" in changed_fields:
+                job.checks = []
+                job.status, job.stage = "draft", "输出目标已更新，请检查准备"
             job.error = None
         self._persist(job)
         return job, stale
@@ -2038,6 +2091,8 @@ class WorkbenchJobs:
             raise RuntimeError("Task not found.")
         if stage not in WORKFLOW_STAGES:
             raise ValueError("Unknown workflow stage.")
+        if job.options.get("output_mode") == "subtitles" and stage not in CORE_STAGES[:-1]:
+            raise RuntimeError("当前任务先出字幕。请在字幕页校对后点击生成成片。")
         if not self._checks_ready(job):
             raise RuntimeError("请先完成“开始前准备”检查并解决阻断项。")
         self._require_quality_consent(job, [stage])
@@ -2058,13 +2113,9 @@ class WorkbenchJobs:
         # or become corrupt after prepare (including while the app was closed).
         self._verify_checkpoints(job)
         self._persist(job)
-        first_pending = next(
-            (index for index, name in enumerate(CORE_STAGES)
-             if job.stages[name].get("status") != "completed"),
-            None,
-        )
-        stages = list(CORE_STAGES[first_pending:]) if first_pending is not None else []
-        if job.options.get("dub_enabled") and job.stages.setdefault("dub", new_stage_states()["dub"]).get("status") != "completed":
+        stages = self._remaining_output_stages(job)
+        if (job.options.get("output_mode") != "subtitles" and job.options.get("dub_enabled")
+                and job.stages.setdefault("dub", new_stage_states()["dub"]).get("status") != "completed"):
             stages.append("dub")
         if not stages:
             return job
@@ -2217,6 +2268,7 @@ class WorkbenchJobs:
         try:
             load_dotenv(USER_DATA_ROOT / ".env", override=True)
             options = self._pipeline_options(job)
+            options.allow_model_layout_repair = "translate" in stages
             for stage in stages:
                 with self._lock:
                     job.current_stage, job.stage = stage, WORKFLOW_STAGE_LABELS[stage]
@@ -2289,6 +2341,8 @@ class WorkbenchJobs:
                     job.status, job.stage, job.progress = "ready", "成片完成，待投稿辅助", 100
                 elif job.stages["render"].get("status") == "completed":
                     job.status, job.stage, job.progress = "completed", "处理完成", 100
+                elif job.options.get("output_mode") == "subtitles" and job.next_stage == "render":
+                    job.status, job.stage, job.progress = "ready", "字幕已生成，待校对", 100
                 else:
                     job.status, job.stage = "ready", "阶段完成，等待下一步"
                 job.checkpoint_validation = "verified" if job.next_stage in {None, "publish"} else "invalid"
@@ -2399,6 +2453,7 @@ class WorkbenchJobs:
     def batch_add(self, entries: list[dict[str, Any]], device: str, compute_type: str, options: dict[str, Any] | None, quality_consent: bool) -> dict[str, Any]:
         options = dict(options or {})
         options["publish_to_bilibili"] = False
+        options["output_mode"] = "video"
         with self._lock:
             for entry in entries:
                 self._batch_items.append({
@@ -2482,6 +2537,7 @@ class WorkbenchJobs:
         if item["status"] == "cancelled":
             return "\u5df2\u53d6\u6d88"
         job.options["publish_to_bilibili"] = False
+        job.options["output_mode"] = "video"
         self.prepare(job.id)
         if job.status == "cancelled":
             return "已取消"
@@ -3860,6 +3916,8 @@ class WorkbenchJobs:
                 outline=job.options["subtitle_outline"], shadow=job.options["subtitle_shadow"],
                 raised_margin=job.artifacts.used_ocr_subtitles, crf=job.options["render_crf"],
                 margin_ratio=job.options["subtitle_margin_ratio"], encoder=job.options["render_encoder"],
+                subtitle_placement=job.options.get("subtitle_placement", "overlay"),
+                display_mode=job.options["subtitle_display_mode"],
                 log=job.add_log, cancel_check=lambda: job.cancellation.cancelled,
                 resource_profile=job.options["resource_profile"],
             )
@@ -4083,6 +4141,71 @@ class WorkbenchJobs:
         threading.Thread(target=self._run_rerender, args=(job, subtitle), daemon=True, name=f"rerender-{job.id}").start()
         return job
 
+    def render_subtitle_preview(self, job_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        start = payload.get("start", 0)
+        if isinstance(start, bool) or not isinstance(start, (int, float)) or not math.isfinite(start) or start < 0:
+            raise ValueError("预览开始时间无效。")
+        style = payload.get("style", {})
+        if not isinstance(style, dict):
+            raise ValueError("字幕样式必须是对象。")
+        fields = (
+            "font_name", "font_size", "subtitle_display_mode", "subtitle_preset", "subtitle_color",
+            "subtitle_outline_color", "subtitle_effect", "subtitle_margin_ratio", "subtitle_placement",
+            "smart_subtitle_layout",
+        )
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.stages.get("translate", {}).get("status") != "completed":
+                raise RuntimeError("请先生成字幕，再试渲染片段。")
+            if self._running_id or self._subtitle_model_action_id or self._batch_job_id or job_id in self._preparing_ids:
+                raise RuntimeError("当前有其他处理任务，请完成后再试渲染。")
+            artifacts = copy.deepcopy(job.artifacts)
+            video = artifacts.path("raw_video")
+            if not video or not video.is_file():
+                raise RuntimeError("原视频不可用，无法试渲染。")
+            normalized = _safe_options({**job.options, **{key: style[key] for key in fields if key in style}})
+            options = self._pipeline_options(job, options=normalized)
+            options.allow_model_layout_repair = False
+            # Share the subtitle action slot without changing the job's recorded stages.
+            self._subtitle_model_action_id = job_id
+        directory = None
+        try:
+            duration = _probe_media(video)[0]
+            if duration is None or duration <= 0:
+                raise RuntimeError("无法读取原视频时长，不能试渲染。")
+            start = min(float(start), max(0, duration - 8))
+            end = min(duration, start + 8)
+            directory = tempfile.TemporaryDirectory(prefix="ybl-subtitle-preview-", ignore_cleanup_errors=True)
+            work_dir = Path(directory.name)
+            if not artifacts.path("translated_segments"):
+                subtitle = artifacts.path("translated_srt")
+                if subtitle and subtitle.is_file():
+                    copy_path = work_dir / "subtitles.srt"
+                    shutil.copy2(subtitle, copy_path)
+                    artifacts.translated_srt = str(copy_path)
+            rendered = run_render(options, work_dir, artifacts, PipelineContext(), lambda _message: None, clip=(start, end))
+            path = rendered.path("rendered_video")
+            if path is None:
+                raise RuntimeError("试渲染未生成视频。")
+            token = uuid.uuid4().hex
+            with self._lock:
+                previous = self._subtitle_preview
+                self._subtitle_preview = SubtitlePreview(job_id, token, directory, path)
+                directory = None
+            if previous:
+                previous.directory.cleanup()
+            return {"token": token, "start": start, "end": end}
+        finally:
+            if directory is not None:
+                directory.cleanup()
+            with self._lock:
+                self._subtitle_model_action_id = None
+
+    def subtitle_preview_media(self, job_id: str, token: str) -> Path | None:
+        with self._lock:
+            preview = self._subtitle_preview
+            return preview.path if preview and preview.job_id == job_id and preview.token == token else None
+
     def media(self, job_id: str, kind: str) -> Path | None:
         job = self.get(job_id)
         if job is None:
@@ -4105,6 +4228,8 @@ class WorkbenchJobs:
                 primary_color=job.options["subtitle_color"], outline_color=job.options["subtitle_outline_color"],
                 outline=job.options["subtitle_outline"], shadow=job.options["subtitle_shadow"],
                 crf=job.options["render_crf"], margin_ratio=job.options["subtitle_margin_ratio"],
+                subtitle_placement=job.options.get("subtitle_placement", "overlay"),
+                display_mode=job.options["subtitle_display_mode"],
                 encoder=job.options["render_encoder"], log=job.add_log,
                 cancel_check=lambda: job.cancellation.cancelled,
                 resource_profile=job.options["resource_profile"],
@@ -4171,7 +4296,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         translator = str(options.get("translator") or ("deepseek" if path in {"/api/jobs", "/api/batch/start"} else "")).lower()
         if translator not in {"deepseek", "openai", "ollama"}:
             return None
-        guarded = re.search(r"/(run-all|resume|retranslate|compact|stages/(translate|render)/run|voice-review/candidates/[^/]+/translate)$", path) or (path == "/api/publish/copy" and payload.get("generate") is True) or path == "/api/batch/start"
+        guarded = re.search(r"/(run-all|resume|retranslate|compact|stages/translate/run|voice-review/candidates/[^/]+/translate)$", path) or (path == "/api/publish/copy" and payload.get("generate") is True) or path == "/api/batch/start"
         if guarded:
             provider, resolved_model_raw, origin, local = ai_provider_request_info(translator, options.get("translate_model"))
             if local:
@@ -4389,6 +4514,18 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             media = self.jobs.material_path(match.group(1))
             if media is None or not media.exists(): self._json({"error": "Material is not available."}, HTTPStatus.NOT_FOUND)
             else: self._serve_media(media)
+            return
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/thumbnail", path)
+        if match:
+            self._serve_job_thumbnail(match.group(1))
+            return
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/subtitle-preview/([0-9a-f]{{32}})", path)
+        if match:
+            media = self.jobs.subtitle_preview_media(*match.groups())
+            if media is None or not media.is_file():
+                self._json({"error": "片段预览已失效，请重新试渲染。"}, HTTPStatus.NOT_FOUND)
+            else:
+                self._serve_media(media)
             return
         match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/media/(source|rendered|dub)", path)
         if match:
@@ -4635,7 +4772,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/metadata":
             try:
-                url = _validate_public_http_url(payload.get("url", ""), "url")
+                url = _require_supported_download_url(_validate_public_http_url(payload.get("url", ""), "url"), "url")
                 cookies_file = str(payload.get("cookies_file", "")).strip() or os.getenv("YBLOCALIZER_COOKIES_FILE", "").strip() or None
                 cookies_from_browser = str(payload.get("cookies_from_browser", "")).strip() or None
                 if cookies_file:
@@ -4656,7 +4793,10 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 if "authorized" in payload:
                     require_boolean(payload["authorized"], "authorized")
                 if "source_url" in payload and payload["source_url"] is not None and payload["source_url"] != "":
-                    payload = {**payload, "source_url": _validate_public_http_url(payload["source_url"])}
+                    payload = {
+                        **payload,
+                        "source_url": _require_supported_download_url(_validate_public_http_url(payload["source_url"])),
+                    }
                 result = preflight(
                     payload, str(OUTPUT_ROOT),
                     lambda browser: bool(self._publish_profile_process_ids(browser)),
@@ -4841,7 +4981,11 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 if not line:
                     continue
                 try:
-                    entries.extend(list_playlist_entries(line, options.get("cookies_from_browser"), options.get("cookies_file"), options.get("youtube_proxy")))
+                    parsed = list_playlist_entries(line, options.get("cookies_from_browser"), options.get("cookies_file"), options.get("youtube_proxy"))
+                    for entry in parsed:
+                        if not entry.get("thumbnail_url"):
+                            entry["thumbnail_url"] = _youtube_thumbnail_url(entry["url"])
+                    entries.extend(parsed)
                 except Exception as exc:
                     entries.append({"url": line, "title": "", "duration": None, "error": str(exc)})
             self._json({"entries": entries}); return
@@ -4919,6 +5063,19 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             except RuntimeError as exc:
                 self._json({"error": str(exc)}, HTTPStatus.CONFLICT); return
             self._json(job.snapshot(), HTTPStatus.ACCEPTED)
+            return
+        match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/subtitle-preview", path)
+        if match:
+            try:
+                preview = self.jobs.render_subtitle_preview(match.group(1), payload)
+            except InputValidationError as exc:
+                self._json(exc.payload(), HTTPStatus.BAD_REQUEST)
+            except (ValueError, OverflowError) as exc:
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except (RuntimeError, OSError) as exc:
+                self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
+            else:
+                self._json(preview)
             return
         match = re.fullmatch(rf"/api/jobs/({JOB_ID_PATTERN})/(cancel|open-output|rerender)", path)
         if match:
@@ -5196,6 +5353,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             public.append({
                 "id": record["id"],
                 "title": record.get("title") or "未命名任务",
+                "source_thumbnail_url": _youtube_thumbnail_url(str(record.get("source_url") or "")),
                 "status": record.get("status") or "unknown",
                 "stage": record.get("stage") or "—",
                 "progress": record.get("progress") or 0,
@@ -5767,6 +5925,50 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-YBL-CSRF")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, OPTIONS")
+
+    def _serve_job_thumbnail(self, job_id: str) -> None:
+        job = self.jobs.get(job_id)
+        if job is None:
+            self._json({"error": "Task not found."}, HTTPStatus.NOT_FOUND)
+            return
+
+        legacy_rendered = None
+        if job.work_dir:
+            covers = (
+                job.artifacts.path("thumbnail_path"),
+                *(job.work_dir / name for name in ("cover.jpg", "cover.png", "thumbnail.jpg", "thumbnail.png")),
+            )
+            for cover in covers:
+                if (cover and cover.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+                        and cover.is_file() and self._path_is_within(cover, job.work_dir)):
+                    self._serve_media(cover)
+                    return
+            candidate = job.work_dir / "rendered.mp4"
+            if candidate.is_file() and self._path_is_within(candidate, job.work_dir):
+                legacy_rendered = candidate
+
+        video_paths = (
+            job.raw_video, job.material.path, job.artifacts.path("original_video"),
+            job.rendered_video, job.artifacts.path("rendered_video"), legacy_rendered,
+            job.artifacts.path("dub_video"),
+        )
+        videos = [video for video in dict.fromkeys(video_paths)
+                  if video and video.suffix.lower() in MEDIA_EXTENSIONS and video.is_file()]
+        if videos and (ffmpeg := resolve_command("ffmpeg")):
+            for video in videos:
+                try:
+                    stat = video.stat()
+                    thumbnail = _video_thumbnail(ffmpeg, video, (stat.st_mtime_ns, stat.st_size))
+                except (OSError, subprocess.SubprocessError, ValueError):
+                    continue
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(thumbnail)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(thumbnail)
+                return
+        self._json({"error": "Thumbnail is not available."}, HTTPStatus.NOT_FOUND)
 
     def _serve_media(self, path: Path) -> None:
         size = path.stat().st_size; start, end = 0, size - 1; status = HTTPStatus.OK

@@ -69,7 +69,7 @@ def test_same_4k_fps_uses_ytdlp_selection_not_raw_bitrate() -> None:
 
 
 def test_acquire_cache_changes_only_with_download_contract(tmp_path: Path) -> None:
-    options = SimpleNamespace(source="https://example.test/v", download_quality="original", max_seconds=None,
+    options = SimpleNamespace(source="https://www.youtube.com/watch?v=demotest", download_quality="original", max_seconds=None,
                               source_language="en", prefer_platform_subtitles=False,
                               quality_proposal={"video_format_id": "401", "audio_format_id": "251"})
     first = _acquire_cache_dir(tmp_path, options)
@@ -105,7 +105,7 @@ def test_original_quality_baseline_survives_repeated_preparation() -> None:
 
 def test_quality_fingerprint_uses_resolution_not_ephemeral_format_ids(tmp_path: Path) -> None:
     jobs = WorkbenchJobs()
-    job = jobs.create_url("https://example.test/v", "cpu", "int8", True, {"output_dir": str(tmp_path)})
+    job = jobs.create_url("https://www.youtube.com/watch?v=demotest", "cpu", "int8", True, {"output_dir": str(tmp_path)})
     proposal = {"video_format_id": "old4k", "audio_format_id": "oldaudio", "width": 3840,
                 "height": 2160, "has_audio": True, "baseline_width": 3840, "baseline_height": 2160}
     changed_ids = {**proposal, "video_format_id": "new4k", "audio_format_id": "newaudio"}
@@ -129,7 +129,7 @@ def test_missing_proposed_resolution_is_rejected_after_download(monkeypatch: pyt
     monkeypatch.setitem(__import__("sys").modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYDL))
     monkeypatch.setattr("yblocalizer.download._probe_video_dimensions", lambda _path: (1280, 720))
     with pytest.raises(DownloadProposalMismatch, match="画质记录不完整"):
-        download_with_ytdlp("https://example.test/v", tmp_path, quality_proposal={"video_format_id": ""})
+        download_with_ytdlp("https://www.youtube.com/watch?v=demotest", tmp_path, quality_proposal={"video_format_id": ""})
     assert constructed is False
 
 
@@ -145,7 +145,7 @@ def test_proposal_resolution_is_checked_when_ytdlp_selected_dims_missing(monkeyp
     monkeypatch.setattr("yblocalizer.download._probe_video_dimensions", lambda _path: (640, 360))
     proposal = {"video_format_id": "v1080", "audio_format_id": "", "width": 1920, "height": 1080}
     with pytest.raises(Exception, match="1920×1080.*640×360"):
-        download_with_ytdlp("https://example.test/v", tmp_path, quality_proposal=proposal)
+        download_with_ytdlp("https://www.youtube.com/watch?v=demotest", tmp_path, quality_proposal=proposal)
 
 
 def test_cancelled_error_never_becomes_quality_retry() -> None:
@@ -170,7 +170,7 @@ def test_cancel_during_download_is_not_converted_to_network_failure(monkeypatch:
         if calls[0] >= 2:
             raise CancellationRequested("cancelled during download")
     with pytest.raises(CancellationRequested):
-        download_with_ytdlp("https://example.test/v", tmp_path, download_quality="1080p", cancel_check=cancel)
+        download_with_ytdlp("https://www.youtube.com/watch?v=demotest", tmp_path, download_quality="1080p", cancel_check=cancel)
     assert calls[0] >= 2
 
 
@@ -178,9 +178,9 @@ def test_acquire_failure_keeps_old_video_hash_and_pointer(monkeypatch: pytest.Mo
     old = tmp_path / "old.mp4"
     old.write_bytes(b"known-good")
     before = hashlib.sha256(old.read_bytes()).hexdigest()
-    artifacts = WorkflowArtifacts(source="https://example.test/v", source_kind="url", raw_video=str(old), original_video=str(old))
+    artifacts = WorkflowArtifacts(source="https://www.youtube.com/watch?v=demotest", source_kind="url", raw_video=str(old), original_video=str(old))
     options = SimpleNamespace(
-        source="https://example.test/v", source_kind="url", title=None, i_have_rights=True,
+        source="https://www.youtube.com/watch?v=demotest", source_kind="url", title=None, i_have_rights=True,
         max_seconds=None, require_reuse_allowed=False, cookies_from_browser=None, cookies_file=None,
         youtube_po_token_mode="off", youtube_proxy=None, download_quality="1080p", resource_profile="balanced",
         source_language=None, prefer_platform_subtitles=False,
@@ -295,7 +295,7 @@ def test_render_rebuilds_bilingual_srt_and_failure_keeps_old_pair(monkeypatch: p
 
 def test_quality_consent_blocks_stage_entry_until_confirmed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     jobs = WorkbenchJobs()
-    job = jobs.create_url("https://example.test/v", "cpu", "int8", True, {"output_dir": str(tmp_path)})
+    job = jobs.create_url("https://www.youtube.com/watch?v=demotest", "cpu", "int8", True, {"output_dir": str(tmp_path)})
     proposal = {"video_format_id": "v360", "audio_format_id": "a", "width": 640, "height": 360, "has_audio": True, "requires_consent": True}
     proposal["fingerprint"] = jobs._quality_fingerprint(job, proposal)
     job.options["quality_proposal"] = proposal

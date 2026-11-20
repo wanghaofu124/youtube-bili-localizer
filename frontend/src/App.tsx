@@ -1,9 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type ReactNode } from "react";
 import { publishStageButton, sameTaskOption, stageAvailability, workflowPrimaryLabel, type StageName } from "./workflowState";
 import { retainVisibleVideoLibrarySelection, selectableVideoLibraryIds, videoLibraryCategory, videoLibraryMatches, type VideoLibraryCategory } from "./videoLibrary";
 import { cueNeedsReview, replaceLiteral } from "./subtitleEditor";
 import { SetupModal, TranslationPresetFields, type TranslationPreset } from "./SetupModal";
 import { TutorialModal, type TutorialAction } from "./TutorialModal";
+import { createSiteRequests } from "./siteRequests";
+import { SubtitleStyleSettings, type SubtitleStyleOptions } from "./SubtitleStyleSettings";
 
 type View = "material" | "library" | "process" | "subtitle" | "publish" | "files";
 const CURRENT_TUTORIAL_VERSION = 1;
@@ -63,6 +65,15 @@ type Material = {
   authorized: boolean;
   is_demo: boolean;
   source_url?: string | null;
+};
+type MaterialMetadata = {
+  title: string | null;
+  duration: number | null;
+  license: string | null;
+  view_count: number | null;
+  thumbnail_url?: string | null;
+  max_width: number | null;
+  max_height: number | null;
 };
 type Cue = {
   id: number;
@@ -191,8 +202,17 @@ type Job = {
   quality_consent?: boolean;
   llm_usage?: LlmUsage | null;
   llm_usage_total?: LlmUsage | null;
+  translation_hint?: {
+    score: number;
+    band: number;
+    title: string;
+    message: string;
+    rare_count: number;
+    advisory: true;
+  } | null;
 };
-type Options = {
+type Options = SubtitleStyleOptions & {
+  output_mode: "video" | "subtitles";
   title: string;
   require_reuse_allowed: boolean;
   cookies_from_browser: string;
@@ -213,7 +233,6 @@ type Options = {
   ocr_crop_ratio: number;
   ocr_min_chars: number;
   ocr_language: string;
-  subtitle_margin_ratio: number;
   render_crf: number;
   dub_enabled?: boolean;
   dub_mix?: "duck" | "dub_only";
@@ -227,13 +246,6 @@ type Options = {
   llm_custom_pricing: Record<string, string>;
   smart_translation: boolean;
   smart_subtitle_layout: boolean;
-  font_name: string;
-  font_size: number;
-  subtitle_display_mode: string;
-  subtitle_preset: string;
-  subtitle_color: string;
-  subtitle_outline_color: string;
-  subtitle_effect: string;
   output_dir: string;
   description?: string;
   tags?: string[];
@@ -280,6 +292,7 @@ type Outputs = {
 type HistoryJob = {
   id: string;
   title: string;
+  source_thumbnail_url?: string | null;
   status: string;
   stage: string;
   progress: number;
@@ -391,6 +404,7 @@ const defaults: Options = {
   subtitle_margin_ratio: 0.055,
   render_crf: 20,
   render_encoder: "auto",
+  output_mode: "video",
   resource_profile: "balanced",
   translator: "deepseek",
   target_lang: "zh-Hans",
@@ -404,6 +418,7 @@ const defaults: Options = {
   font_size: 24,
   subtitle_display_mode: "translated",
   subtitle_preset: "soft",
+  subtitle_placement: "overlay",
   subtitle_color: "白色",
   subtitle_outline_color: "黑色",
   subtitle_effect: "描边",
@@ -412,10 +427,10 @@ const defaults: Options = {
 type NavIconName = "material" | "library" | "process" | "subtitle" | "publish" | "files" | "save" | "link" | "rerender" | "download" | "voice" | "translate" | "render" | "upload" | "check" | "running" | "error" | "pause" | "ear" | "speed" | "text" | "video" | "subtitle-file" | "audio" | "cover" | "file" | "book";
 const nav: Array<[View, string, string, NavIconName]> = [
   ["material", "素材", "链接、本地视频与授权", "material"],
-  ["library", "任务库", "待处理、可继续与成片", "library"],
   ["process", "处理", "识别、翻译与推理", "process"],
   ["subtitle", "字幕", "预览、编辑与渲染", "subtitle"],
   ["publish", "发布", "B 站与抖音投稿辅助", "publish"],
+  ["library", "任务库", "待处理、可继续与成片", "library"],
   ["files", "文件", "输出与空间管理", "files"],
 ];
 function NavIcon({ name, className = "nav-icon" }: { name: NavIconName; className?: string }) {
@@ -594,9 +609,12 @@ const formatBytes = (bytes: number) => {
   return index ? `${value.toFixed(1)} ${units[index]}` : `${Math.round(value)} B`;
 };
 
+type MaterialSelection = { material_id: string; name: string };
+
 type NativeBridge = {
   choose_publish_video: () => Promise<{ token: string } | null>;
-  choose_material_video: () => Promise<{ material_id: string; name: string } | null>;
+  choose_material_video: () => Promise<MaterialSelection | null>;
+  import_dropped_material?: () => Promise<MaterialSelection>;
   choose_output_dir: () => Promise<{ path: string } | null>;
   choose_cookies_file: () => Promise<{ path: string } | null>;
 };
@@ -624,6 +642,30 @@ const fileIconName = (kind: string, name = ""): NavIconName => {
   if (value.includes("预览") || value.includes("封面") || /\.(png|jpe?g|webp)$/i.test(name)) return "cover";
   return "file";
 };
+
+function TranslationDifficultyHint({ hint }: { hint?: Job["translation_hint"] }) {
+  if (!hint) return null;
+  const bands = [0, 20, 40, 60, 80];
+  const ranges: Record<number, string> = { 0: "0–19", 20: "20–39", 40: "40–59", 60: "60–79", 80: "80–100" };
+  const headline = hint.message.split("。")[0];
+  const rest = hint.message.slice(headline.length).replace(/^。/, "");
+  return (
+    <aside className={`translation-hint band-${hint.band}`} role="note">
+      <div className="translation-hint-score">
+        <b>{hint.score}</b>
+        <small>难度</small>
+        <small>{ranges[hint.band] ?? ""}</small>
+      </div>
+      <div className="translation-hint-copy">
+        <strong>{headline}</strong>
+        <span>{rest}</span>
+        <span className="translation-hint-scale" aria-hidden="true">
+          {bands.map((band) => <i key={band} className={band === hint.band ? "current" : ""} />)}
+        </span>
+      </div>
+    </aside>
+  );
+}
 
 function FieldGuide({ summary, detail, badges = [] }: { summary: string; detail: string; badges?: string[] }) {
   return <span className="field-guide"><small>{summary}</small><span className="guide-badges">{badges.map((badge) => <i key={badge}>{badge}</i>)}</span><details><summary>？ 选择建议与影响</summary><p>{detail}</p></details></span>;
@@ -658,6 +700,52 @@ function ActivityBars() {
   return <span className="activity-bars" aria-hidden="true"><i /><i /><i /><i /><i /></span>;
 }
 
+function pageHost(url: string): string {
+  const text = url.trim();
+  if (!text) return "";
+  try {
+    return new URL(text).hostname.replace(/^www\./, "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function hostIs(host: string, suffixes: readonly string[]): boolean {
+  return suffixes.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
+}
+
+function showYoutubeBrowserVerification(url: string): boolean {
+  const host = pageHost(url);
+  if (!host) return true;
+  return hostIs(host, ["youtu.be", "youtube.com", "youtube-nocookie.com"]);
+}
+
+function isPublicPostUrl(url: string): boolean {
+  return hostIs(pageHost(url), ["x.com", "twitter.com", "reddit.com", "bsky.app"]);
+}
+
+function downloadQualityHint(url: string, batch: boolean): string {
+  if (batch) return "批量共用处理范围和获取代理。画质上限会用于选流；X、Reddit、Bluesky 没有平台字幕时自动转写。";
+  if (isPublicPostUrl(url)) return "画质上限会用于这条公开帖子的选流。没有平台字幕时自动转写。";
+  return "720p 和 1080p 是上限。原始画质取站点能给出的最高一路。";
+}
+
+function reuseHint(url: string, batch: boolean, enabled: boolean, pending: boolean): string {
+  const state = enabled ? "仅接受可复用 CC 视频" : "未启用 CC 限制";
+  const sync = pending ? "（正在同步到任务）" : "";
+  if (batch) return `整批共用当前任务设置：${state}${sync}。这个开关只认 YouTube 的可转载标记。`;
+  if (isPublicPostUrl(url)) return `公开帖子不看这个开关。当前仍是：${state}${sync}`;
+  if (pageHost(url) && !showYoutubeBrowserVerification(url)) return `这个开关只认 YouTube 的可转载标记。当前仍是：${state}${sync}`;
+  return `当前任务：${state}${sync}`;
+}
+
+function platformSubtitleLabel(url: string, batch: boolean): string {
+  if (batch) return "优先使用站点字幕（X、Reddit、Bluesky 没有平台字幕时自动转写）";
+  if (isPublicPostUrl(url)) return "优先使用平台字幕（没有时自动转写）";
+  if (!pageHost(url) || showYoutubeBrowserVerification(url)) return "优先使用 YouTube 字幕（更快；没有时自动转写）";
+  return "优先使用站点字幕（没有时自动转写）";
+}
+
 function describeTaskError(message: string, fallbackTitle = "任务处理未完成", fallbackHint = "查看技术详情，确认原因后从失败阶段继续。"): { title: string; hint: string } {
   if (/WinError 32|另一个程序正在使用|being used by another process|Unable to rename file/i.test(message)) {
     return { title: "文件写入失败", hint: "目标文件可能正在被其他程序占用。关闭占用文件的程序后，再从失败阶段继续。" };
@@ -670,6 +758,9 @@ function describeTaskError(message: string, fallbackTitle = "任务处理未完�
   }
   if (/403 Forbidden|HTTP Error 403|HTTP 403/i.test(message)) {
     return { title: "视频暂时无法访问", hint: "请检查链接、登录状态或网络连接。" };
+  }
+  if (message.includes("当前不支持")) {
+    return { title: "暂不支持这个站点", hint: message };
   }
   if (/No such file|WinError 2|找不到指定的文件/i.test(message)) {
     return { title: "找不到素材文件", hint: "原文件可能已移动或删除，请检查素材位置。" };
@@ -695,7 +786,10 @@ function mostlyCjk(text: string): boolean {
   return cjk / chars.length > 0.35;
 }
 declare global {
-  interface Window { pywebview?: { api?: NativeBridge } }
+  interface Window {
+    pywebview?: { api?: NativeBridge };
+    chrome?: { webview?: { postMessageWithAdditionalObjects?: (message: string, files: File[]) => void } };
+  }
 }
 
 let csrfToken = "";
@@ -733,7 +827,7 @@ function externalAiConfirmation(disclosure: ExternalAiDisclosure): boolean {
   ].join("\n"));
 }
 
-type BatchEntry = { url: string; title: string; duration?: number | null; error?: string; selected: boolean };
+type BatchEntry = { url: string; title: string; duration?: number | null; thumbnail_url?: string | null; error?: string; selected: boolean };
 type SubscribedChannel = { id: string; url: string; title: string; added_at?: string };
 type WeeklyHotVideo = {
   url: string;
@@ -802,6 +896,17 @@ const SITE_DURATION_BANDS: { id: SiteDurationBand; label: string }[] = [
   { id: "longer", label: "更长" },
 ];
 
+const SITE_REGIONS = [
+  { id: "US", label: "美国" },
+  { id: "GB", label: "英国" },
+  { id: "JP", label: "日本" },
+  { id: "KR", label: "韩国" },
+  { id: "IN", label: "印度" },
+  { id: "CA", label: "加拿大" },
+  { id: "AU", label: "澳大利亚" },
+  { id: "", label: "不限" },
+];
+
 function thumbnailCandidates(src: string): string[] {
   const id = src.match(/\/vi(?:_webp)?\/([A-Za-z0-9_-]{11})\//)?.[1] ?? "";
   // Signed hq720 links expire, and hqdefault/mqdefault stall on this network.
@@ -814,24 +919,56 @@ function thumbnailCandidates(src: string): string[] {
   ];
 }
 
-function WeeklyThumb({ src }: { src: string }) {
+function WeeklyThumb({ src, lazy = false }: { src: string; lazy?: boolean }) {
   const candidates = thumbnailCandidates(src);
   const [index, setIndex] = useState(0);
   if (index >= candidates.length) return <span className="weekly-hot-thumb is-placeholder" aria-hidden="true" />;
-  return <img className="weekly-hot-thumb" src={candidates[index]} alt="" onError={() => setIndex((value) => value + 1)} />;
+  return <img className="weekly-hot-thumb" src={candidates[index]} alt="" loading={lazy ? "lazy" : undefined} onError={() => setIndex((value) => value + 1)} />;
 }
+
+function RecentTaskCover({ item }: { item: HistoryJob }) {
+  const [index, setIndex] = useState(0);
+  const candidates = [
+    `/api/jobs/${encodeURIComponent(item.id)}/thumbnail`,
+    ...thumbnailCandidates(item.source_thumbnail_url ?? ""),
+  ];
+  const src = candidates[index];
+  return <span className="material-side-cover" aria-hidden="true">
+    <NavIcon name="video" className="app-icon" />
+    {src && <img src={src} alt="" loading="lazy" decoding="async" referrerPolicy="no-referrer" onError={() => setIndex(index + 1)} />}
+  </span>;
+}
+
 const formatUploadDay = (value: string | null): string | null => {
   if (!value || !/^\d{8}$/.test(value)) return null;
   return `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`;
 };
+type WeeklySortMode = "views" | "recent";
+type WeeklyRecencyBucket = "today" | "yesterday" | "earlier";
+const WEEKLY_SECTION_LABEL: Record<WeeklyRecencyBucket, string> = { today: "今天", yesterday: "昨天", earlier: "更早" };
+const shanghaiYmd = (ms: number): [number, number, number] => {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(ms));
+  const num = (type: string) => Number(parts.find((part) => part.type === type)?.value ?? 0);
+  return [num("year"), num("month"), num("day")];
+};
+const dayIndex = (year: number, month: number, day: number) => Math.floor(Date.UTC(year, month - 1, day) / 86400000);
 const formatDaysAgo = (timestamp: number | null): string | null => {
   if (!timestamp) return null;
-  const upload = new Date(timestamp * 1000);
-  const now = new Date();
-  const days = Math.round((Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - Date.UTC(upload.getUTCFullYear(), upload.getUTCMonth(), upload.getUTCDate())) / 86400000);
+  const [ty, tm, td] = shanghaiYmd(Date.now());
+  const [uy, um, ud] = shanghaiYmd(timestamp * 1000);
+  const days = dayIndex(ty, tm, td) - dayIndex(uy, um, ud);
   if (days <= 0) return "今天";
   if (days === 1) return "昨天";
   return `${days} 天前`;
+};
+const weeklyRecencyBucket = (timestamp: number | null): WeeklyRecencyBucket => {
+  if (timestamp == null) return "earlier";
+  const [ty, tm, td] = shanghaiYmd(Date.now());
+  const [uy, um, ud] = shanghaiYmd(timestamp * 1000);
+  const delta = dayIndex(ty, tm, td) - dayIndex(uy, um, ud);
+  if (delta <= 0) return "today";
+  if (delta === 1) return "yesterday";
+  return "earlier";
 };
 const formatClock = (seconds: number): string => {
   const total = Math.max(0, Math.round(seconds));
@@ -995,6 +1132,15 @@ function App() {
   const prepareSpecificJobRef = useRef<(jobId: string) => Promise<void>>(async () => undefined);
   const schemeDirtyRef = useRef(false);
   const [view, setView] = useState<View>("material");
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  const materialStartRef = useRef(false);
+  const [startingMaterial, setStartingMaterial] = useState(false);
+  const materialImportRef = useRef(false);
+  const [importingMaterial, setImportingMaterial] = useState(false);
+  const [draggingMaterial, setDraggingMaterial] = useState(false);
+  const discoveryPanelRef = useRef<HTMLDetailsElement>(null);
+  const [recentJobs, setRecentJobs] = useState<HistoryJob[]>([]);
   const [materials, setMaterials] = useState<Material[]>([]);
   const [materialId, setMaterialId] = useState("");
   const [sourceUrl, setSourceUrl] = useState("");
@@ -1014,6 +1160,7 @@ function App() {
   const siteCategoryRef = useRef("mix");
   const siteRegionRef = useRef("US");
   const siteAutoTriedRef = useRef(new Set<string>());
+  const siteRequestsRef = useRef(createSiteRequests());
   const [materialSourceTab, setMaterialSourceTab] = useState<"url" | "local">("url");
   const sourceRevision = useRef(0);
   const [authorized, setAuthorized] = useState(false);
@@ -1078,6 +1225,11 @@ function App() {
   const [retranslatingCueId, setRetranslatingCueId] = useState<number | null>(null);
   const [compactingCues, setCompactingCues] = useState(false);
   const [preview, setPreview] = useState<"source" | "rendered" | "dub">("source");
+  const [subtitleTrial, setSubtitleTrial] = useState<{
+    jobId: string; token: string; start: number; end: number; styleKey: string; revision?: number;
+  } | null>(null);
+  const [subtitleTrialBusy, setSubtitleTrialBusy] = useState(false);
+  const subtitleTrialBusyRef = useRef(false);
   const dubSettings = (
     <section className="settings-section dub-section">
       <header className="settings-group-heading"><NavIcon name="voice" className="app-icon" /><span><b>配音</b><small>可选：渲染后用 VoxCPM 生成中文配音，另存 *_dub.mp4</small></span></header>
@@ -1215,14 +1367,7 @@ function App() {
   const [exportingDiagnostics, setExportingDiagnostics] = useState(false);
   const [diagnosticsNote, setDiagnosticsNote] = useState("");
   const [message, setMessage] = useState("正在连接本地服务…");
-  const [metadata, setMetadata] = useState<{
-    duration: number | null;
-    license: string | null;
-    view_count: number | null;
-    max_width: number | null;
-    max_height: number | null;
-    quality_proposal?: { width: number | null; height: number | null; quality: string; requires_consent?: boolean; fingerprint?: string } | null;
-  } | null>(null);
+  const [metadata, setMetadata] = useState<MaterialMetadata | null>(null);
   const [metadataNotice, setMetadataNotice] = useState("");
   const [metadataState, setMetadataState] = useState<
     "idle" | "loading" | "success" | "error"
@@ -1332,6 +1477,10 @@ function App() {
   );
   const runningRef = useRef(running);
   runningRef.current = running;
+  const subtitlesAwaitingReview = job?.status === "ready"
+    && job.options.output_mode === "subtitles"
+    && job.next_stage === "render"
+    && job.stages?.translate?.status === "completed";
   const dirty = history.length > 0;
   const reviewCueCount = useMemo(() => cues.filter((cue) => cueNeedsReview(cue)).length, [cues]);
   const visibleCueRows = useMemo(
@@ -1378,7 +1527,7 @@ function App() {
   const previewSrc = demoPreview
     ? `/api/demo/rendered?v=${mediaNonce || "demo"}`
     : job
-    ? `/api/jobs/${job.id}/media/${preview === "dub" ? "dub" : preview === "rendered" && job.result ? "rendered" : "source"}?v=${mediaNonce || job.stages?.render?.finished_at || "0"}`
+    ? `/api/jobs/${job.id}/media/${preview === "dub" ? "dub" : preview === "rendered" && job.result?.rendered_video ? "rendered" : "source"}?v=${mediaNonce || job.stages?.render?.finished_at || "0"}`
     : selected
       ? `/api/materials/${selected.id}/media`
       : "";
@@ -1445,15 +1594,17 @@ function App() {
     setSelectedOutputTaskIds((current) => retainVisibleVideoLibrarySelection(current, libraryJobs));
   }, [visibleLibraryTaskIds]);
 
-  const updateOptions = <K extends keyof Options>(key: K, value: Options[K]) => {
+  const updateOptionValues = (patch: Partial<Options>) => {
     setFieldErrors((current) => {
-      if (!current[String(key)]) return current;
+      const fields = Object.keys(patch).filter((key) => current[key]);
+      if (!fields.length) return current;
       const next = { ...current };
-      delete next[String(key)];
+      for (const field of fields) delete next[field];
       return next;
     });
-    setOptions((current) => ({ ...current, [key]: value }));
+    setOptions((current) => ({ ...current, ...patch }));
   };
+  const updateOptions = <K extends keyof Options>(key: K, value: Options[K]) => updateOptionValues({ [key]: value });
   const changeTranslator = (value: string) => {
     const localModels = ["qwen3.5:4b", "qwen3.5:9b", "translategemma:12b"];
     if (value === "ollama" && options.translator !== "ollama") {
@@ -1599,7 +1750,7 @@ function App() {
       setWeeklyBusy(false);
     }
   };
-  const saveWeeklyPrefs = async (patch: Partial<Pick<WeeklyHot, "window_days" | "top_k" | "fetch_count" | "cache_ttl_hours" | "show_thumbnails">>) => {
+  const saveWeeklyPrefs = async (patch: Partial<Pick<WeeklyHot, "window_days" | "top_k" | "fetch_count" | "cache_ttl_hours" | "show_thumbnails" | "sort_mode">>) => {
     setChannelSaving(true);
     try {
       const data = await api<WeeklyHot>("/api/subscriptions/settings", { method: "POST", body: JSON.stringify(patch) });
@@ -1609,6 +1760,10 @@ function App() {
     } finally {
       setChannelSaving(false);
     }
+  };
+  const setWeeklySortMode = async (mode: WeeklySortMode) => {
+    if (!weekly || (weekly.sort_mode ?? "views") === mode || channelSaving) return;
+    await saveWeeklyPrefs({ sort_mode: mode });
   };
   const setWeeklyEnabled = async (enabled: boolean) => {
     setChannelSaving(true);
@@ -1651,7 +1806,8 @@ function App() {
   };
   const loadSite = async (category = siteCategoryRef.current) => {
     try {
-      const data = await api<SiteHot>(`/api/trending?category=${encodeURIComponent(category)}`);
+      const data = await siteRequestsRef.current.read(() => api<SiteHot>(`/api/trending?category=${encodeURIComponent(category)}`));
+      if (!data) return null;
       if (siteCategoryRef.current !== category) return data;
       siteRegionRef.current = data.region;
       setSite(data);
@@ -1678,17 +1834,18 @@ function App() {
     setSiteBusy(true);
     setSiteError("");
     try {
-      const data = await api<SiteHot>("/api/trending/refresh", {
+      const data = await siteRequestsRef.current.write(() => api<SiteHot>("/api/trending/refresh", {
         method: "POST",
         body: JSON.stringify({
           category,
-          ...(site ? { region: requestedRegion } : {}),
+          region: requestedRegion,
           cookies_from_browser: options.cookies_from_browser,
           cookies_file: options.cookies_file,
           youtube_proxy: options.youtube_proxy,
           youtube_po_token_mode: options.youtube_po_token_mode,
         }),
-      });
+      }));
+      if (!data) return;
       if (data.refreshing) siteAutoTriedRef.current.delete(siteAutoKey(category, requestedRegion));
       if (siteCategoryRef.current === category && siteRegionRef.current === requestedRegion) {
         siteRegionRef.current = data.region;
@@ -1723,28 +1880,36 @@ function App() {
     });
   };
   const saveSiteRegion = async (region: string) => {
+    if (region === siteRegionRef.current) return;
+    const category = siteCategoryRef.current;
     siteRegionRef.current = region;
-    setSite((current) => current ? { ...current, region } : current);
+    setSiteError("");
+    setSite((current) => current ? {
+      ...current, region, videos: [], refreshed_at: null, stale: true, error: null, query_errors: [],
+    } : current);
     try {
-      const data = await api<SiteHot>("/api/trending/region", {
+      const data = await siteRequestsRef.current.write(() => api<SiteHot>("/api/trending/region", {
         method: "POST",
-        body: JSON.stringify({ region, category: siteCategoryRef.current }),
-      });
+        body: JSON.stringify({ region, category }),
+      }));
+      if (!data) return;
       if (siteCategoryRef.current === data.category) {
         siteRegionRef.current = data.region;
-        setSite(data);
+        setSite(data.cached_region === data.region ? data : { ...data, videos: [] });
       }
       if (siteCategoryRef.current !== data.category || siteRegionRef.current !== data.region || siteBusyRef.current) return;
-      if (claimSiteAutoRefresh(data)) void refreshSite();
+      if (data.cached_region !== data.region || siteNeedsAutoRefresh(data)) void refreshSite();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "保存地区失败");
+      void loadSite();
     }
   };
   const loadRestorableJobs = async () => {
     const response = await api<{ jobs: RestorableJob[] }>("/api/jobs/restorable?limit=20");
     setRestorableJobs(response.jobs);
   };
-  const loadRestoredJob = async (id: string) => {
+  const loadRestoredJob = async (id: string, destination: "process" | "subtitle" = "process", viewProgress = false) => {
+    if (materialStartRef.current) return;
     if ((dirty || materialDraftToken > 0) && !window.confirm(dirty ? "字幕还有未保存修改。载入其他任务会清空当前草稿，确定继续吗？" : "素材页还有未保存的链接/本地选择。载入任务会覆盖这些内容，确定继续吗？")) {
       return;
     }
@@ -1754,7 +1919,10 @@ function App() {
     cueOwner.current = null;
     setCues([]); setHistory([]); setFuture([]); setCuesReady(false);
     try {
-      const restored = await api<Job>(`/api/jobs/${id}/load`, { method: "POST", body: "{}" });
+      const jobPath = `/api/jobs/${encodeURIComponent(id)}`;
+      const restored = viewProgress
+        ? await api<Job>(jobPath)
+        : await api<Job>(`${jobPath}/load`, { method: "POST", body: "{}" });
       if (generation !== cueGeneration.current || selectedJobIdRef.current !== id) return;
       setJob(restored);
       setDemoPreview(false);
@@ -1772,6 +1940,7 @@ function App() {
       setSourceUrl(restored.material.source_url ?? "");
       setMaterialId(restored.material.source_url ? "" : restored.material.id);
       setMaterialSourceTab(restored.material.source_url ? "url" : "local");
+      setBatchMode(false);
       setAuthorized(restored.material.authorized);
       setMaterialDraftToken(0);
       if (restored.material.source_url) {
@@ -1791,7 +1960,14 @@ function App() {
       setPreview(restored.artifacts?.rendered_video?.available ? "rendered" : "source");
       setSelectedCue(null);
       const cuesLoaded = await loadCues(restored.id, generation);
-      setView("process");
+      if (selectedJobIdRef.current !== id || generation !== cueGeneration.current) return;
+      if (viewProgress) {
+        setView("process");
+        setInspectorOpen(true);
+        setMessage("已打开任务进度。");
+        return;
+      }
+      setView(destination);
       const completedStageCount = Object.values(restored.stages ?? {}).filter((stage) => stage.status === "completed").length;
       if (!cuesLoaded) return;
       setMessage(restored.edit_state === "legacy-ambiguous"
@@ -1833,13 +2009,14 @@ function App() {
       setMessage("请先确认拥有处理和转载授权。");
       return;
     }
+    if (!validateTaskFields(true)) return;
     setBatchBusy(true);
     try {
       const result = await api<BatchQueue>("/api/batch/start", {
         method: "POST",
         body: JSON.stringify({
           entries: batchEntries.filter((entry) => entry.selected).map(({ url, title }) => ({ url, title })),
-          authorized, device, compute_type: computeType, options: { ...taskOptions(), dub_enabled: batchDub }, quality_consent: batchQualityConsent,
+          authorized, device, compute_type: computeType, options: { ...taskOptions(true), dub_enabled: batchDub }, quality_consent: batchQualityConsent,
         }),
       });
       setBatchQueue(result.items);
@@ -2448,8 +2625,8 @@ function App() {
       setMessage(error instanceof Error ? error.message : "读取完整日志失败");
     }
   };
-  const taskOptions = () => {
-    const urlSourceActive = job ? Boolean(job.material.source_url) : materialSourceTab === "url";
+  const currentSourceHasUrl = job ? Boolean(job.material.source_url) : materialSourceTab === "url";
+  const taskOptions = (urlSourceActive = currentSourceHasUrl) => {
     const maxSeconds = urlSourceActive && !fullVideo
       ? secondsFromDuration(durationValue, durationUnit)
       : null;
@@ -2464,9 +2641,8 @@ function App() {
       close_after_fill: closeAfterFill,
     };
   };
-  const validateTaskFields = () => {
+  const validateTaskFields = (urlSourceActive = currentSourceHasUrl) => {
     const errors: Record<string, string> = {};
-    const urlSourceActive = job ? Boolean(job.material.source_url) : materialSourceTab === "url";
     if (urlSourceActive && !fullVideo && secondsFromDuration(durationValue, durationUnit) === null) {
       errors.max_seconds = "处理范围须为 1～86400 秒之间的整数。";
     }
@@ -2573,6 +2749,14 @@ function App() {
     localStorage.setItem("ybl-mode", next);
     setMessage(next === "advanced" ? "已切换到高级模式，显示全部参数。" : "已切换到基础模式，仅显示常用参数。");
   };
+  const openAdvancedProcessing = () => {
+    setMode("advanced");
+    setView("process");
+    window.requestAnimationFrame(() => {
+      window.scrollTo(0, 0);
+      document.getElementById("processing-parameters-heading")?.focus({ preventScroll: true });
+    });
+  };
   const dismissTutorial = () => {
     setSessionDismissed(true);
     setDismissedVersion(CURRENT_TUTORIAL_VERSION);
@@ -2638,6 +2822,17 @@ function App() {
       .catch(() => setMessage("未连接本地服务，请启动工作台 EXE。"));
   }, []);
   useEffect(() => {
+    const preventFileNavigation = (event: DragEvent) => {
+      if (event.dataTransfer?.types.includes("Files")) event.preventDefault();
+    };
+    window.addEventListener("dragover", preventFileNavigation);
+    window.addEventListener("drop", preventFileNavigation);
+    return () => {
+      window.removeEventListener("dragover", preventFileNavigation);
+      window.removeEventListener("drop", preventFileNavigation);
+    };
+  }, []);
+  useEffect(() => {
     let inFlight = false;
     const refresh = async (force = false) => {
       if (inFlight || document.visibilityState !== "visible") return;
@@ -2683,8 +2878,14 @@ function App() {
       setPreview("rendered");
       loadCues(job.id);
       loadOutputs().catch(() => undefined);
+    } else if (subtitlesAwaitingReview && job && viewRef.current === "process") {
+      setInspectorOpen(false);
+      setPreview("source");
+      setView("subtitle");
+      void loadCues(job.id);
+      setMessage("字幕已生成，校对后可以生成成片。");
     }
-  }, [running, job?.status]);
+  }, [running, job?.status, subtitlesAwaitingReview]);
   useEffect(() => {
     setShowFullLogs(false);
     setFullLogs([]);
@@ -2733,6 +2934,23 @@ function App() {
     const timer = window.setTimeout(() => void loadJobHistory(), 250);
     return () => window.clearTimeout(timer);
   }, [view, historyScope, options.output_dir, libraryQuery, libraryFilter]);
+  useEffect(() => {
+    if (!online || view !== "material") return;
+    let current = true;
+    let timer: number | undefined;
+    const refresh = async () => {
+      try {
+        const { jobs } = await api<{ jobs: HistoryJob[] }>("/api/history/jobs?limit=3&scope=all");
+        if (!current) return;
+        setRecentJobs(jobs);
+        if (jobs.some((item) => videoLibraryCategory(item, false) === "active")) {
+          timer = window.setTimeout(refresh, 4000);
+        }
+      } catch { /* Retain the last visible tasks. */ }
+    };
+    void refresh();
+    return () => { current = false; window.clearTimeout(timer); };
+  }, [online, view, job?.id, job?.status]);
   useEffect(() => {
     if (view !== "publish" || !publishVideoReady) return;
     const hydrateKey = [
@@ -2818,14 +3036,7 @@ function App() {
       setMetadataState("loading");
       setMetadataNotice("正在读取标题、时长与许可证信息…");
       setMessage("正在读取链接标题与时长…");
-      const value = await api<{
-        title: string | null;
-        duration: number | null;
-        license: string | null;
-        view_count: number | null;
-        max_width: number | null;
-        max_height: number | null;
-      }>("/api/metadata", {
+      const value = await api<MaterialMetadata>("/api/metadata", {
         method: "POST",
         body: JSON.stringify({
           url,
@@ -2840,7 +3051,7 @@ function App() {
       setMetadata(value);
       if (value.title) updateOptions("title", value.title);
       setMetadataState("success");
-      setMetadataNotice("已读取视频信息，标题已自动填入下方字段。");
+      setMetadataNotice("");
       setMessage("已读取视频信息。");
     } catch (error) {
       if (revision !== sourceRevision.current) return;
@@ -2861,6 +3072,7 @@ function App() {
     else sourceRevision.current += 1;
     if (job || selected) setMessage("已切换到新链接草稿；原任务可在任务库重新载入。");
     setMaterialSourceTab("url");
+    setBatchMode(false);
     setMaterialId("");
     setSourceUrl(url);
     setMaterialDraftToken((value) => value + 1);
@@ -2894,9 +3106,9 @@ function App() {
     setBatchEntries((current) => {
       if (current.length === 0) return current;
       if (current.some((row) => row.url === entry.url)) {
-        return current.map((row) => row.url === entry.url ? { ...row, selected: true, title: row.title || entry.title } : row);
+        return current.map((row) => row.url === entry.url ? { ...row, selected: true, title: row.title || entry.title, thumbnail_url: row.thumbnail_url || entry.thumbnail_url } : row);
       }
-      return [...current, { url: entry.url, title: entry.title, duration: entry.duration, selected: true }];
+      return [...current, { url: entry.url, title: entry.title, duration: entry.duration, thumbnail_url: entry.thumbnail_url, selected: true }];
     });
     setMessage("已加入批量链接。");
     window.requestAnimationFrame(() => {
@@ -2909,36 +3121,75 @@ function App() {
       setMessage(error instanceof Error ? error.message : "无法打开原链接");
     });
   };
-  const importVideo = async (file: File) => {
-    if (running) return setMessage("当前阶段运行中，请先取消或等待完成后再切换素材。");
-    if (!authorized) {
-      setMessage("请先勾选上方「我确认拥有处理、转载或发布该视频的授权/许可证」复选框，再导入本地视频。");
-      document.getElementById("rights-check")?.scrollIntoView({ behavior: "smooth", block: "center" });
-      return;
+  const canImportLocalMaterial = () => {
+    if (materialImportRef.current || materialStartRef.current) return false;
+    if (runningRef.current) {
+      setMessage("当前阶段运行中，请先取消或等待完成后再切换素材。");
+      return false;
     }
-    if (!confirmDiscardSubtitles("切换到本地视频")) return;
-    const body = new FormData();
-    body.append("video", file);
-    body.append("authorized", "true");
+    if (!authorized) {
+      setRightsHint(true);
+      setMessage("请先勾选授权确认，再导入本地视频。");
+      document.getElementById("rights-check")?.scrollIntoView({ behavior: "smooth", block: "center" });
+      return false;
+    }
+    return true;
+  };
+  const importLocalMaterial = async (register: () => Promise<MaterialSelection | null>, originalPath: boolean) => {
+    if (!canImportLocalMaterial() || !confirmDiscardSubtitles("切换到本地视频")) return;
+    materialImportRef.current = true;
+    setImportingMaterial(true);
+    const revision = sourceRevision.current;
+    const generation = cueGeneration.current;
+    const importView = viewRef.current;
     try {
-      const material = await api<Material>("/api/materials", {
-        method: "POST",
-        body,
-      });
+      const selection = await register();
+      if (!selection) return;
       await loadMaterials();
+      if (revision !== sourceRevision.current || generation !== cueGeneration.current || importView !== viewRef.current || runningRef.current) return;
       resetForSourceSwitch();
-      setMaterialId(material.id);
+      setMaterialId(selection.material_id);
       setSourceUrl("");
       setMaterialSourceTab("local");
       setMaterialDraftToken((value) => value + 1);
-      updateOptions("title", material.name.replace(/\.[^.]+$/, ""));
-      setMessage(
-        `已导入 ${material.name}（开发模式：此版本会复制到工作区；桌面版直接使用原路径）。`,
-      );
+      updateOptions("title", selection.name.replace(/\.[^.]+$/, ""));
+      setMessage(`已导入 ${selection.name}${originalPath ? "" : "（已复制到本地工作区）"}。`);
     } catch (error) {
-      setMessage(
-        `导入失败：${error instanceof Error ? error.message : "未知错误"}`,
-      );
+      setMessage(`导入本地视频失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      materialImportRef.current = false;
+      setImportingMaterial(false);
+    }
+  };
+  const importVideo = (file: File) => importLocalMaterial(async () => {
+    const body = new FormData();
+    body.append("video", file);
+    body.append("authorized", "true");
+    const material = await api<Material>("/api/materials", { method: "POST", body });
+    return { material_id: material.id, name: material.name };
+  }, false);
+  const dropLocalMaterial = (event: ReactDragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setDraggingMaterial(false);
+    const files = event.dataTransfer.files;
+    if (!files.length) return;
+    if (files.length > 1) {
+      setMessage("本地文件一次导入一个视频，请拖入单个文件。");
+      return;
+    }
+    const file = files[0];
+    const register = window.pywebview?.api?.import_dropped_material;
+    const webview = window.chrome?.webview;
+    const postFiles = webview?.postMessageWithAdditionalObjects;
+    if (register && postFiles) {
+      void importLocalMaterial(() => {
+        postFiles.call(webview, "FilesDropped", [file]);
+        return register();
+      }, true);
+    } else if (window.pywebview) {
+      setMessage("当前无法读取拖入的视频，请点击选择本地视频。");
+    } else {
+      void importVideo(file);
     }
   };
   const importPublishVideo = async (file: File) => {
@@ -2966,8 +3217,10 @@ function App() {
       `状态：${job?.status ?? "-"}（${job?.stage ?? "-"} ${job?.progress ?? 0}%）`,
       `翻译器：${options.translator}${apiKeyConfigured === false ? "（DeepSeek Key 未配置）" : ""}`,
       `Cookies：${cookies}`,
-      `YouTube 浏览器验证：${options.youtube_po_token_mode === "auto" ? "开启" : "关闭"}`,
-      `YouTube 代理：${options.youtube_proxy ? "已配置（地址已隐藏）" : "未配置"}`,
+      ...(showYoutubeBrowserVerification(job?.material?.source_url || sourceUrl)
+        ? [`YouTube 浏览器验证：${options.youtube_po_token_mode === "auto" ? "开启" : "关闭"}`]
+        : []),
+      `获取代理：${options.youtube_proxy ? "已配置（地址已隐藏）" : "未配置"}`,
       `下载画质：${options.download_quality}`,
       `字幕渲染：${options.render_encoder}`,
       `资源模式：${options.resource_profile}`,
@@ -2977,20 +3230,29 @@ function App() {
     ];
     return lines.join("\n");
   };
-  const start = async () => {
+  const start = async (runImmediately = false, outputMode: Options["output_mode"] = "video") => {
     const url = materialSourceTab === "url" ? sourceUrl.trim() : "";
-    if ((materialSourceTab === "url" ? !url : !selected) || running) return;
+    if ((materialSourceTab === "url" ? !url : !selected) || running || materialStartRef.current || materialImportRef.current) return;
     if (dirty && !confirmDiscardSubtitles("开始新任务会清空当前未保存的字幕修改")) return;
-    if (!authorized) return setMessage("开始前请确认拥有处理或转载授权。");
-    if (!validateTaskFields()) return;
-    if (
-      url &&
-      options.download_quality === "original" &&
-      (metadata?.max_height ?? 0) >= 2160 &&
-      !window.confirm(
-        `该素材最高为 ${metadata?.max_width ?? "?"}×${metadata?.max_height ?? "?"}。原始画质会显著增加显存、CPU 和磁盘占用。\n\n建议改为 1080p。仍要继续吗？`,
-      )
-    ) return;
+    if (!authorized) {
+      setRightsHint(true);
+      return setMessage("开始前请确认拥有处理或转载授权。");
+    }
+    if (!validateTaskFields(Boolean(url))) return;
+    const originalQuality = Boolean(url && options.download_quality === "original");
+    const confirmOriginalQuality = (width: number | null | undefined, height: number | null | undefined) => window.confirm(
+      `该素材最高为 ${width ?? "?"}×${height ?? "?"}。原始画质会显著增加显存、CPU 和磁盘占用。\n\n建议改为 1080p。仍要继续吗？`,
+    );
+    const known4k = originalQuality && (metadata?.max_height ?? 0) >= 2160;
+    if (known4k && !confirmOriginalQuality(metadata?.max_width, metadata?.max_height)) return;
+    materialStartRef.current = true;
+    setStartingMaterial(true);
+    let generation = cueGeneration.current;
+    const source = sourceRevision.current;
+    const initialView = view;
+    const stillCurrent = () => generation === cueGeneration.current && source === sourceRevision.current && viewRef.current === initialView;
+    let createdId: string | null = null;
+    let failureLabel = "无法保存任务";
     try {
       const created = await api<Job>("/api/jobs", {
         method: "POST",
@@ -2999,10 +3261,12 @@ function App() {
           authorized,
           device,
           compute_type: computeType,
-          options: taskOptions(),
+          options: { ...taskOptions(Boolean(url)), output_mode: outputMode },
         }),
       });
-      cueGeneration.current += 1;
+      if (!stillCurrent()) return;
+      generation = ++cueGeneration.current;
+      createdId = created.id;
       selectedJobIdRef.current = created.id;
       cueOwner.current = null;
       setCuesReady(false);
@@ -3015,10 +3279,41 @@ function App() {
       setSelectedCue(null);
       setPreview("source");
       setMaterialDraftToken(0);
+      if (!runImmediately) {
+        setView("process");
+        setMessage("任务草稿已保存。请确认处理方案，再运行准备检查。");
+        return;
+      }
+      failureLabel = "准备检查失败";
+      setMessage("正在检查素材与处理环境…");
+      const prepared = await api<Job>(`/api/jobs/${created.id}/prepare`, { method: "POST", body: "{}" });
+      if (!stillCurrent() || selectedJobIdRef.current !== created.id) return;
+      setJob(prepared);
+      const needsQualityConsent = prepared.quality_proposal?.requires_consent && !prepared.quality_consent;
+      if (prepared.status !== "ready" || !checksReady(prepared) || needsQualityConsent) {
+        setView("process");
+        setMessage(needsQualityConsent ? "请确认本次下载画质，再继续处理。" : "请在开始前准备中查看检查结果。");
+        return;
+      }
+      if (originalQuality && !known4k && (prepared.material.height ?? 0) >= 2160 && !confirmOriginalQuality(prepared.material.width, prepared.material.height)) {
+        setView("process");
+        setMessage("任务已保存。可以更改画质后重新检查准备。");
+        return;
+      }
+      failureLabel = "无法开始处理";
+      const started = await api<Job>(`/api/jobs/${created.id}/run-all`, { method: "POST", body: "{}" });
+      if (!stillCurrent() || selectedJobIdRef.current !== created.id) return;
+      setJob(started);
       setView("process");
-      setMessage("任务草稿已保存。请确认处理方案，然后运行开始前准备检查；当前不会下载视频。 ");
+      setInspectorOpen(true);
+      setMessage(outputMode === "subtitles" ? "已开始生成字幕，完成后会进入校对。" : "已开始处理视频，可在任务详情查看进度。");
     } catch (error) {
-      setMessage(`无法启动：${reportApiError(error, "未知错误")}`);
+      if (!stillCurrent()) return;
+      if (createdId) setView("process");
+      setMessage(`${failureLabel}：${reportApiError(error, "未知错误")}`);
+    } finally {
+      materialStartRef.current = false;
+      setStartingMaterial(false);
     }
   };
   const checksReady = (current: Job | null | undefined) =>
@@ -3071,7 +3366,7 @@ function App() {
       const prepared = await api<Job>(`/api/jobs/${job.id}/prepare`, { method: "POST", body: "{}" });
       setJob(prepared);
       const blockers = (prepared.checks ?? []).filter((item) => item.status === "blocking");
-      setMessage(blockers.length ? `准备检查发现 ${blockers.length} 个阻断项，请按清单修正。` : "开始前准备已通过。你可以逐阶段运行，或一键运行到渲染。 ");
+      setMessage(blockers.length ? `准备检查发现 ${blockers.length} 个阻断项，请按清单修正。` : prepared.options.output_mode === "subtitles" ? "准备检查已通过，可以一键生成字幕。" : "准备检查已通过，可以逐阶段运行或一键生成成片。");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "准备检查失败");
     } finally { preparingJobRef.current = false; setPreparingJob(false); }
@@ -3153,6 +3448,7 @@ function App() {
   };
   const runStage = async (stage: WorkflowStageName) => {
     if (!job || running) return;
+    if (stage === "render" && subtitlesAwaitingReview) return openStageResult("translate");
     const saved = await saveWorkflowOptions();
     if (!saved) return;
     if (!checksReady(saved)) {
@@ -3177,6 +3473,7 @@ function App() {
   };
   const runAll = async () => {
     if (!job || running) return;
+    if (subtitlesAwaitingReview) return openStageResult("translate");
     const saved = await saveWorkflowOptions();
     if (!saved) {
       return;
@@ -3187,7 +3484,9 @@ function App() {
     }
     try {
       const latest = await api<Job>(`/api/jobs/${saved.id}/run-all`, { method: "POST", body: "{}" });
-      setJob(latest); setInspectorOpen(true); setMessage("已按同一套阶段顺序运行；任一步失败都会停在该检查点。 ");
+      setJob(latest);
+      setInspectorOpen(true);
+      setMessage(latest.options.output_mode === "subtitles" ? "正在生成字幕，完成后可校对。" : "正在按阶段生成成片。遇到问题可从检查点继续。");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "无法运行全部阶段");
     }
@@ -3206,8 +3505,10 @@ function App() {
     } catch (error) { setMessage(error instanceof Error ? error.message : "无法恢复任务"); }
   };
   const topAction = () => {
+    if (materialStartRef.current || materialImportRef.current) return;
     if (running) return void cancel();
     if (!job) return void start();
+    if (subtitlesAwaitingReview) return openStageResult("translate");
     if (job.status === "completed" && !job.next_stage) return setView("subtitle");
     if (!job.checks?.length || (job.checks ?? []).some((item) => item.status === "blocking")) return void prepareJob();
     if (job.can_resume) return void resumeJob();
@@ -3215,7 +3516,7 @@ function App() {
     if (job.next_stage) return void runStage(job.next_stage);
     setView("subtitle");
   };
-  const topActionLabel = preparingJob ? "正在检查准备…" : job?.status === "completed" && !job.next_stage
+  const topActionLabel = preparingJob ? "正在检查准备…" : subtitlesAwaitingReview ? "校对字幕" : job?.status === "completed" && !job.next_stage
     ? "查看字幕成片" : job?.next_stage === "publish" && !running && job.checks?.length && !(job.checks ?? []).some((item) => item.status === "blocking")
     ? "查看投稿辅助" : workflowPrimaryLabel({
     running, hasJob: Boolean(job), hasChecks: Boolean(job?.checks?.length),
@@ -3307,28 +3608,69 @@ function App() {
     }
   };
   const rerender = async () => {
-    if (!job) return;
+    if (!job || running || preparingJobRef.current || subtitleTrialBusyRef.current) return;
     if (dirty) { setMessage("字幕有未保存修改，请先保存后再重新渲染。 "); return; }
+    const finishingSubtitles = job.options.output_mode === "subtitles";
+    preparingJobRef.current = true;
+    setPreparingJob(true);
     try {
-      if (schemeDirty) {
-        const saved = await saveWorkflowOptions();
+      if (schemeDirty || finishingSubtitles || !checksReady(job)) {
+        const saved = await patchJobOptions(finishingSubtitles ? { output_mode: "video" } : {});
         if (!saved) return;
+        if (finishingSubtitles && saved.stages?.translate?.status !== "completed") {
+          setView("process");
+          setMessage("生成字幕的设置已修改，请先重新生成字幕，再校对和合成。");
+          return;
+        }
         const prepared = await api<Job>(`/api/jobs/${job.id}/prepare`, { method: "POST", body: "{}" });
+        if (jobRef.current?.id !== job.id) return;
         setJob(prepared);
         if ((prepared.checks ?? []).some((item) => item.status === "blocking")) {
           setMessage("渲染前准备检查未通过，请先修正阻断项。 ");
           return;
         }
       }
-      setJob(
-        await api<Job>(`/api/jobs/${job.id}/rerender`, {
-          method: "POST",
-          body: JSON.stringify({ dirty }),
-        }),
-      );
-      setMessage("正在按当前字幕样式重新渲染。 ");
+      const started = await api<Job>(`/api/jobs/${job.id}/rerender`, { method: "POST", body: JSON.stringify({ dirty }) });
+      if (jobRef.current?.id !== job.id) return;
+      setJob(started);
+      setMessage(finishingSubtitles ? "正在用已校对的字幕生成成片。" : "正在按当前字幕样式重新渲染。");
     } catch (error) {
-      setMessage(String(error));
+      if (jobRef.current?.id === job.id) setMessage(reportApiError(error, "渲染未能开始"));
+    } finally {
+      preparingJobRef.current = false;
+      setPreparingJob(false);
+    }
+  };
+  const subtitleTrialStyle: SubtitleStyleOptions & { smart_subtitle_layout: boolean } = {
+    font_name: options.font_name, font_size: options.font_size,
+    subtitle_display_mode: options.subtitle_display_mode, subtitle_preset: options.subtitle_preset,
+    subtitle_color: options.subtitle_color, subtitle_outline_color: options.subtitle_outline_color,
+    subtitle_effect: options.subtitle_effect, subtitle_margin_ratio: options.subtitle_margin_ratio,
+    subtitle_placement: options.subtitle_placement, smart_subtitle_layout: options.smart_subtitle_layout,
+  };
+  const subtitleTrialStyleKey = JSON.stringify(subtitleTrialStyle);
+  const trySubtitleRender = async () => {
+    if (!job || running || preparingJobRef.current || dirty || subtitleTrialBusyRef.current) return;
+    const jobId = job.id;
+    const generation = cueGeneration.current;
+    const currentTime = video.current?.currentTime ?? 0;
+    video.current?.pause();
+    subtitleTrialBusyRef.current = true;
+    setSubtitleTrialBusy(true);
+    setSubtitleTrial(null);
+    try {
+      const clip = await api<{ token: string; start: number; end: number }>(`/api/jobs/${encodeURIComponent(jobId)}/subtitle-preview`, {
+        method: "POST",
+        body: JSON.stringify({ start: currentTime, style: subtitleTrialStyle }),
+      });
+      if (cueGeneration.current !== generation || jobRef.current?.id !== jobId || viewRef.current !== "subtitle") return;
+      setSubtitleTrial({ ...clip, jobId, styleKey: subtitleTrialStyleKey, revision: job.artifact_revision });
+      window.requestAnimationFrame(() => document.getElementById("subtitle-trial-preview")?.scrollIntoView({ behavior: "smooth", block: "nearest" }));
+    } catch (error) {
+      if (cueGeneration.current === generation && jobRef.current?.id === jobId) setMessage(reportApiError(error, "试渲染失败"));
+    } finally {
+      subtitleTrialBusyRef.current = false;
+      setSubtitleTrialBusy(false);
     }
   };
   const addCutRange = () => {
@@ -4210,33 +4552,12 @@ function App() {
     return () => window.clearInterval(timer);
   }, [siteBusy]);
   const chooseNativeMaterial = async () => {
-    if (running) return setMessage("当前阶段运行中，请先取消或等待完成后再切换素材。");
-    if (!authorized) {
-      setRightsHint(true);
-      setMessage("请先勾选下方「我确认拥有处理、转载或发布该视频的授权/许可证」复选框，再导入本地视频。");
-      document.getElementById("rights-check")?.scrollIntoView({ behavior: "smooth", block: "center" });
-      return;
-    }
     const bridge = window.pywebview?.api;
     if (!bridge || typeof bridge.choose_material_video !== "function") {
-      fileInput.current?.click();
+      if (canImportLocalMaterial()) fileInput.current?.click();
       return;
     }
-    try {
-      const selection = await bridge.choose_material_video();
-      if (!selection) return;
-      if (!confirmDiscardSubtitles("切换到本地视频")) return;
-      await loadMaterials();
-      resetForSourceSwitch();
-      setMaterialId(selection.material_id);
-      setSourceUrl("");
-      setMaterialSourceTab("local");
-      setMaterialDraftToken((value) => value + 1);
-      updateOptions("title", selection.name.replace(/\.[^.]+$/, ""));
-      setMessage(`已导入本地视频（直接使用原路径，不会复制到工作区）：${selection.name}。`);
-    } catch (error) {
-      setMessage(`导入本地视频失败：${error instanceof Error ? error.message : String(error)}`);
-    }
+    await importLocalMaterial(() => bridge.choose_material_video(), true);
   };
   const chooseNativePublishVideo = async () => {
     const bridge = window.pywebview?.api;
@@ -4258,8 +4579,9 @@ function App() {
 
   const weeklyFailures = weekly?.channel_results.filter((item) => !item.ok) ?? [];
   const canRefreshWeekly = Boolean(weekly?.enabled && weekly.channels.length);
-  const weeklyRankedByViews = weekly?.sort_mode === "views";
-  const weeklyTitle = weeklyRankedByViews || !weekly?.videos.length ? "本周热片" : "本周新片";
+  const weeklySortMode: WeeklySortMode = weekly?.sort_mode ?? "views";
+  const weeklyRankedByViews = weeklySortMode === "views";
+  const weeklyTitle = !weekly?.videos.length ? "本周热片" : weeklyRankedByViews ? "本周热片" : "本周新片";
   const weeklyWindow = weekly?.window_days ?? 7;
   const weeklyBusyLabel = weekly?.channel_progress ? `正在刷新 ${weekly.channel_progress.done}/${weekly.channel_progress.total}` : "正在刷新…";
   const weeklySummary = !weekly
@@ -4284,7 +4606,7 @@ function App() {
       : "按本周播放量搜索";
   const weeklyHasChannels = Boolean(weekly?.enabled && weekly.channels.length > 0);
   const siteVideos = (site && site.category === siteCategory ? site.videos : []).filter((entry) => siteDurationMatches(entry.duration, siteDurationBand));
-  const siteRegions = site?.regions ?? [{ id: "US", label: "美国" }, { id: "GB", label: "英国" }, { id: "", label: "不限" }];
+  const siteRegions = SITE_REGIONS;
   const siteFailedQueries = (site?.query_errors ?? []).map((item) => item.split(":")[0]).filter(Boolean);
   const siteReady = Boolean(site && site.category === siteCategory);
   const weeklyNumber = (key: "window_days" | "top_k" | "fetch_count" | "cache_ttl_hours", label: string, min: number, max: number) => (
@@ -4308,8 +4630,9 @@ function App() {
     </label>
   );
   const hotVideoRow = (entry: WeeklyHotVideo, when: string | null, showViews: boolean, row?: { rank?: number; showStatLabels?: boolean }) => {
-    const filled = !batchMode && sourceUrl === entry.url;
-    const queued = batchMode && batchHasUrl(entry.url);
+    const addingToBatch = materialSourceTab === "url" && batchMode;
+    const filled = materialSourceTab === "url" && !addingToBatch && sourceUrl === entry.url;
+    const queued = addingToBatch && batchHasUrl(entry.url);
     const showStatLabels = row?.showStatLabels === true;
     const showRankColumn = row !== undefined && "rank" in row;
     return (
@@ -4349,13 +4672,13 @@ function App() {
         </div>
         <div className="video-library-actions">
           <button type="button" className="small open-original" onMouseDown={(event) => event.preventDefault()} onClick={() => openOriginalVideo(entry.url)}>原链接</button>
-          <button type="button" className="small use-video" onMouseDown={(event) => event.preventDefault()} onClick={() => batchMode ? addHotToBatch(entry) : fillSourceFromHot(entry.url)} disabled={running || batchBusy || filled || queued}>{batchMode ? (queued ? "已加入" : "加入批量") : (filled ? "已填入" : "用这条")}</button>
+          <button type="button" className="small use-video" onMouseDown={(event) => event.preventDefault()} onClick={() => addingToBatch ? addHotToBatch(entry) : fillSourceFromHot(entry.url)} disabled={running || startingMaterial || batchBusy || filled || queued}>{addingToBatch ? (queued ? "已加入" : "加入批量") : (filled ? "已填入" : "用这条")}</button>
         </div>
       </div>
     );
   };
   const weeklyHotCard = (
-    <details className={`workspace-card weekly-hot-card${weekly?.show_thumbnails === false ? " no-thumbs" : ""}`}>
+    <details ref={discoveryPanelRef} className={`workspace-card weekly-hot-card${weekly?.show_thumbnails === false ? " no-thumbs" : ""}`}>
       <summary>
         <b>{hotTab === "channels" ? weeklyTitle : "本周热片"}</b>
         <span>{hotTab === "site" ? siteSummary : weeklySummary}</span>
@@ -4373,17 +4696,6 @@ function App() {
               <button type="button" onClick={() => void refreshSite()} disabled={siteBusy} aria-busy={siteBusy}>
                 {siteBusy ? siteBusyLabel : "刷新"}
               </button>
-              <label className="weekly-hot-region">
-                搜索地区
-                <select
-                  aria-label="搜索地区"
-                  value={site?.region ?? "US"}
-                  disabled={siteBusy || !site}
-                  onChange={(event) => void saveSiteRegion(event.target.value)}
-                >
-                  {siteRegions.map((item) => <option key={item.id || "any"} value={item.id}>{item.label}</option>)}
-                </select>
-              </label>
               {siteReady && site?.refreshed_at && <small>上次获取 {new Date(site.refreshed_at).toLocaleString()}</small>}
               {!weeklyHasChannels && (
                 <button type="button" className="weekly-hot-quiet" onClick={() => setHotTab("channels")}>关注频道</button>
@@ -4391,6 +4703,10 @@ function App() {
             </div>
           ) : weeklyHasChannels ? (
             <div className="weekly-hot-tools">
+              <div className="weekly-hot-tabs" role="tablist" aria-label="排序">
+                <button type="button" className={weeklySortMode === "views" ? "selected" : ""} aria-selected={weeklySortMode === "views"} disabled={channelSaving || weeklyBusy} onClick={() => void setWeeklySortMode("views")}>热</button>
+                <button type="button" className={weeklySortMode === "recent" ? "selected" : ""} aria-selected={weeklySortMode === "recent"} disabled={channelSaving || weeklyBusy} onClick={() => void setWeeklySortMode("recent")}>新</button>
+              </div>
               <button type="button" onClick={() => void refreshWeekly()} disabled={!canRefreshWeekly || weeklyBusy} aria-busy={weeklyBusy}>
                 {weeklyBusy ? weeklyBusyLabel : weeklyFailures.length ? "全部重试" : "刷新"}
               </button>
@@ -4411,6 +4727,13 @@ function App() {
                 </button>
               ))}
             </div>
+            <div className="weekly-hot-cats" role="tablist" aria-label="搜索地区">
+              {siteRegions.map((item) => (
+                <button type="button" key={item.id || "any"} className={item.id === (site?.region ?? "US") ? "selected" : ""} aria-selected={item.id === (site?.region ?? "US")} disabled={!site} onClick={() => void saveSiteRegion(item.id)}>
+                  {item.label}
+                </button>
+              ))}
+            </div>
             <div className="weekly-hot-cats weekly-hot-bands" role="tablist" aria-label="时长">
               {SITE_DURATION_BANDS.map((item) => (
                 <button type="button" key={item.id} className={item.id === siteDurationBand ? "selected" : ""} aria-selected={item.id === siteDurationBand} onClick={() => setSiteDurationBand(item.id)}>
@@ -4424,9 +4747,6 @@ function App() {
             {!site && <div className="empty-editor"><b>正在读取热片</b><span>稍候即可查看近一周播放量较高的视频。</span></div>}
             {siteError && <p className="metadata-notice error" role="status">{siteError}</p>}
             {siteReady && site?.error && <p className="metadata-notice error" role="status">{site.error}</p>}
-            {siteReady && site?.refreshed_at && site.cached_region !== site.region && !siteBusy && (
-              <p className="metadata-notice warning" role="status">地区已改，下面暂时仍是上次的列表。</p>
-            )}
             {siteReady && siteFailedQueries.length > 0 && !site?.error && (
               <p className="metadata-notice warning" role="status">部分搜索词没有拉到：{siteFailedQueries.join("、")}。下面是这次拿到的结果。</p>
             )}
@@ -4496,11 +4816,24 @@ function App() {
                 <span>每个频道读取最近约 {weekly?.fetch_count ?? 20} 条，只保留 {weeklyWindow} 天内、能读到上传时间的视频。</span>
               </div>
             )}
-            {weekly?.videos.map((entry, index) => hotVideoRow(entry, formatUploadDay(entry.upload_date), weeklyRankedByViews, { showStatLabels: index === 0 }))}
+            {weekly && weekly.videos.length > 0 && (
+              <div className="weekly-hot-list">
+                {weeklyRankedByViews
+                  ? weekly.videos.map((entry, index) => hotVideoRow(entry, formatUploadDay(entry.upload_date), true, { rank: index + 1, showStatLabels: index === 0 }))
+                  : weekly.videos.flatMap((entry, index) => {
+                      const bucket = weeklyRecencyBucket(entry.timestamp);
+                      const prev = index > 0 ? weeklyRecencyBucket(weekly.videos[index - 1].timestamp) : null;
+                      const row = hotVideoRow(entry, formatUploadDay(entry.upload_date), true, { showStatLabels: index === 0 });
+                      return bucket === prev
+                        ? [row]
+                        : [<p className="weekly-hot-section" key={`sec-${bucket}-${entry.url}`}>{WEEKLY_SECTION_LABEL[bucket]}</p>, row];
+                    })}
+              </div>
+            )}
             {weekly?.enabled && weekly.channels.length > 0 && (
               <p className="weekly-hot-note">{weeklyRankedByViews
-                ? "按播放量从高到低，播放量相同则较新的在前。数字来自频道页，没有逐条再打开视频。"
-                : "按上传时间从新到旧。播放量缺失时用这个顺序，也不逐条重抓。日期来自频道页的近似时间，可能有几小时偏差；太旧或没有日期的不会列入。"}</p>
+                ? "热：按播放量从高到低，缺播放量的排后面。数字来自频道页，不逐条重抓。"
+                : "新：按上传时间从新到旧，并用今天 / 昨天 / 更早分区。窗口和日期都按上海时间，来自频道页近似时间。"}</p>
             )}
           </>
         )}
@@ -4511,56 +4844,46 @@ function App() {
   const whisperReady = dependencies.some((item) => item.id === "whisper-small" && item.available);
   const setupTranslationReady = apiKeyConfigured === true || openaiKeyConfigured === true || options.translator === "ollama";
   const setupOpen = !setupLoading && !setupDismissed && dependencies.length > 0 && apiKeyConfigured !== null && openaiKeyConfigured !== null && (!ffmpegReady || !whisperReady || !setupTranslationReady);
+  const materialBatch = materialSourceTab === "url" && batchMode;
+  const jobMatchesMaterial = Boolean(job && (materialSourceTab === "url"
+    ? job.material.source_url && sourceUrl.trim() === job.material.source_url
+    : materialId && materialId === job.material.id));
+  const materialJob = jobMatchesMaterial ? job : null;
+  const taskSourcePreview = materialJob?.artifacts?.raw_video?.available
+    ? `/api/jobs/${encodeURIComponent(materialJob.id)}/media/source` : "";
+  const localPreview = selected ?? (taskSourcePreview ? materialJob?.material : undefined);
+  const sourceThumbnail = metadata?.thumbnail_url || (materialJob?.artifacts?.thumbnail_path?.available
+    ? `/api/jobs/${encodeURIComponent(materialJob.id)}/thumbnail` : "");
+  const sourceTitle = options.title || metadata?.title || materialJob?.material.name || "已读取视频";
+  const sourceDuration = metadata?.duration ?? materialJob?.material.duration_seconds;
+  const sourceWidth = metadata?.max_width ?? materialJob?.material.width;
+  const sourceHeight = metadata?.max_height ?? materialJob?.material.height;
+  const materialMode = materialSourceTab === "local" ? "local" : batchMode ? "batch" : "single";
+  const chooseMaterialMode = (next: "single" | "batch" | "local") => {
+    setMaterialSourceTab(next === "local" ? "local" : "url");
+    if (next !== "local") setBatchMode(next === "batch");
+  };
+  const subtitleStyleProps = {
+    options,
+    onChange: updateOptionValues,
+    fontError: fieldErrors.font_name,
+    untranslated: options.translator === "none",
+  };
   const materialView = (
-    <section className="workspace-card material-view">
-      <header>
-        <p className="eyebrow">素材来源</p>
-        <h1>添加素材</h1>
-        <p>选择视频链接或本地文件；仅处理你已获授权的内容。</p>
-      </header>
-      {!preferencesLoading && !setupOpen && !tutorialDismissed && (
-        <div className="welcome-banner tutorial-welcome">
-          <div>
-            <b>第一次使用？先看新手教程</b>
-            <span>用几分钟了解素材、依赖、字幕校对、渲染和投稿辅助。教程不会启动任务或下载。</span>
+    <div className="material-editor">
+      <h1 className="material-page-title">{job ? "素材与方案" : "新建任务"}</h1>
+      <fieldset className="material-editor-fields" disabled={startingMaterial || importingMaterial}>
+      <section className="workspace-card material-input-card" aria-label="添加素材">
+        <header className="material-card-heading">
+          <h2><NavIcon name="video" className="app-icon" />添加素材</h2>
+          <div className="material-source-switch" role="group" aria-label="素材来源">
+            {([ ["single", "单条链接"], ["batch", "批量"], ["local", "本地文件"] ] as const).map(([id, label]) => (
+              <button key={id} type="button" className={materialMode === id ? "selected" : ""} aria-pressed={materialMode === id} disabled={running || batchBusy} onClick={() => chooseMaterialMode(id)}>{label}</button>
+            ))}
           </div>
-          <button className="primary small" onClick={() => { dismissTutorial(); openTutorial(); }}>开始教程</button>
-          <button className="secondary small" onClick={dismissTutorial}>以后再看</button>
-        </div>
-      )}
-      {!setupOpen && apiKeyConfigured === false && options.translator === "deepseek" && (
-        <div className="welcome-banner">
-          <div>
-            <b>首次使用提示</b>
-            <span>
-              当前翻译器是 DeepSeek，但 API Key 还未配置。请先到「设置」填入 Key；也可以在「处理」页把翻译器改为「不翻译」；或者先用「演示视频」体验完整流程（不需要 Key）。
-            </span>
-          </div>
-          <button className="primary small" onClick={() => setSettingsOpen(true)}>
-            去设置
-          </button>
-          <button className="secondary small" onClick={() => void previewAuthorizedDemo()}>
-            直接预览演示结果
-          </button>
-        </div>
-      )}
-      {!setupOpen && diagnostics.some((check) => check.required && !check.available) && (
-        <section className="diagnostics-banner" aria-label="首次使用依赖检查">
-          <div>
-            <b>开始前还需安装 {diagnostics.filter((check) => check.required && !check.available).map((check) => check.label).join("、")}</b>
-            <span>这里只列出默认流程的必需组件；Tesseract 等 OCR 组件按所选模式检查。</span>
-          </div>
-          <button className="text-button" onClick={() => setDependenciesOpen(true)}>打开依赖中心</button>
-        </section>
-      )}
-      <div className="source-tabs" role="tablist" aria-label="素材来源">
-        <button type="button" role="tab" aria-selected={materialSourceTab === "url"} aria-controls="material-url-panel" className={materialSourceTab === "url" ? "selected" : ""} onClick={() => setMaterialSourceTab("url")}>视频链接</button>
-        <button type="button" role="tab" aria-selected={materialSourceTab === "local"} aria-controls="material-local-panel" className={materialSourceTab === "local" ? "selected" : ""} onClick={() => setMaterialSourceTab("local")}>本地文件</button>
-      </div>
+        </header>
       <div className="import-methods">
-        {materialSourceTab === "url" && <section className="material-source material-url" id="material-url-panel" role="tabpanel" aria-label="视频链接导入">
-          <p className="source-intro">粘贴 YouTube 或 B 站地址，读取标题与时长后再确认处理范围。</p>
-      <label className="check"><input type="checkbox" checked={batchMode} disabled={running} onChange={(event) => setBatchMode(event.target.checked)} />批量（每行一个链接，或粘贴播放列表链接）</label>
+        {materialSourceTab === "url" && <section className="material-source material-url" aria-label="视频链接导入">
       {!batchMode && (
       <div className="form-grid two">
         <label>
@@ -4569,7 +4892,7 @@ function App() {
             id="source-url"
             value={sourceUrl}
             maxLength={2048}
-            placeholder="粘贴 YouTube / B 站视频链接"
+            placeholder="粘贴视频或帖子链接"
             onChange={(event) => {
               if (job && !window.confirm(`修改素材链接会离开当前任务；原任务可在任务库重新载入。${dirty ? "当前未保存的字幕修改会丢失。" : ""}\n\n确定继续吗？`)) return;
               if (job || selected) resetForSourceSwitch();
@@ -4592,12 +4915,12 @@ function App() {
         <div className="inline-actions">
           <button
             onClick={() => void readMetadata()}
-            disabled={running || metadataState === "loading"}
+            disabled={running || !sourceUrl.trim() || metadataState === "loading"}
             aria-busy={metadataState === "loading"}
           >
             {metadataState === "loading" && <ActivityBars />}
             {metadataState !== "loading" && <NavIcon name="link" className="app-icon" />}
-            {metadataState === "loading" ? "正在读取…" : "读取标题与时长"}
+            {metadataState === "loading" ? "正在读取…" : "读取视频信息"}
           </button>
         </div>
       </div>
@@ -4606,10 +4929,13 @@ function App() {
         <div className="form-grid">
           <label>
             视频链接（每行一个）
-            <textarea id="batch-urls" value={batchText} rows={5} maxLength={20000} placeholder="每行一个 YouTube / B 站链接，或一个播放列表链接。热片里可点「加入批量」。" onChange={(event) => setBatchText(event.target.value)} />
+            <textarea id="batch-urls" value={batchText} rows={5} maxLength={20000} placeholder="每行一个视频或帖子链接，或一个播放列表链接。热片里可点「加入批量」。" disabled={batchBusy || running} onChange={(event) => {
+              setBatchText(event.target.value);
+              setBatchEntries([]);
+            }} />
           </label>
           <div className="inline-actions">
-            <button onClick={() => void parseBatch()} disabled={batchBusy || !batchText.trim()} aria-busy={batchBusy}>
+            <button onClick={() => void parseBatch()} disabled={batchBusy || running || !batchText.trim()} aria-busy={batchBusy}>
               {batchBusy ? <ActivityBars /> : <NavIcon name="link" className="app-icon" />}
               {batchBusy ? "正在解析…" : "解析"}
             </button>
@@ -4621,35 +4947,30 @@ function App() {
               </div>
               {batchEntries.map((entry, index) => (
                 <label className={`video-library-row ${entry.error ? "attention" : ""}`} key={`${entry.url}-${index}`}>
-                  <input type="checkbox" checked={entry.selected} disabled={!!entry.error} onChange={(event) => setBatchEntries((current) => current.map((row, i) => i === index ? { ...row, selected: event.target.checked } : row))} />
+                  <input type="checkbox" checked={entry.selected} disabled={batchBusy || running || !!entry.error} onChange={(event) => setBatchEntries((current) => current.map((row, i) => i === index ? { ...row, selected: event.target.checked } : row))} />
+                  <span className="material-side-cover" aria-hidden="true">
+                    {entry.thumbnail_url ? <WeeklyThumb key={entry.thumbnail_url} src={entry.thumbnail_url} lazy /> : <NavIcon name="video" className="app-icon" />}
+                  </span>
                   <div className="video-library-main">
                     <div className="video-library-title"><b title={entry.url}>{entry.title || entry.url}</b></div>
                     <div className="video-library-meta">
                       {entry.error ? <><span className="library-status attention">解析失败</span><span>{entry.error}</span></> : entry.duration ? <span>时长 {Math.round(entry.duration)} 秒</span> : null}
                     </div>
                   </div>
-                  <span />
                 </label>
               ))}
               <div className="batch-parse-foot">
                 <label className="check">
-                  <input type="checkbox" checked={batchQualityConsent} onChange={(event) => setBatchQualityConsent(event.target.checked)} />
+                  <input type="checkbox" checked={batchQualityConsent} disabled={batchBusy || running} onChange={(event) => setBatchQualityConsent(event.target.checked)} />
                   可用画质低于所选上限时，按可用画质继续（整批共用）
                 </label>
-                {voxcpm.voxcpm_available && (
-                  <label className="check">
-                    <input type="checkbox" checked={batchDub} onChange={(event) => setBatchDub(event.target.checked)} />
-                    同时生成配音版（整批共用）
-                  </label>
-                )}
-                <button className="primary" onClick={() => void startBatch()} disabled={batchBusy || !batchEntries.some((entry) => entry.selected)}>加入批量并开始</button>
               </div>
             </div>
           )}
-          {batchEntries.length > 0 && <small className="check-hint">批量沿用当前处理设置；只处理到压制字幕，不会自动投稿。</small>}
+          {batchEntries.length > 0 && <small className="check-hint">批量沿用当前处理设置，只处理到压制字幕，不会自动投稿。画质上限会用于选流；X、Reddit、Bluesky 没有平台字幕时自动转写。</small>}
         </div>
       )}
-      {metadataState !== "idle" && (
+      {!batchMode && metadataNotice && metadataState !== "idle" && (
         <div className="metadata-notice-wrap">
           {metadataState === "error" && /ERROR:|WinError|Traceback|OSError|HTTP Error|FileNotFoundError/i.test(metadataNotice)
             ? <TaskErrorSummary message={metadataNotice} fallbackTitle="视频信息读取失败" fallbackHint="请检查链接或访问设置，再重新读取。" />
@@ -4661,21 +4982,18 @@ function App() {
           )}
         </div>
       )}
-      {metadata && (
-        <div className="metadata">
-          <span>
-            {metadata.duration
-              ? `${metadata.duration.toFixed(1)} 秒`
-              : "时长未知"}
-          </span>
-          <span>{metadata.license || "许可证待确认"}</span>
-          <span>{metadata.view_count?.toLocaleString() || "—"} 播放</span>
-          <span>
-            {metadata.max_width && metadata.max_height
-              ? `最高 ${metadata.max_width} × ${metadata.max_height}`
-              : "分辨率未知"}
-          </span>
-        </div>
+      {!batchMode && (metadata || taskSourcePreview || sourceThumbnail) && (
+        <article className="material-preview-row">
+          <div className="material-preview-frame">
+            {taskSourcePreview ? <video key={taskSourcePreview} src={taskSourcePreview} controls preload="metadata" playsInline aria-label="源视频预览" />
+              : sourceThumbnail ? <WeeklyThumb key={sourceThumbnail} src={sourceThumbnail} /> : <NavIcon name="video" className="app-icon" />}
+          </div>
+          <div className="material-preview-copy">
+            <strong title={sourceTitle}>{sourceTitle}</strong>
+            <p>{[pageHost(sourceUrl), sourceDuration == null ? "时长未知" : formatClock(sourceDuration), sourceWidth && sourceHeight ? `${sourceWidth} × ${sourceHeight}` : null, metadata?.view_count == null ? null : `${metadata.view_count.toLocaleString()} 次播放`].filter(Boolean).join(" · ")}</p>
+            {metadata && <small>{metadata.license || "许可证待确认"}</small>}
+          </div>
+        </article>
       )}
       {metadata && options.download_quality === "original" && (metadata.max_height ?? 0) >= 2160 && (
         <p className="metadata-notice warning">
@@ -4693,76 +5011,112 @@ function App() {
           <button className="primary small" onClick={() => void confirmQualityProposal()} disabled={running || preparingJob}>确认此画质方案</button>
         </div>
       )}
+        <details className="material-source-help">
+          <summary>支持的网站</summary>
+          <p>YouTube、Vimeo、Dailymotion、TikTok、Niconico、Rumble、X、Instagram、Facebook、Reddit、Bluesky 和 Tumblr。</p>
+        </details>
         </section>}
-        {materialSourceTab === "local" && <section className="material-source material-local" id="material-local-panel" role="tabpanel" aria-label="本地视频导入">
-          <p className="source-intro">选择已导入视频，或从电脑中选择新视频。桌面版直接使用原路径。</p>
-      <div className="form-grid two">
-        <label>
-          已导入视频
-          <select
-            value={materialId}
-            onChange={(event) => {
-              if (dirty && !confirmDiscardSubtitles("切换素材会清空当前未保存的字幕修改")) return;
-              resetForSourceSwitch();
-              setMaterialId(event.target.value);
-              setSourceUrl("");
-              updateOptions("title", materials.find((item) => item.id === event.target.value)?.name.replace(/\.[^.]+$/, "") ?? "");
-              setMaterialDraftToken((value) => value + 1);
-              setMessage("已切换本地素材；原任务可在任务库重新载入。");
-            }}
-            disabled={running}
-          >
-            <option value="">未选择视频</option>
-            {job && materialId && !selected && <option value={materialId}>当前历史任务 · {job.material.name}</option>}
-            {materials.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.is_demo ? "演示 · " : "本地 · "}
-                {item.name}
-              </option>
-            ))}
-          </select>
-        </label>
-        <div className="inline-actions">
-          <button onClick={() => void chooseNativeMaterial()} disabled={running}>
-            选择本地视频
+        {materialSourceTab === "local" && <section className="material-source material-local" aria-label="本地视频导入">
+          <div className="material-local-layout">
+            <div
+              className={`material-preview-frame material-local-stage${draggingMaterial ? " drag-active" : ""}`}
+              aria-busy={importingMaterial}
+              onDragOver={(event) => {
+                if (!event.dataTransfer.types.includes("Files")) return;
+                event.preventDefault();
+                if (running || materialStartRef.current || materialImportRef.current) {
+                  event.dataTransfer.dropEffect = "none";
+                  return;
+                }
+                event.dataTransfer.dropEffect = "copy";
+                setDraggingMaterial(true);
+              }}
+              onDragLeave={(event) => {
+                if (!(event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget))) setDraggingMaterial(false);
+              }}
+              onDrop={dropLocalMaterial}
+            >
+              {localPreview ? <>
+                <video key={taskSourcePreview || localPreview.id} src={taskSourcePreview || `/api/materials/${encodeURIComponent(localPreview.id)}/media`} controls preload="metadata" playsInline aria-label="本地视频预览" />
+                {(draggingMaterial || importingMaterial) && <span className="material-drop-overlay" role="status">
+                  {importingMaterial ? "正在导入…" : "松开即可更换视频"}
+                </span>}
+              </> : (
+                <button className="material-drop-zone" type="button" onClick={() => void chooseNativeMaterial()} disabled={running}>
+                  <NavIcon name="upload" className="app-icon" />
+                  <b>{importingMaterial ? "正在导入…" : draggingMaterial ? "松开即可导入" : "将视频拖到这里"}</b>
+                  {!importingMaterial && !draggingMaterial && <small>或点击选择文件</small>}
+                </button>
+              )}
+            </div>
+            <div className="form-grid material-local-controls">
+              <label>
+                已导入视频
+                <select
+                  value={materialId}
+                  title={localPreview?.name}
+                  onChange={(event) => {
+                    if (dirty && !confirmDiscardSubtitles("切换素材会清空当前未保存的字幕修改")) return;
+                    resetForSourceSwitch();
+                    setMaterialId(event.target.value);
+                    setSourceUrl("");
+                    updateOptions("title", materials.find((item) => item.id === event.target.value)?.name.replace(/\.[^.]+$/, "") ?? "");
+                    setMaterialDraftToken((value) => value + 1);
+                    setMessage("已切换本地素材；原任务可在任务库重新载入。");
+                  }}
+                  disabled={running}
+                >
+                  <option value="">未选择视频</option>
+                  {job && materialId && !selected && <option value={materialId}>当前历史任务 · {job.material.name}</option>}
+                  {materials.map((item) => (
+                    <option key={item.id} value={item.id}>{item.is_demo ? "演示 · " : "本地 · "}{item.name}</option>
+                  ))}
+                </select>
+              </label>
+              {localPreview && (localPreview.duration_seconds != null || (localPreview.width && localPreview.height)) && (
+                <dl className="material-local-facts">
+                  {localPreview.duration_seconds != null && <div><dt>时长</dt><dd>{formatClock(localPreview.duration_seconds)}</dd></div>}
+                  {localPreview.width && localPreview.height && <div><dt>分辨率</dt><dd>{localPreview.width} × {localPreview.height}</dd></div>}
+                </dl>
+              )}
+              {localPreview && <div className="inline-actions material-local-replace">
+                <button type="button" onClick={() => void chooseNativeMaterial()} disabled={running}><NavIcon name="upload" className="app-icon" />更换视频</button>
+                <small>也可拖到预览区</small>
+              </div>}
+              {!authorized && <p className="material-hint">导入前请先勾选下方授权确认。</p>}
+              <p className="material-hint">桌面版直接读取原文件。处理期间请保留原文件位置。</p>
+            </div>
+          </div>
+        </section>}
+      </div>
+      </section>
+      <section className="workspace-card material-plan" aria-label="处理方案">
+        <header className="material-card-heading">
+          <h2><NavIcon name="process" className="app-icon" />处理方案</h2>
+          <button className="material-advanced-entry" type="button" onClick={openAdvancedProcessing}>
+            <span className="material-entry-copy"><strong>更多参数</strong><small>识别模型、运行设备、编码和输出目录</small></span>
+            <span className="material-entry-arrow" aria-hidden="true">›</span>
           </button>
-          {!authorized && (
-            <span className="rights-hint">导入前需先勾选下方授权确认</span>
-          )}
-        </div>
-      </div>
-      <p className="material-hint">
-        桌面版直接使用本地视频原路径，不占用双倍磁盘；处理期间请勿移动或删除原文件。
-      </p>
-        </section>}
-      </div>
-      <div className="material-detail-heading"><b>处理设置与授权</b><span>先确认这一步，再进入处理方案</span></div>
-      <div className={`form-grid three material-settings ${materialSourceTab === "local" ? "local-settings" : ""}`}>
-        <label>
-          标题
-          <input
-            value={options.title}
-            maxLength={200}
-            onChange={(event) => updateOptions("title", event.target.value)}
-          />
-          {fieldErrors.title && <small className="field-error">{fieldErrors.title}</small>}
-        </label>
+        </header>
+      <fieldset className="form-grid material-options" disabled={running || batchBusy}>
         {materialSourceTab === "url" && <fieldset className="material-range">
-          <legend>处理范围</legend>
-          <label className="check"><input type="radio" name="material-range" checked={fullVideo} onChange={() => setFullVideo(true)} />完整视频</label>
-          <div className="range-limited">
-            <label className="check"><input type="radio" name="material-range" checked={!fullVideo} onChange={() => setFullVideo(false)} />仅处理前</label>
+          <label>
+            处理范围
+            <select value={fullVideo ? "full" : "clip"} onChange={(event) => setFullVideo(event.target.value === "full")}>
+              <option value="full">完整视频</option>
+              <option value="clip">截取开头</option>
+            </select>
+          </label>
+          {!fullVideo && <div className="range-limited">
             <input aria-label="处理前多少时长" type="number" min={durationUnit === "秒" ? 1 : 1 / 60} max={durationUnit === "小时" ? 24 : durationUnit === "分钟" ? 1440 : 86400} step={durationUnit === "秒" ? 1 : durationUnit === "分钟" ? 1 / 60 : 1 / 3600} value={durationValue} disabled={fullVideo} onChange={(event) => { setDurationValue(event.target.value); setFieldErrors((current) => ({ ...current, max_seconds: "" })); }} />
             <select aria-label="处理范围单位" value={durationUnit} disabled={fullVideo} onChange={(event) => setDurationUnit(event.target.value as "秒" | "分钟" | "小时")}><option>秒</option><option>分钟</option><option>小时</option></select>
-          </div>
-          <small>仅处理开头片段，便于快速测试识别、翻译和字幕效果。</small>
+          </div>}
           {fieldErrors.max_seconds && <small className="field-error">{fieldErrors.max_seconds}</small>}
         </fieldset>}
         {materialSourceTab === "url" && <label>
           下载画质
           <select
             value={options.download_quality}
-            disabled={!sourceUrl.trim() || running}
             onChange={(event) => updateOptions("download_quality", event.target.value as Options["download_quality"])}
           >
             <option value="720p">最高 720p（低负载）</option>
@@ -4770,45 +5124,181 @@ function App() {
             <option value="original">原始画质（最高可用，不静默降档）</option>
           </select>
         </label>}
-        {materialSourceTab === "url" && <label className="check cc-reuse-check">
+        <label>
+          字幕模式
+          <select value={options.subtitle_display_mode} onChange={(event) => updateOptions("subtitle_display_mode", event.target.value)}>
+            <option value="translated">{options.translator === "none" ? "原文字幕" : "译文单语"}</option>
+            <option value="bilingual-source-first">双语 · 原文在上</option>
+            <option value="bilingual-translation-first">双语 · 译文在上</option>
+          </select>
+        </label>
+        <label>
+          字幕来源
+          <select value={options.subtitle_source} onChange={(event) => updateOptions("subtitle_source", event.target.value as Options["subtitle_source"])}>
+            <option value="auto">自动选择</option>
+            <option value="audio">语音识别</option>
+            <option value="ocr">画面 OCR</option>
+            <option value="merged">语音 + 画面 OCR</option>
+          </select>
+        </label>
+        <label>
+          翻译服务
+          <select value={options.translator} onChange={(event) => changeTranslator(event.target.value)}>
+            <option value="deepseek">DeepSeek（在线）</option>
+            <option value="openai">OpenAI 兼容接口</option>
+            <option value="ollama">Ollama（本机）</option>
+            <option value="none">不翻译</option>
+          </select>
+        </label>
+        <label className="material-dub-option">
+          中文配音
+          <span className="material-dub-toggle">
+            <input type="checkbox" role="switch" checked={materialBatch ? batchDub : !!options.dub_enabled} disabled={!voxcpm.voxcpm_available} onChange={(event) => materialBatch ? setBatchDub(event.target.checked) : updateOptions("dub_enabled", event.target.checked)} />
+            {voxcpm.voxcpm_available ? (materialBatch ? batchDub : options.dub_enabled) ? "已开启" : "已关闭" : "模型未就绪"}
+          </span>
+        </label>
+      </fieldset>
+      <details className="material-extra-options material-subtitle-style">
+        <summary className="material-options-entry">
+          <NavIcon name="text" className="app-icon" />
+          <span className="material-entry-copy"><strong>字幕样式与预览</strong><small>自定义字体、字体下载和实时预览</small></span>
+          <span className="material-entry-arrow" aria-hidden="true">›</span>
+        </summary>
+        <fieldset className="material-subtitle-style-fields" disabled={running || batchBusy}>
+          <SubtitleStyleSettings {...subtitleStyleProps} />
+        </fieldset>
+      </details>
+      <details className="material-extra-options">
+        <summary className="material-options-entry">
+          <NavIcon name="text" className="app-icon" />
+          <span className="material-entry-copy"><strong>{materialSourceTab === "url" ? "标题与下载选项" : "任务标题"}</strong><small>{materialSourceTab === "url" ? "修改任务标题、筛选可复用视频" : "修改任务库中显示的标题"}</small></span>
+          <span className="material-entry-arrow" aria-hidden="true">›</span>
+        </summary>
+        <div className="form-grid">
+          <label>
+            标题
+            <input value={options.title} maxLength={200} disabled={running} onChange={(event) => updateOptions("title", event.target.value)} />
+            {fieldErrors.title && <small className="field-error">{fieldErrors.title}</small>}
+          </label>
+          {materialSourceTab === "url" && <small className="check-hint">{downloadQualityHint(sourceUrl, materialBatch)}</small>}
+          {materialSourceTab === "url" && <label className="check cc-reuse-check">
           <input
             type="checkbox"
             checked={options.require_reuse_allowed}
             onChange={(event) => void persistRequireReuseAllowed(event.target.checked)}
-            disabled={!sourceUrl.trim() || running}
+            disabled={(!sourceUrl.trim() && !materialBatch) || running}
           />
           <span>仅接受可复用 CC 视频</span>
           <small className="check-hint">
             {job
-              ? `当前任务：${job.options.require_reuse_allowed ? "仅接受可复用 CC 视频" : "未启用 CC 限制"}`
-              : "大多数视频无此标记，勾选后可能无法下载"}
-            {job && job.options.require_reuse_allowed !== options.require_reuse_allowed ? "（正在同步到任务）" : ""}
+              ? reuseHint(job.material.source_url || sourceUrl, batchMode, job.options.require_reuse_allowed, job.options.require_reuse_allowed !== options.require_reuse_allowed)
+              : "大多数视频无此标记，勾选后可能无法下载。这个开关只认 YouTube 的可转载标记。"}
           </small>
-        </label>}
-      </div>
+          </label>}
+        </div>
+      </details>
+      </section>
+      </fieldset>
+      {!preferencesLoading && !setupOpen && !tutorialDismissed && (
+        <div className="material-next-note"><span>第一次使用</span><button className="text-button" type="button" onClick={() => { dismissTutorial(); openTutorial(); }} disabled={startingMaterial}>查看教程 ›</button><button className="text-button" type="button" onClick={dismissTutorial} disabled={startingMaterial}>以后再看</button></div>
+      )}
+      {!setupOpen && apiKeyConfigured === false && options.translator === "deepseek" && (
+        <div className="material-next-note material-attention-note" role="status"><NavIcon name="error" className="app-icon" /><span>DeepSeek 密钥待配置</span><button className="material-side-action" type="button" onClick={() => setSettingsOpen(true)} disabled={startingMaterial}>打开设置 ›</button></div>
+      )}
+      {!setupOpen && diagnostics.some((check) => check.required && !check.available) && (
+        <div className="material-next-note material-attention-note" role="status"><NavIcon name="error" className="app-icon" /><span>开始前还需安装 {diagnostics.filter((check) => check.required && !check.available).map((check) => check.label).join("、")}</span><button className="material-side-action" type="button" onClick={() => setDependenciesOpen(true)} disabled={startingMaterial}>打开依赖中心 ›</button></div>
+      )}
+      <section className="workspace-card material-action-card" aria-label="任务操作">
+      <div className="material-actions">
       <label className={`rights-row ${rightsHint && !authorized ? "rights-hint-active" : ""}`} id="rights-check">
         <input
           type="checkbox"
           checked={authorized}
+          disabled={startingMaterial}
           onChange={(event) => {
             setAuthorized(event.target.checked);
             if (event.target.checked) setRightsHint(false);
           }}
         />
-        我声明自己拥有处理及发布该视频所需的权利或许可证
-        <small className="check-hint">程序只能记录这项声明，无法代替版权或身份核验。</small>
+        我拥有处理该素材所需的授权
       </label>
-      <div className="card-footer task-tools">
-        <button className="secondary" onClick={() => void previewAuthorizedDemo()}>
-          预览授权演示结果
-        </button>
-        <button onClick={applyRecommended} disabled={running}>推荐设置</button>
-        <button onClick={() => void checkReadiness()} disabled={running}>检查配置</button>
-        {readiness.length > 0 && <span className="readiness-error">{readiness.join("；")}</span>}
-        {!readiness.length && preflightWarnings.length > 0 && <span className="readiness-warning">{preflightWarnings.join("；")}</span>}
-        <button className="primary material-submit" onClick={start} disabled={running || !materialSourceReady}>保存素材并配置方案 →</button>
+        <div className="material-run-actions">
+          {!materialBatch && !running && !jobMatchesMaterial && (
+            <button className="secondary material-subtitles-submit" type="button" onClick={() => void start(true, "subtitles")}
+              disabled={startingMaterial || importingMaterial || preparingJob || metadataState === "loading" || !materialSourceReady}
+              title="先生成字幕，校对后再合成视频">
+              <NavIcon name="text" className="app-icon" />先出字幕
+            </button>
+          )}
+          <button className="primary material-submit" type="button" onClick={() => materialBatch ? void startBatch() : running || jobMatchesMaterial ? topAction() : void start(true)} disabled={startingMaterial || importingMaterial || preparingJob || (materialBatch ? batchBusy || running || !batchEntries.some((entry) => entry.selected) : metadataState === "loading" || (!jobMatchesMaterial && !materialSourceReady && !running))} aria-busy={startingMaterial || batchBusy}>
+            {startingMaterial || batchBusy ? <ActivityBars /> : <NavIcon name={running && !materialBatch ? "pause" : "running"} className="app-icon" />}
+            {startingMaterial ? "正在准备…" : materialBatch ? "开始批量处理" : running || jobMatchesMaterial ? topActionLabel : "直接出成片"}
+          </button>
+        </div>
       </div>
-    </section>
+      {(readiness.length > 0 || preflightWarnings.length > 0) && <p className={`material-action-notice ${readiness.length ? "readiness-error" : "readiness-warning"}`} role="status">{(readiness.length ? readiness : preflightWarnings).join("；")}</p>}
+      <div className="inline-actions material-task-tools" role="group" aria-label="任务工具">
+        {!job && !materialBatch && <button type="button" onClick={() => void start()} disabled={startingMaterial || importingMaterial || !materialSourceReady}><NavIcon name="save" className="app-icon" />保存草稿</button>}
+        <button type="button" onClick={() => void checkReadiness()} disabled={startingMaterial || importingMaterial || running}><NavIcon name="check" className="app-icon" />检查配置</button>
+        <button type="button" onClick={applyRecommended} disabled={startingMaterial || importingMaterial || running}>推荐设置</button>
+        <button type="button" onClick={() => void previewAuthorizedDemo()} disabled={startingMaterial || importingMaterial || running}>预览授权演示</button>
+      </div>
+      </section>
+    </div>
+  );
+  const materialSidebar = (
+    <aside className="material-sidebar" aria-label="发现素材与最近任务">
+      <section className="workspace-card material-side-card">
+        <header className="material-card-heading">
+          <h2><NavIcon name="video" className="app-icon" />本周热片</h2>
+          <button className="material-side-action" type="button" disabled={startingMaterial} onClick={() => {
+            const panel = discoveryPanelRef.current;
+            if (!panel) return;
+            panel.open = true;
+            panel.querySelector("summary")?.focus({ preventScroll: true });
+            panel.scrollIntoView({ behavior: "smooth", block: "start" });
+          }}>查看全部 <span aria-hidden="true">›</span></button>
+        </header>
+        {siteVideos.length ? <div className="material-side-list">
+          {siteVideos.slice(0, 3).map((entry) => (
+            <button key={entry.url} className="material-side-item" type="button" title={entry.title} disabled={startingMaterial || running || batchBusy || (materialBatch ? batchHasUrl(entry.url) : materialSourceTab === "url" && sourceUrl === entry.url)} onClick={() => materialBatch ? addHotToBatch(entry) : fillSourceFromHot(entry.url)}>
+              {weekly?.show_thumbnails !== false && <span className="material-side-cover">
+                {entry.thumbnail_url ? <WeeklyThumb src={entry.thumbnail_url} /> : <NavIcon name="video" className="app-icon" />}
+              </span>}
+              <span className="material-side-copy"><strong>{entry.title}</strong><small>{[entry.channel_title, typeof entry.duration === "number" ? formatClock(entry.duration) : null].filter(Boolean).join(" · ")}</small></span>
+              <span className="material-side-arrow" aria-hidden="true">{materialBatch && batchHasUrl(entry.url) ? "✓" : "+"}</span>
+            </button>
+          ))}
+        </div> : (
+          <div className="material-side-empty">
+            <img src="/images/channels-empty.png" alt="" />
+            <div><strong>{siteBusy ? "正在读取热片…" : "暂无热片"}</strong>{!siteBusy && <button className="text-button" type="button" onClick={() => void refreshSite()} disabled={startingMaterial}>刷新 ›</button>}</div>
+          </div>
+        )}
+      </section>
+      <section className="workspace-card material-side-card">
+        <header className="material-card-heading">
+          <h2><NavIcon name="library" className="app-icon" />最近任务</h2>
+          <button className="material-side-action" type="button" onClick={() => setView("library")} disabled={startingMaterial}>打开任务库 <span aria-hidden="true">›</span></button>
+        </header>
+        {recentJobs.length ? <div className="material-side-list">
+          {recentJobs.map((item) => {
+            const resumable = restorableJobs.some((candidate) => candidate.id === item.id);
+            const category = videoLibraryCategory(item, resumable);
+            const status = category === "active" ? "处理中" : category === "completed" ? "已完成" : resumable ? "可继续" : item.status === "failed" ? "失败" : "待处理";
+            return <button key={item.id} className="material-side-item recent-task-item" type="button" title={item.title} disabled={startingMaterial || (running && job?.id !== item.id)} onClick={() => {
+              if (item.id === job?.id && running) setView("process");
+              else if (resumable || item.output_exists || item.rendered_exists || item.dub_exists || category === "active") void loadRestoredJob(item.id, item.rendered_exists ? "subtitle" : "process", category === "active");
+              else setView("library");
+            }}>
+              <RecentTaskCover key={`${item.status}:${item.stage}:${item.rendered_exists}:${item.dub_exists}`} item={item} />
+              <span className="material-side-copy"><strong>{item.title}</strong><small>{item.stage || "等待配置"}</small></span>
+              <span className={`library-status ${category}`}>{status}</span>
+            </button>;
+          })}
+        </div> : <p className="material-recent-empty">暂无任务。开始处理后，可在这里继续或打开成片。</p>}
+      </section>
+    </aside>
   );
   const preparationBlocking = (job?.checks ?? []).some((item) => item.status === "blocking");
   const preparationReady = Boolean(job?.checks?.length) && !preparationBlocking;
@@ -4878,7 +5368,7 @@ function App() {
             aria-disabled={running || !preparationReady || schemeDirty}
             title={schemeDirty ? "先保存修改并重新检查准备" : !preparationReady ? "准备检查全部通过后才能运行" : undefined}
           >
-            <NavIcon name="render" className="app-icon" />一键运行到渲染
+            <NavIcon name="render" className="app-icon" />{subtitlesAwaitingReview ? "校对字幕" : job?.options.output_mode === "subtitles" ? "一键生成字幕" : "一键运行到渲染"}
           </button>
         </div>
       </header>
@@ -5049,9 +5539,9 @@ function App() {
     <section className="workspace-card process-view">
       <header className="process-header">
         <p className="eyebrow">处理配置</p>
-        <h1>字幕、翻译与推理</h1>
+        <h1 id="processing-parameters-heading" tabIndex={-1}>字幕、翻译与推理</h1>
         <p>先选择字幕来源、Whisper 模型和翻译方式；声道、精度与 OCR 细节可在高级设置的分类中展开。</p>
-        <button className="process-mode-toggle" onClick={toggleMode}>{mode === "basic" ? "高级设置 ›" : "收起高级设置 ‹"}</button>
+        <button className="process-mode-toggle" type="button" onClick={toggleMode} aria-expanded={mode === "advanced"}><NavIcon name="process" className="app-icon" />{mode === "basic" ? "展开高级参数" : "显示常用参数"}</button>
       </header>
       {options.translator === "deepseek" && apiKeyConfigured === false && (
         <p className="metadata-notice error">
@@ -5109,10 +5599,11 @@ function App() {
           <AsrRecognitionFields options={options} hintError={fieldErrors.asr_hint} onHint={(value) => updateOptions("asr_hint", value)} onVad={(value) => updateOptions("asr_vad_mode", value)} />
            {(job?.material.source_url || (!job && sourceUrl.trim())) && ["auto", "merged"].includes(options.subtitle_source) && <label className="check settings-check">
              <input type="checkbox" checked={options.prefer_platform_subtitles} onChange={(event) => updateOptions("prefer_platform_subtitles", event.target.checked)} />
-             优先使用 YouTube 字幕（更快；没有时自动转写）
+             {platformSubtitleLabel(job?.material.source_url || sourceUrl, batchMode)}
            </label>}
           </section>
           <section className="settings-section basic-primary-section"><div className="settings-group-heading"><NavIcon name="translate" className="app-icon" /><span><b>翻译服务与模型</b><small>在线服务、本地模型与目标语言</small></span></div>
+          <TranslationDifficultyHint hint={job?.translation_hint} />
           <label>
             翻译器
             <select
@@ -5175,85 +5666,7 @@ function App() {
            </label>
           </section>
           <section className="settings-section"><div className="settings-group-heading"><NavIcon name="text" className="app-icon" /><span><b>字幕样式</b><small>排版、字体、字号与颜色</small></span></div>
-          <label>
-            字幕排版
-            <select
-              value={options.subtitle_display_mode}
-              onChange={(event) =>
-                updateOptions("subtitle_display_mode", event.target.value)
-              }
-            >
-              <option value="translated">中文单语</option>
-              <option value="bilingual-source-first">原文在上 + 中文在下</option>
-              <option value="bilingual-translation-first">中文在上 + 原文在下</option>
-            </select>
-          </label>
-          <label>
-            双语样式
-            <select
-              value={options.subtitle_preset}
-              disabled={options.subtitle_display_mode === "translated"}
-              onChange={(event) => updateOptions("subtitle_preset", event.target.value)}
-            >
-              <option value="soft">弱化原文（小一号、浅灰）</option>
-              <option value="compact">小字原文（更小、更灰）</option>
-              <option value="equal">两行一致</option>
-            </select>
-          </label>
-          <label>
-            字体
-            <input
-              value={options.font_name}
-              maxLength={100}
-              onChange={(event) => updateOptions("font_name", event.target.value)}
-            />
-            {fieldErrors.font_name && <small className="field-error">{fieldErrors.font_name}</small>}
-          </label>
-          <label>
-            字号
-            <input
-              type="number"
-              min="8"
-              max="96"
-              step="1"
-              value={options.font_size}
-              onChange={(event) => updateOptions("font_size", Number(event.target.value || 24))}
-            />
-          </label>
-          <label>
-            字幕颜色
-            <select
-              value={options.subtitle_color}
-              onChange={(event) => updateOptions("subtitle_color", event.target.value)}
-            >
-              {["白色", "黄色", "青色", "绿色", "黑色"].map((value) => (
-                <option key={value}>{value}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            边框颜色
-            <select
-              value={options.subtitle_outline_color}
-              onChange={(event) => updateOptions("subtitle_outline_color", event.target.value)}
-            >
-              {["黑色", "白色", "灰色", "蓝色"].map((value) => (
-                <option key={value}>{value}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            字幕效果
-            <select
-              value={options.subtitle_effect}
-              onChange={(event) => updateOptions("subtitle_effect", event.target.value)}
-            >
-              {["描边", "阴影", "描边+阴影", "无"].map((value) => (
-                <option key={value}>{value}</option>
-              ))}
-            </select>
-            <FieldGuide summary="控制硬字幕的描边与阴影。" detail="改完样式后需重新渲染成片才会生效；已完成的渲染检查点会提示重做。" />
-          </label>
+          <SubtitleStyleSettings {...subtitleStyleProps} effectGuide={<FieldGuide summary="控制硬字幕的描边与阴影。" detail="保存样式后重新渲染成片，即可应用新的字幕效果。" />} />
            <label className="check settings-check">
              <input type="checkbox" checked={options.smart_subtitle_layout} onChange={(event) => updateOptions("smart_subtitle_layout", event.target.checked)} />
              智能字幕换行排版
@@ -5337,7 +5750,7 @@ function App() {
           <AsrRecognitionFields options={options} hintError={fieldErrors.asr_hint} onHint={(value) => updateOptions("asr_hint", value)} onVad={(value) => updateOptions("asr_vad_mode", value)} />
          {(job?.material.source_url || (!job && sourceUrl.trim())) && ["auto", "merged"].includes(options.subtitle_source) && <label className="check settings-check">
            <input type="checkbox" checked={options.prefer_platform_subtitles} onChange={(event) => updateOptions("prefer_platform_subtitles", event.target.checked)} />
-           优先使用 YouTube 字幕（更快；没有时自动转写）
+           {platformSubtitleLabel(job?.material.source_url || sourceUrl, batchMode)}
          </label>}
         <details className="settings-subfold">
           <summary><span><b>OCR 细节</b><small>画面字幕的采样、语言与识别区域</small></span><i>{options.subtitle_source === "audio" ? "当前未启用" : "展开/收起"}</i></summary>
@@ -5373,6 +5786,7 @@ function App() {
         </details>
         </div></section>
         <section className="settings-section"><header className="settings-group-heading" id="advanced-translation-settings"><NavIcon name="translate" className="app-icon" /><span><b>翻译服务与模型</b><small>服务、模型、目标语言与请求计价</small></span></header><div className="settings-grid settings-fold-body">
+        <TranslationDifficultyHint hint={job?.translation_hint} />
         <label>
           翻译器
           <select
@@ -5485,91 +5899,7 @@ function App() {
         </label>
         </div></section>
         <section className="settings-section"><header className="settings-group-heading"><NavIcon name="text" className="app-icon" /><span><b>字幕样式</b><small>排版、字体、字号、颜色与位置</small></span></header><div className="settings-grid settings-fold-body">
-        <label>
-          字幕底部位置
-          <select value={options.subtitle_margin_ratio} onChange={(event) => updateOptions("subtitle_margin_ratio", Number(event.target.value))}>
-            <option value={0.03}>3%（贴近底部）</option>
-            <option value={0.055}>5.5%（推荐）</option>
-            <option value={0.1}>10%（偏上）</option>
-            <option value={0.15}>15%（更高）</option>
-          </select>
-        </label>
-        <label>
-          字幕排版
-          <select
-            value={options.subtitle_display_mode}
-            onChange={(event) => updateOptions("subtitle_display_mode", event.target.value)}
-          >
-            <option value="translated">中文单语</option>
-            <option value="bilingual-source-first">原文在上 + 中文在下</option>
-            <option value="bilingual-translation-first">中文在上 + 原文在下</option>
-          </select>
-        </label>
-        <label>
-          双语样式
-          <select
-            value={options.subtitle_preset}
-            disabled={options.subtitle_display_mode === "translated"}
-            onChange={(event) => updateOptions("subtitle_preset", event.target.value)}
-          >
-            <option value="soft">弱化原文（小一号、浅灰）</option>
-            <option value="compact">小字原文（更小、更灰）</option>
-            <option value="equal">两行一致</option>
-          </select>
-        </label>
-        <label>
-          字体
-          <input
-            value={options.font_name}
-            maxLength={100}
-            onChange={(event) => updateOptions("font_name", event.target.value)}
-          />
-          {fieldErrors.font_name && <small className="field-error">{fieldErrors.font_name}</small>}
-        </label>
-        <label>
-          字号
-          <input
-            type="number"
-            min="8"
-            max="96"
-            step="1"
-            value={options.font_size}
-            onChange={(event) => updateOptions("font_size", Number(event.target.value || 24))}
-          />
-        </label>
-        <label>
-          字幕颜色
-          <select
-            value={options.subtitle_color}
-            onChange={(event) => updateOptions("subtitle_color", event.target.value)}
-          >
-            {["白色", "黄色", "青色", "绿色", "黑色"].map((value) => (
-              <option key={value}>{value}</option>
-            ))}
-          </select>
-        </label>
-        <label>
-          边框颜色
-          <select
-            value={options.subtitle_outline_color}
-            onChange={(event) => updateOptions("subtitle_outline_color", event.target.value)}
-          >
-            {["黑色", "白色", "灰色", "蓝色"].map((value) => (
-              <option key={value}>{value}</option>
-            ))}
-          </select>
-        </label>
-        <label>
-          字幕效果
-          <select
-            value={options.subtitle_effect}
-            onChange={(event) => updateOptions("subtitle_effect", event.target.value)}
-          >
-            {["描边", "阴影", "描边+阴影", "无"].map((value) => (
-              <option key={value}>{value}</option>
-            ))}
-          </select>
-        </label>
+        <SubtitleStyleSettings {...subtitleStyleProps} />
          <label className="check settings-check">
            <input type="checkbox" checked={options.smart_subtitle_layout} onChange={(event) => updateOptions("smart_subtitle_layout", event.target.checked)} />
            智能字幕换行排版
@@ -5681,7 +6011,7 @@ function App() {
                 ? "授权演示成片（只读）"
                 : preview === "dub"
                 ? "中文配音版"
-                : preview === "rendered" && job?.result
+                : preview === "rendered" && job?.result?.rendered_video
                 ? "中文字幕成片"
                 : "原始视频"}
             </h1>
@@ -5695,7 +6025,7 @@ function App() {
             </button>
             <button
               className={preview === "rendered" ? "selected" : ""}
-              disabled={!job?.result && !demoPreview}
+              disabled={!job?.result?.rendered_video && !demoPreview}
               onClick={() => {
                 setMediaNonce(Date.now());
                 setPreview("rendered");
@@ -5708,6 +6038,13 @@ function App() {
                 <button className={preview === "dub" ? "selected" : ""} onClick={() => { setMediaNonce(Date.now()); setPreview("dub"); }}>配音版</button>
                 <button onClick={() => void openHistoryPath(job.result?.dub_video || "")}>打开配音版</button>
               </>
+            )}
+            {job?.stages?.translate?.status === "completed" && !demoPreview && (
+              <button className="subtitle-trial-button" type="button" onClick={trySubtitleRender}
+                disabled={running || preparingJob || dirty || subtitleTrialBusy}
+                title={dirty ? "先保存字幕，再预览实际画面" : "用当前样式试渲染播放位置附近的 8 秒"}>
+                {subtitleTrialBusy ? "正在试渲染…" : "试渲染当前 8 秒"}
+              </button>
             )}
           </div>
         </div>
@@ -5799,6 +6136,18 @@ function App() {
             )}
           </div>
         </div>
+        {subtitleTrial && subtitleTrial.jobId === job?.id && (
+          <div className="subtitle-trial-preview" id="subtitle-trial-preview">
+            <div className="subtitle-trial-heading">
+              <div><strong>试渲染片段</strong><small>{formatTime(subtitleTrial.start)} 至 {formatTime(subtitleTrial.end)}</small></div>
+              <button className="secondary small" type="button" onClick={() => setSubtitleTrial(null)}>关闭预览</button>
+            </div>
+            {(subtitleTrial.styleKey !== subtitleTrialStyleKey || subtitleTrial.revision !== job?.artifact_revision || dirty) && (
+              <p className="subtitle-trial-stale">字幕或样式已修改，重新试渲染可查看最新效果。</p>
+            )}
+            <video src={`/api/jobs/${encodeURIComponent(subtitleTrial.jobId)}/subtitle-preview/${subtitleTrial.token}`} controls preload="metadata" aria-label="试渲染视频" />
+          </div>
+        )}
       </section>
       <details className="workspace-card trim-card">
         <summary className="studio-drawer-summary"><span><b>剪辑视频</b><small>选时间段，再选择删除、保留或静音</small></span><span>展开</span></summary>
@@ -5907,98 +6256,7 @@ function App() {
           <p>字体、字号与颜色也可在「处理」页直接设置。</p>
         </header>
         <div className="settings-grid compact">
-          <label>
-            显示模式
-            <select
-              value={options.subtitle_display_mode}
-              onChange={(event) =>
-                updateOptions("subtitle_display_mode", event.target.value)
-              }
-            >
-              <option value="translated">中文单语</option>
-              <option value="bilingual-source-first">
-                原文在上 + 中文在下
-              </option>
-              <option value="bilingual-translation-first">
-                中文在上 + 原文在下
-              </option>
-            </select>
-          </label>
-          <label>
-            双语样式
-            <select
-              value={options.subtitle_preset}
-              disabled={options.subtitle_display_mode === "translated"}
-              onChange={(event) => updateOptions("subtitle_preset", event.target.value)}
-            >
-              <option value="soft">弱化原文（小一号、浅灰）</option>
-              <option value="compact">小字原文（更小、更灰）</option>
-              <option value="equal">两行一致</option>
-            </select>
-          </label>
-          <label>
-            字体
-            <input
-              value={options.font_name}
-              maxLength={100}
-              onChange={(event) =>
-                updateOptions("font_name", event.target.value)
-              }
-            />
-            {fieldErrors.font_name && <small className="field-error">{fieldErrors.font_name}</small>}
-          </label>
-          <label>
-            字号
-            <input
-              type="number"
-              min="8"
-              max="96"
-              step="1"
-              value={options.font_size}
-              onChange={(event) =>
-                updateOptions("font_size", Number(event.target.value || 24))
-              }
-            />
-          </label>
-          <label>
-            字幕颜色
-            <select
-              value={options.subtitle_color}
-              onChange={(event) =>
-                updateOptions("subtitle_color", event.target.value)
-              }
-            >
-              {["白色", "黄色", "青色", "绿色", "黑色"].map((value) => (
-                <option key={value}>{value}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            边框颜色
-            <select
-              value={options.subtitle_outline_color}
-              onChange={(event) =>
-                updateOptions("subtitle_outline_color", event.target.value)
-              }
-            >
-              {["黑色", "白色", "灰色", "蓝色"].map((value) => (
-                <option key={value}>{value}</option>
-              ))}
-            </select>
-          </label>
-          <label>
-            效果
-            <select
-              value={options.subtitle_effect}
-              onChange={(event) =>
-                updateOptions("subtitle_effect", event.target.value)
-              }
-            >
-              {["描边", "阴影", "描边+阴影", "无"].map((value) => (
-                <option key={value}>{value}</option>
-              ))}
-            </select>
-          </label>
+          <SubtitleStyleSettings {...subtitleStyleProps} />
         </div>
       </details>
       <section className="voice-review-card workspace-card">
@@ -6072,10 +6330,10 @@ function App() {
             <button
               className="primary small"
               onClick={rerender}
-              disabled={!job?.result || running || retranslatingCueId !== null || compactingCues || dirty || job?.edit_state === "legacy-ambiguous"}
+              disabled={(!job?.result?.rendered_video && job?.stages?.translate?.status !== "completed") || running || preparingJob || subtitleTrialBusy || retranslatingCueId !== null || compactingCues || dirty || job?.edit_state === "legacy-ambiguous"}
               title={job?.edit_state === "legacy-ambiguous" ? "旧任务的后期版本顺序无法确认；为保护现有成片，已禁用重新渲染" : dirty ? "先保存当前字幕修改，再重新渲染" : "使用当前活动视频和字幕重新渲染"}
             >
-              <NavIcon name="rerender" className="app-icon" />重新渲染
+              <NavIcon name="rerender" className="app-icon" />{job?.result?.rendered_video ? "重新渲染" : "生成成片"}
             </button>
           </div>
           <div className="editor-timing-actions">
@@ -6794,8 +7052,8 @@ function App() {
               </div>
               <div className="video-library-actions">
                 {resumable || category === "active" || !missingOutput ? (
-                  <button className="library-open" onClick={() => isCurrent && running ? setView("process") : void loadRestoredJob(item.id)}>
-                    {isCurrent && running ? "查看进度" : resumable ? "继续处理" : category === "completed" ? "打开任务" : "检查任务"}
+                  <button className="library-open" onClick={() => isCurrent && running ? setView("process") : void loadRestoredJob(item.id, "process", category === "active")}>
+                    {category === "active" ? "查看进度" : resumable ? "继续处理" : category === "completed" ? "打开任务" : "检查任务"}
                   </button>
                 ) : (
                   <button
@@ -6960,7 +7218,7 @@ function App() {
   );
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell${view === "material" ? " material-home" : ""}`}>
       <header className="topbar">
         <a className="brand" href="#workspace">
           <span>▶</span>
@@ -6982,16 +7240,16 @@ function App() {
           </span>
         </div>
         <div className="top-actions">
-          <button ref={tutorialTriggerRef} className="tutorial-trigger" onClick={openTutorial} disabled={settingsOpen || dependenciesOpen || shortcutHelpOpen || templateEditorOpen} aria-label="打开新手教程">
+          <button ref={tutorialTriggerRef} className="tutorial-trigger" onClick={openTutorial} disabled={startingMaterial || settingsOpen || dependenciesOpen || shortcutHelpOpen || templateEditorOpen} aria-label="打开新手教程">
             <NavIcon name="book" className="app-icon" />新手教程
           </button>
           <span className={online ? "status online" : "status"}>
             {online ? "本地已连接" : "未连接"}
           </span>
-          <button className="text-button" onClick={() => setSettingsOpen(true)}>
+          <button className="text-button" onClick={() => setSettingsOpen(true)} disabled={startingMaterial}>
             设置
           </button>
-          <button className="text-button" onClick={() => setInspectorOpen((value) => !value)}>
+          <button className="text-button" onClick={() => setInspectorOpen((value) => !value)} disabled={startingMaterial}>
             任务详情
           </button>
           <details className="top-more">
@@ -7001,16 +7259,16 @@ function App() {
               <button onClick={() => setShortcutHelpOpen(true)}>使用帮助</button>
             </div>
           </details>
-          <button
+          {view !== "material" && <button
             className="primary"
             onClick={topAction}
             disabled={preparingJob || (running ? !job : !job && !materialSourceReady)}
           >
             {topActionLabel}
-          </button>
+          </button>}
         </div>
       </header>
-      {restorableJobs.length > 0 && !running && (
+      {view !== "material" && restorableJobs.length > 0 && !running && (
         <section className="restore-banner" aria-live="polite">
           <div>
             <b>↻ {restorableJobs.length} 个任务可继续</b>
@@ -7055,7 +7313,9 @@ function App() {
           {nav.map(([id, label, hint, icon]) => (
             <button
               key={id}
+              data-view={id}
               className={view === id ? "active" : ""}
+              disabled={startingMaterial}
               onClick={() => setView(id)}
             >
               <b className="nav-label"><NavIcon name={icon} /><span>{label}</span></b>
@@ -7072,8 +7332,7 @@ function App() {
           </div>
         </nav>
         <section className={`main-workspace workspace-${view}`}>
-          {view === "material" && weeklyHotCard}
-          {view === "material" && materialView}
+          {view === "material" && <><div className="material-workbench">{materialView}{materialSidebar}</div>{weeklyHotCard}</>}
           {view === "library" && libraryView}
           {view === "process" && processView}
           {view === "subtitle" && subtitleView}
@@ -7341,7 +7600,7 @@ function App() {
           <p className="cookies-hint">
             提示：Chrome / Edge 130 及以上版本对 Cookies 做了应用绑定加密，无法直接读取，所以这里只保留 Firefox 选项；Chrome 用户请用浏览器插件（如 Get cookies.txt LOCALLY）导出 cookies.txt 后选择下面的文件。两种来源二选一。
           </p>
-          <label>
+          {showYoutubeBrowserVerification(sourceUrl) && <label>
             YouTube 自动浏览器验证
             <select
               value={options.youtube_po_token_mode}
@@ -7355,9 +7614,9 @@ function App() {
                 ? `验证组件已就绪${poTokenStatus.browser_path ? "，已检测到 Chrome/Edge" : "；运行时将自动查找 Chrome/Edge"}。首次请求可能短暂启动一个最小化浏览器。`
                 : "当前未检测到验证组件；程序会退回常规模式。公开发行版应通过“修复安装”补齐该组件。"}
             </small>
-          </label>
+          </label>}
           <label>
-            YouTube 代理（可选，仅当前运行）
+            获取代理（可选，仅当前运行）
             <input
               type="password"
               value={options.youtube_proxy}
@@ -7366,7 +7625,7 @@ function App() {
               onChange={(event) => { updateOptions("youtube_proxy", event.target.value); setProxyDirty(true); }}
             />
             <small className="drawer-note">
-              同一地址用于元数据、视频、封面和浏览器验证；只保存在本机设置，不会写入任务历史或日志。
+              同一地址用于读取标题、下载视频和封面，X、Reddit、Bluesky 的公开帖子也走它。Cookies 和 YouTube 浏览器验证只给原来的下载器。地址只保存在本机设置，不会写入任务历史或日志。
             </small>
           </label>
           <div className="settings-section-label"><NavIcon name="video" className="app-icon" /><b>关注频道</b><span>{weeklyTitle}</span></div>
@@ -7379,7 +7638,7 @@ function App() {
             />
             启用周热
           </label>
-          <p className="drawer-note">打开并添加频道后，素材页会把「关注频道」和「本周搜索」并排。频道页带齐播放量时按播放量排，标题是「本周热片」；播放量缺失时按上传时间排，标题是「本周新片」。列表缓存约 {weekly?.cache_ttl_hours ?? 12} 小时，点刷新会立刻重取。还没有频道时，热片卡片右侧有一个「关注频道」入口。热片列表不依赖这里的开关。</p>
+          <p className="drawer-note">打开并添加频道后，素材页会把「关注频道」和「本周搜索」并排。关注频道列表可用「热 / 新」切换：热按播放量，新按发布时间并分今天 / 昨天 / 更早。列表缓存约 {weekly?.cache_ttl_hours ?? 12} 小时，点刷新会立刻重取。还没有频道时，热片卡片右侧有一个「关注频道」入口。热片列表不依赖这里的开关。</p>
           <div className="settings-weekly-fields">
             {weeklyNumber("window_days", "时间窗口（天）", 1, 30)}
             {weeklyNumber("top_k", "最多显示", 1, 50)}

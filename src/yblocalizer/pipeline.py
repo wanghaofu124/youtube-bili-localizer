@@ -105,6 +105,8 @@ class PipelineOptions:
     dub_mix: str = "duck"
     voxcpm_python: str = ""
     voxcpm_model_dir: str = ""
+    subtitle_placement: str = "overlay"
+    allow_model_layout_repair: bool = True
 
 
 @dataclass(slots=True)

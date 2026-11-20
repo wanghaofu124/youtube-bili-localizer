@@ -92,7 +92,7 @@ def test_normal_download_extracts_once(monkeypatch: pytest.MonkeyPatch, tmp_path
     )
     monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
 
-    job = download_with_ytdlp("https://example.test/video", tmp_path)
+    job = download_with_ytdlp("https://www.youtube.com/watch?v=demotest", tmp_path, prefer_platform_subtitles=False)
 
     assert calls == [True]
     assert job.raw_video == tmp_path / "demo.mp4"
@@ -120,11 +120,15 @@ def test_original_proposal_reports_ytdlp_selection_not_our_bitrate_rank() -> Non
 
 def test_confirmed_resolution_is_a_floor_for_every_ytdlp_fallback() -> None:
     selector = _format_for_quality("original", (3840, 2160))
-    assert selector == "bestvideo[width>=3840][height>=2160]+bestaudio/best[width>=3840][height>=2160]"
+    assert selector == (
+        "bestvideo[width>=3840][height>=2160]+bestaudio/"
+        "best[width>=3840][height>=2160]/"
+        "bestvideo[width>=3840][height>=2160]"
+    )
 
     formats = [
         {"format_id": "360", "width": 640, "height": 360, "vcodec": "avc1", "acodec": "mp4a", "ext": "mp4", "url": "https://example.test/360"},
-        {"format_id": "4k-video", "width": 3840, "height": 2160, "vcodec": "av01", "acodec": "none", "ext": "webm", "url": "https://example.test/video"},
+        {"format_id": "4k-video", "width": 3840, "height": 2160, "vcodec": "av01", "acodec": "none", "ext": "webm", "url": "https://www.youtube.com/watch?v=demotest"},
         {"format_id": "audio", "vcodec": "none", "acodec": "opus", "ext": "webm", "url": "https://example.test/audio"},
     ]
     ydl = real_yt_dlp.YoutubeDL({"format": selector, "quiet": True})
@@ -186,7 +190,7 @@ def test_stale_partial_is_left_to_ytdlp_without_an_outer_retry(
     monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
 
     with pytest.raises(YouTubeAccessError, match="续传失败"):
-        download_with_ytdlp("https://example.test/video", tmp_path)
+        download_with_ytdlp("https://www.youtube.com/watch?v=demotest", tmp_path)
 
     assert calls == [True]
     assert part.read_bytes() == b"stale-partial"
@@ -231,7 +235,7 @@ def test_network_timeout_keeps_partial_without_an_outer_retry(monkeypatch: pytes
     monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
 
     with pytest.raises(YouTubeAccessError) as captured:
-        download_with_ytdlp("https://example.test/video", tmp_path, download_quality="720p")
+        download_with_ytdlp("https://www.youtube.com/watch?v=demotest", tmp_path, download_quality="720p")
 
     assert captured.value.code == "youtube_network_timeout"
     assert calls == [True]
@@ -262,10 +266,10 @@ def test_ssl_eof_does_not_propose_lower_quality(
     monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
 
     with pytest.raises(YouTubeAccessError) as captured:
-        download_with_ytdlp("https://example.test/video", tmp_path, download_quality="original")
+        download_with_ytdlp("https://www.youtube.com/watch?v=demotest", tmp_path, download_quality="original")
 
     assert captured.value.code == "youtube_network_timeout"
-    assert attempted_formats == ["bestvideo+bestaudio/best"]
+    assert attempted_formats == ["bestvideo+bestaudio/best/bestvideo"]
 
 
 def test_network_timeout_errors_have_precise_codes() -> None:
@@ -282,9 +286,9 @@ def test_network_timeout_errors_have_precise_codes() -> None:
 @pytest.mark.parametrize(
     ("quality", "expected"),
     [
-        ("720p", "bestvideo[height<=720]+bestaudio/best[height<=720]"),
-        ("1080p", "bestvideo[height<=1080]+bestaudio/best[height<=1080]"),
-        ("original", "bestvideo+bestaudio/best"),
+        ("720p", "bestvideo[height<=720]+bestaudio/best[height<=720]/bestvideo[height<=720]/bestvideo[width<=720]+bestaudio/best[width<=720]/bestvideo[width<=720]"),
+        ("1080p", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/bestvideo[height<=1080]/bestvideo[width<=1080]+bestaudio/best[width<=1080]/bestvideo[width<=1080]"),
+        ("original", "bestvideo+bestaudio/best/bestvideo"),
     ],
 )
 def test_download_quality_never_has_an_unbounded_fallback(quality: str, expected: str) -> None:
@@ -292,7 +296,7 @@ def test_download_quality_never_has_an_unbounded_fallback(quality: str, expected
     assert value == expected
     assert "/worst" not in value
     if quality == "original":
-        assert value == "bestvideo+bestaudio/best"
+        assert value == "bestvideo+bestaudio/best/bestvideo"
 
 
 def test_download_rejects_file_below_selected_original_resolution(
@@ -320,9 +324,9 @@ def test_download_rejects_file_below_selected_original_resolution(
     monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
 
     with pytest.raises(DownloadResolutionMismatch, match="3840×2160.*640×360"):
-        download_with_ytdlp("https://example.test/video", tmp_path, download_quality="original")
+        download_with_ytdlp("https://www.youtube.com/watch?v=demotest", tmp_path, download_quality="original")
 
-    assert captured["format"] == "bestvideo+bestaudio/best"
+    assert captured["format"] == "bestvideo+bestaudio/best/bestvideo"
 
 
 @pytest.mark.parametrize(
@@ -367,7 +371,7 @@ def test_original_uses_fresh_4k_format_ids_without_downgrade(
     monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
     promised = {"video_format_id": "old4k", "audio_format_id": "old_audio", "width": 3840,
                 "height": 2160, "has_audio": True}
-    job = download_with_ytdlp("https://example.test/video", tmp_path, download_quality="original", quality_proposal=promised)
+    job = download_with_ytdlp("https://www.youtube.com/watch?v=demotest", tmp_path, download_quality="original", quality_proposal=promised, prefer_platform_subtitles=False)
     assert chosen == [expected_format]
     assert job.raw_video == tmp_path / "demo.mp4"
 
@@ -390,7 +394,7 @@ def test_original_rejects_lower_result_without_committing_it(
     promised = {"video_format_id": "old4k", "audio_format_id": "", "width": 3840,
                 "height": 2160, "has_audio": True}
     with pytest.raises(DownloadProposalMismatch, match="3840×2160.*1920×1080"):
-        download_with_ytdlp("https://example.test/video", tmp_path, download_quality="original", quality_proposal=promised)
+        download_with_ytdlp("https://www.youtube.com/watch?v=demotest", tmp_path, download_quality="original", quality_proposal=promised)
     assert (tmp_path / "demo.mp4").read_bytes() == b"new candidate"
 
 
@@ -437,7 +441,7 @@ def test_cc_gate_keeps_metadata_preflight(monkeypatch: pytest.MonkeyPatch, tmp_p
     monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
 
     download_with_ytdlp(
-        "https://example.test/video", tmp_path, require_reuse_allowed=True
+        "https://www.youtube.com/watch?v=demotest", tmp_path, require_reuse_allowed=True, prefer_platform_subtitles=False
     )
 
     assert calls == [False, True]
@@ -522,7 +526,7 @@ def test_media_403_cycles_to_the_next_player_client(
 
     monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
 
-    job = download_with_ytdlp("https://example.test/video", tmp_path, log=logs.append)
+    job = download_with_ytdlp("https://www.youtube.com/watch?v=demotest", tmp_path, log=logs.append, prefer_platform_subtitles=False)
 
     assert [clients[0] for clients in seen] == ["android_vr", "mweb"]
     assert job.raw_video == tmp_path / "demo.mp4"
@@ -556,7 +560,7 @@ def test_private_video_does_not_burn_the_client_chain(
     monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
 
     with pytest.raises(RuntimeError, match="Private video"):
-        download_with_ytdlp("https://example.test/video", tmp_path)
+        download_with_ytdlp("https://www.youtube.com/watch?v=demotest", tmp_path)
 
     assert calls == [True]
 
@@ -587,7 +591,7 @@ def test_po_token_off_keeps_a_single_extraction(
     monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
 
     with pytest.raises(RuntimeError, match="403"):
-        download_with_ytdlp("https://example.test/video", tmp_path, po_token_mode="off")
+        download_with_ytdlp("https://www.youtube.com/watch?v=demotest", tmp_path, po_token_mode="off")
 
     assert calls == [True]
 
@@ -652,7 +656,7 @@ def test_quality_downgrade_is_stated_in_log(monkeypatch: pytest.MonkeyPatch, tmp
 
     monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
 
-    download_with_ytdlp("https://example.test/video", tmp_path, download_quality="1080p", log=logs.append)
+    download_with_ytdlp("https://www.youtube.com/watch?v=demotest", tmp_path, download_quality="1080p", log=logs.append, prefer_platform_subtitles=False)
 
     assert any("低于请求的 1080p" in line for line in logs), logs
     assert not any("未自动降低画质" in line for line in logs)

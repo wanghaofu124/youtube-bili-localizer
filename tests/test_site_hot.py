@@ -127,10 +127,28 @@ def test_failed_refresh_keeps_cache_and_mix_skips_music(monkeypatch):
     moved = set_site_region("GB", "mix")
     assert moved["region"] == "GB"
     assert moved["stale"] is True
-    assert moved["videos"][0]["title"] == "Clip"
+    assert moved["videos"] == []
+    assert moved["refreshed_at"] is None
+    assert moved["error"] is None
+    assert moved["query_errors"] == []
+    assert set_site_region("US", "mix")["videos"][0]["title"] == "Clip"
     try:
         refresh_site_hot(access, category="nope")
     except ValueError as exc:
         assert "分类" in str(exc)
     else:
         raise AssertionError("unknown category should be rejected")
+
+
+def test_refresh_finishing_after_region_change_does_not_show_the_old_region(monkeypatch):
+    def fetch(*_args, **_kwargs):
+        set_site_region("JP", "gaming")
+        return [_clip("abcdefghijk", "US result", 100)]
+
+    monkeypatch.setattr("yblocalizer.site_hot.list_playlist_entries", fetch)
+    view = refresh_site_hot({}, category="gaming", region="US")
+    assert view["region"] == "JP"
+    assert view["cached_region"] == "US"
+    assert view["videos"] == []
+    assert view["stale"] is True
+    assert set_site_region("US", "gaming")["videos"][0]["title"] == "US result"

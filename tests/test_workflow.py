@@ -171,10 +171,12 @@ def test_audio_translation_uses_speech_cues_without_crossing_long_silence(
     assert cues[0].end < 443 and cues[1].start == 504.95
 
 
-@pytest.mark.parametrize("repair_fails", [False, True])
-@pytest.mark.parametrize("font_plan_fails", [False, True])
+@pytest.mark.parametrize(
+    ("repair_fails", "font_plan_fails", "allow_model_layout_repair"),
+    [(False, False, True), (False, True, True), (True, False, True), (True, True, True), (False, True, False)],
+)
 def test_render_keeps_going_with_dense_translation_and_preserves_old_video(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repair_fails: bool, font_plan_fails: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repair_fails: bool, font_plan_fails: bool, allow_model_layout_repair: bool,
 ) -> None:
     translated = tmp_path / "segments.translated.json"
     save_segments(translated, [Segment(
@@ -191,7 +193,9 @@ def test_render_keeps_going_with_dense_translation_and_preserves_old_video(
         def failed_font_plan(*_args, **_kwargs):
             raise RuntimeError("无法计算逐条字号")
         monkeypatch.setattr("yblocalizer.workflow._plan_cue_font_sizes", failed_font_plan)
+    repair_attempts = []
     def fake_compact(items, *_args, **_kwargs):
+        repair_attempts.append(True)
         if repair_fails:
             raise RuntimeError("翻译服务暂时不可用")
         return items, [0]
@@ -211,13 +215,15 @@ def test_render_keeps_going_with_dense_translation_and_preserves_old_video(
         subtitle_outline_color="&H00000000", subtitle_outline=1, subtitle_shadow=0,
         render_crf=20, render_encoder="cpu", resource_profile="balanced",
         subtitle_margin_ratio=0.055, translator="none", translate_model="",
-        target_lang="zh-Hans",
+        target_lang="zh-Hans", allow_model_layout_repair=allow_model_layout_repair,
     )
     result = run_render(options, tmp_path, artifacts, PipelineContext(), lambda _message: None)
     assert Path(result.rendered_video).read_bytes() == b"new"
     assert result.translated_segments == str(translated)
     assert any("继续渲染" in warning for warning in result.content_warnings)
     assert old_video.read_bytes() == b"old"
+    if not allow_model_layout_repair:
+        assert not repair_attempts
 
 
 @pytest.mark.parametrize(

@@ -1,6 +1,6 @@
 param(
     [switch]$Clean,
-    [string]$Version = "0.2.55",
+    [string]$Version = "",
     [string]$AppName = "YouTubeBiliLocalizer",
     [string]$PythonExe = "",
     [string]$SigningThumbprint = "",
@@ -12,6 +12,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+if (-not $Version) {
+    $VersionLine = Get-Content -LiteralPath (Join-Path $ProjectRoot "src\yblocalizer\__init__.py") |
+        Select-String -Pattern '^__version__\s*=\s*"([^"]+)"'
+    if (-not $VersionLine) { throw "Could not read the application version." }
+    $Version = $VersionLine.Matches[0].Groups[1].Value
+}
 $BuildRoot = Join-Path $ProjectRoot ".release-build"
 $VenvRoot = Join-Path $BuildRoot "venv"
 $ReleaseRoot = Join-Path $ProjectRoot "releases"
@@ -108,6 +114,7 @@ $Arguments += @(
     "--add-data", "$ProjectRoot\demo\authorized-demo-10s.mp4;demo",
     "--add-data", "$ProjectRoot\demo\artifacts;demo\artifacts",
     "--add-data", "$ProjectRoot\src\yblocalizer\default_glossary.json;yblocalizer",
+    "--add-data", "$ProjectRoot\src\yblocalizer\common_en_20k.txt;yblocalizer",
     "--add-data", "$ProjectRoot\src\yblocalizer\tts_worker.py;yblocalizer",
     "--add-data", "$ProjectRoot\LICENSE;.",
     "--add-data", "$ProjectRoot\PORTABLE-README.txt;.",

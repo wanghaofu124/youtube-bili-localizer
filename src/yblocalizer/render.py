@@ -174,9 +174,11 @@ def _prepare_ass(
     display_mode: str = "translated",
     subtitle_preset: str = "soft",
     cue_source_lines: Mapping[int, int] | None = None,
+    canvas_size: tuple[int, int] | None = None,
+    clip: tuple[float, float] | None = None,
 ) -> Path:
     subtitles = pysubs2.load(subtitle_path, encoding="utf-8-sig")
-    width, height = size or (384, 288)
+    width, height = canvas_size or size or (384, 288)
     actual_font = _scaled_ass_font_size(font_size, size)
     if margin_v is None:
         actual_margin = max(24, round(height * max(0.01, min(0.4, margin_ratio)))) if size else 24
@@ -239,6 +241,13 @@ def _prepare_ass(
             subtitles.styles[style_name] = style
         event.style = style_name
 
+    if clip is not None:
+        start_ms, end_ms = (round(bound * 1000) for bound in clip)
+        subtitles.events = [event for event in subtitles.events if event.start < end_ms and event.end > start_ms]
+        for event in subtitles.events:
+            event.start = max(event.start, start_ms) - start_ms
+            event.end = min(event.end, end_ms) - start_ms
+
     ass_path = subtitle_path.with_suffix(".ass")
     subtitles.save(ass_path, encoding="utf-8-sig", format_="ass")
     return ass_path
@@ -268,6 +277,8 @@ def burn_subtitles(
     display_mode: str = "translated",
     subtitle_preset: str = "soft",
     cue_source_lines: Mapping[int, int] | None = None,
+    subtitle_placement: str = "overlay",
+    clip: tuple[float, float] | None = None,
 ) -> Path:
     require_command("ffmpeg")
     video_path = video_path.resolve()
@@ -277,11 +288,23 @@ def burn_subtitles(
     profile = normalize_resource_profile(resource_profile)
     logger = log or (lambda _message: None)
     logger("正在读取视频参数并准备字幕样式。")
-    duration = _probe_video_duration(video_path)
+    duration = clip[1] - clip[0] if clip is not None else _probe_video_duration(video_path)
+    size = _probe_video_size(video_path)
+    canvas_size = None
+    if subtitle_placement == "bottom-bar":
+        if size is None:
+            raise RuntimeError("无法读取原视频尺寸，不能添加画面外字幕栏。")
+        width, height = size
+        font_pixels = _scaled_ass_font_size(font_size, size)
+        margin_v = max(12, round(height * margin_ratio)) if margin_v is None else margin_v
+        lines = 2 if display_mode == "translated" else 4
+        bar_height = math.ceil(2 * margin_v + 1.2 * lines * font_pixels)
+        canvas_size = (math.ceil(width / 2) * 2, math.ceil((height + bar_height) / 2) * 2)
+        raised_margin = False
 
     ass_path = _prepare_ass(
         subtitle_path,
-        size=_probe_video_size(video_path),
+        size=size,
         font_name=font_name,
         font_size=font_size,
         primary_color=primary_color,
@@ -297,8 +320,12 @@ def burn_subtitles(
         display_mode=display_mode,
         subtitle_preset=subtitle_preset,
         cue_source_lines=cue_source_lines,
+        canvas_size=canvas_size,
+        clip=clip,
     )
     filter_expr = f"ass={ass_path.name}"
+    if canvas_size:
+        filter_expr = f"pad={canvas_size[0]}:{canvas_size[1]}:0:0:color=black,{filter_expr}"
     logger("正在检查可用视频编码器。")
     selected_encoder, encoder_args = _video_encoder_args(encoder, crf)
     logger("字幕渲染使用 NVIDIA NVENC。" if selected_encoder == "nvidia" else "字幕渲染使用 CPU libx264。")
@@ -319,8 +346,10 @@ def burn_subtitles(
             "-progress",
             "pipe:1",
             "-nostats",
+            *(["-ss", f"{clip[0]:.3f}"] if clip is not None else []),
             "-i",
             str(video_path),
+            *(["-t", f"{duration:.3f}"] if clip is not None else []),
             "-vf",
             filter_expr,
             *args,

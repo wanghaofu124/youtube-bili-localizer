@@ -499,7 +499,7 @@ class LocalizerApp(tk.Tk):
 
     def _guide_youtube(self) -> None:
         self.source_kind.set("url")
-        self.guide_status.set("粘贴 YouTube 链接，点击“读取时长”，确认授权；如遇登录/机器人检查，在 Cookies 里选择已登录的浏览器。")
+        self.guide_status.set("粘贴视频站链接，或 X、Instagram、Facebook、Reddit、Bluesky、Tumblr 帖子，点击“读取时长”，确认授权。获取代理和处理范围对每条链接都生效。画质上限会用于选流；X、Reddit、Bluesky 没有平台字幕时自动转写。")
         self.main_canvas.yview_moveto(0.0)
 
     def _guide_local_file(self) -> None:

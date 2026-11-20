@@ -41,7 +41,7 @@ def test_ytdlp_progress_hook_stops_download_after_cancel(monkeypatch: pytest.Mon
     monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
 
     with pytest.raises(CancellationRequested):
-        download_with_ytdlp("https://example.test/video", tmp_path)
+        download_with_ytdlp("https://www.youtube.com/watch?v=demotest", tmp_path)
 
 
 @pytest.mark.parametrize("url", ["", "youtube.com/watch?v=demo", "ftp://example.test/video"])

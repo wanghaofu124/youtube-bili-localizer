@@ -51,7 +51,7 @@ CATEGORIES: list[tuple[str, str, list[str]]] = [
     ("news", "资讯", ["news", "sports"]),
     ("music", "音乐", ["music"]),
 ]
-REGIONS: list[tuple[str, str]] = [("US", "美国"), ("GB", "英国"), ("", "不限")]
+REGIONS: list[tuple[str, str]] = [("US", "美国"), ("GB", "英国"), ("JP", "日本"), ("KR", "韩国"), ("IN", "印度"), ("CA", "加拿大"), ("AU", "澳大利亚"), ("", "不限")]
 
 _CATEGORY_QUERIES = {key: queries for key, _label, queries in CATEGORIES}
 _REGION_IDS = {key for key, _label in REGIONS}
@@ -124,6 +124,7 @@ def _load() -> dict:
             "error": str(item["error"]) if item.get("error") else None,
             "query_errors": errors,
             "region": item.get("region") if isinstance(item.get("region"), str) else None,
+            "error_region": item.get("error_region", item.get("region")),
         }
     return {"region": region if region in _REGION_IDS else DEFAULT_REGION, "categories": categories}
 
@@ -282,7 +283,8 @@ def site_snapshot(category: str = "mix", now: float | None = None) -> dict:
         data = _load()
     cached = data["categories"].get(category) or _empty_category()
     refreshed = _parse_stamp(cached.get("refreshed_at"))
-    region_changed = bool(cached.get("refreshed_at")) and cached.get("region") != data["region"]
+    region_changed = cached.get("region") != data["region"]
+    error_region_changed = cached.get("error_region", cached.get("region")) != data["region"]
     stale = refreshed is None or stamp - refreshed >= CACHE_TTL_HOURS * 3600 or region_changed
     progress = _progress_view()
     return {
@@ -291,13 +293,13 @@ def site_snapshot(category: str = "mix", now: float | None = None) -> dict:
         "region": data["region"],
         "regions": [{"id": key, "label": label} for key, label in REGIONS],
         "cached_region": cached.get("region"),
-        "videos": list(cached["videos"]),
-        "refreshed_at": cached.get("refreshed_at"),
+        "videos": [] if region_changed else list(cached["videos"]),
+        "refreshed_at": None if region_changed else cached.get("refreshed_at"),
         "stale": stale,
         "refreshing": progress is not None,
         "progress": progress,
-        "error": cached.get("error"),
-        "query_errors": list(cached.get("query_errors") or []),
+        "error": None if error_region_changed else cached.get("error"),
+        "query_errors": [] if error_region_changed else list(cached.get("query_errors") or []),
         "sort_mode": "views",
     }
 
@@ -393,8 +395,13 @@ def refresh_site_hot(access: dict, category: str = "mix", now: float | None = No
                     "region": chosen,
                 }
             else:
-                current["error"] = "全站热门没有拉到视频。YouTube 搜索排序可能已经改了，上次的列表还在。"
+                current["error"] = (
+                    "全站热门没有拉到视频。YouTube 搜索排序可能已经改了，上次的列表还在。"
+                    if current["videos"] and current.get("region") == chosen
+                    else "这个地区暂时没有拉到视频，可以稍后刷新或换一个地区。"
+                )
                 current["query_errors"] = errors
+                current["error_region"] = chosen
             data["categories"][category] = current
             _save(data)
         _progress_stop()

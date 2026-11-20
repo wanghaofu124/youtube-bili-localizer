@@ -12,13 +12,12 @@ import shutil
 import subprocess
 import uuid
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlparse
-
 from . import dependencies
 from .asr_prompt import build_initial_prompt
 from .glossary import load_glossary
 from .asr_review import prepare_session, resolve_review_language, session_path
 from .download import download_with_ytdlp, import_local_video
+from .source_sites import source_identity, youtube_video_id
 from .media import extract_audio
 from .models import Segment, VideoJob, load_segments, save_segments
 from .ocr_subtitle import extract_ocr_subtitles
@@ -64,7 +63,7 @@ CONFIG_INVALIDATION: tuple[tuple[frozenset[str], str], ...] = (
     (frozenset({"source", "source_kind", "output_dir", "cookies_from_browser", "cookies_file", "youtube_po_token_mode", "youtube_proxy", "download_quality", "max_seconds", "require_reuse_allowed", "prefer_platform_subtitles"}), "acquire"),
     (frozenset({"subtitle_source", "ocr_fallback_to_audio", "whisper_model_size", "source_language", "beam_size", "device", "compute_type", "ocr_interval", "ocr_crop_ratio", "ocr_min_chars", "ocr_language", "audio_channel", "asr_hint", "asr_vad_mode"}), "extract"),
     (frozenset({"translator", "target_lang", "translate_model", "batch_size", "smart_translation", "smart_subtitle_layout"}), "translate"),
-    (frozenset({"font_name", "font_size", "subtitle_display_mode", "subtitle_color", "subtitle_outline_color", "subtitle_outline", "subtitle_shadow", "subtitle_margin_ratio", "subtitle_preset", "render_crf", "render_encoder"}), "render"),
+    (frozenset({"font_name", "font_size", "subtitle_display_mode", "subtitle_color", "subtitle_outline_color", "subtitle_outline", "subtitle_shadow", "subtitle_margin_ratio", "subtitle_preset", "subtitle_placement", "render_crf", "render_encoder"}), "render"),
     (frozenset({"dub_enabled", "dub_mix"}), "dub"),
     (frozenset({"title", "description", "tags", "publish_to_bilibili", "include_source_link", "bilibili_browser", "close_after_fill"}), "publish"),
 )
@@ -236,30 +235,11 @@ def _commit_acquired_file(source: Path, work_dir: Path, stem: str) -> Path:
 
 
 def _youtube_video_id(source: str) -> str | None:
-    parsed = urlparse(str(source).strip())
-    host = (parsed.hostname or "").lower()
-    segments = [segment for segment in parsed.path.split("/") if segment]
-    if host == "youtu.be" or host.endswith(".youtu.be"):
-        return segments[0] if segments else None
-    if (
-        host == "youtube.com"
-        or host.endswith(".youtube.com")
-        or host == "youtube-nocookie.com"
-        or host.endswith(".youtube-nocookie.com")
-    ):
-        value = (parse_qs(parsed.query).get("v") or [None])[0]
-        if value:
-            return value
-        if len(segments) >= 2 and segments[0] in {"embed", "live", "shorts", "v"}:
-            return segments[1]
-    return None
+    return youtube_video_id(source)
 
 
 def _acquire_source_identity(source: str) -> str:
-    video_id = _youtube_video_id(source)
-    if video_id:
-        return f"youtube:{video_id}"
-    return str(source).strip()
+    return source_identity(source)
 
 
 def _acquire_cache_contract(options: Any) -> dict[str, Any]:
@@ -1119,7 +1099,11 @@ def _record_render_layout_warning(
         artifacts.content_warnings.append(message)
 
 
-def run_render(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx: PipelineContext, log: Callable[[str], None], progress: Callable[[float], None] | None = None) -> WorkflowArtifacts:
+def run_render(
+    options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx: PipelineContext,
+    log: Callable[[str], None], progress: Callable[[float], None] | None = None,
+    *, clip: tuple[float, float] | None = None,
+) -> WorkflowArtifacts:
     video, subtitle = artifacts.path("raw_video"), artifacts.path("translated_srt")
     translated_json = artifacts.path("translated_segments")
     regenerated_subtitle: Path | None = None
@@ -1145,6 +1129,11 @@ def run_render(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx: 
             log("正在读取并检查译文字幕。")
             report_progress(0.12)
             translated_items = load_segments(translated_json)
+            if clip is not None:
+                start, end = clip
+                translated_items = [item for item in translated_items if item.start < end and item.end > start]
+                if not translated_items:
+                    raise RuntimeError("这一段没有字幕。请把播放位置移到要预览的字幕附近。")
             if options.subtitle_display_mode == "translated":
                 try:
                     measured_width = subtitle_line_capacity(
@@ -1209,7 +1198,7 @@ def run_render(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx: 
                             f"从 {options.font_size} 调至最低 {min(cue_font_sizes.values())}；"
                             "译文和时间轴保持不变。"
                         )
-                if layout_issues:
+                if layout_issues and clip is None and getattr(options, "allow_model_layout_repair", True):
                     repair_indexes = {
                         index - 1 for index, _start, _text in layout_issues
                     }
@@ -1355,6 +1344,8 @@ def run_render(options: Any, work_dir: Path, artifacts: WorkflowArtifacts, ctx: 
             expected_cue_count=len(translated_items) if translated_items else None,
             display_mode=options.subtitle_display_mode,
             subtitle_preset=getattr(options, "subtitle_preset", "soft"),
+            subtitle_placement=getattr(options, "subtitle_placement", "overlay"),
+            clip=clip,
             cue_source_lines=cue_source_line_counts(
                 translated_items, options.subtitle_display_mode, options.smart_subtitle_layout,
             ) if translated_items else None,

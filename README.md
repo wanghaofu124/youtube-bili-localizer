@@ -8,11 +8,13 @@
 
 面向**已获授权视频**的 Python 本地化工具：将本地文件或授权 URL 转为中文字幕硬字幕视频，并在人工确认前辅助填写 B 站投稿信息。
 
-## Windows 0.3.0 下载（推荐）
+## Windows 下载
 
-- [便携 ZIP（YouTubeBiliLocalizer-v0.3.0-windows-x64.zip）](https://github.com/wanghaofu124/youtube-bili-localizer/releases/download/v0.3.0/YouTubeBiliLocalizer-v0.3.0-windows-x64.zip)：推荐下载。将 ZIP 解压到有写入权限的文件夹，再运行解压目录内的 `YouTubeBiliLocalizer.exe`，无需安装。
-- [安装包（YouTubeBiliLocalizer-v0.3.0-setup.exe）](https://github.com/wanghaofu124/youtube-bili-localizer/releases/download/v0.3.0/YouTubeBiliLocalizer-v0.3.0-setup.exe)。
-- [发布页与校验文件](https://github.com/wanghaofu124/youtube-bili-localizer/releases/tag/v0.3.0)：Windows x64。桌面窗口需要 WebView2；默认音频流程需要 FFmpeg/ffprobe 和所选 Whisper 模型，依赖中心可按需安装或下载；Ollama、CUDA、OCR、Node.js 和翻译模型按所选流程启用。
+- 将 **v0.3.2 Windows x64 便携版**解压到有写入权限的文件夹，运行目录内的 `YouTubeBiliLocalizer.exe`。 [下载 ZIP](https://github.com/wanghaofu124/youtube-bili-localizer/releases/download/v0.3.2/YouTubeBiliLocalizer-v0.3.2-windows-x64.zip)
+- 优先使用安装程序时可选 v0.3.0。 [下载安装程序](https://github.com/wanghaofu124/youtube-bili-localizer/releases/download/v0.3.0/YouTubeBiliLocalizer-v0.3.0-setup.exe)
+- 桌面窗口需要 WebView2。默认音频流程需要 FFmpeg、ffprobe 和所选 Whisper 模型，均可在依赖中心检查。 [发布页与校验文件](https://github.com/wanghaofu124/youtube-bili-localizer/releases/tag/v0.3.2)
+
+本仓库近期的源码改进记录在 [更新日志](CHANGELOG.md)。
 
 当前公开 Windows 二进制未签名，Windows 仍可能显示 SmartScreen 或其他安全检查。运行前请在发布页核对对应的 SHA-256 校验文件；选择 ZIP 便携版不会取消系统安全检查。
 
@@ -48,7 +50,9 @@ flowchart LR
 - `faster-whisper` 支持 CPU、CUDA 和可配置精度；OCR 可识别画面内英文字幕与信息标签。
 - 音频/OCR 可分别使用，或按时间轴合并；转写、翻译和输出均保留可检查的 JSON/SRT 中间产物。
 - OpenAI / DeepSeek 可进行源字幕校对、上下文分批翻译和投稿元数据生成；也可选择 Ollama 在本机运行 Qwen 3.5 或专用翻译模型 TranslateGemma，无需在线翻译 API。
-- 支持中文、原文、双语字幕，动态换行、字体、描边、阴影和位置配置。
+- 单条素材可选择先出字幕再校对，或直接生成成片。本地视频支持拖拽导入。
+- 支持中文、原文和双语字幕。字体、字号、描边和位置有实时示例，也可以在原视频上试渲染当前 8 秒。文字密集的录屏可选画面外黑色字幕栏。
+- 校对后合成和单独重渲染会使用已保存的译文。日志分别显示 Whisper 模型加载、实际转写和漏词复核耗时。
 - 图形工作台（WebView 界面）：素材、处理、字幕精修、视频修改（删除/保留/静音/导出/重排）、发布辅助、任务历史；另保留 CLI。
 - 三档资源模式：默认“均衡”限制下载带宽与 CPU 线程；“后台”优先保证其他软件流畅；“极速”释放全部资源。
 - 自适应画面字幕 OCR：一次抽帧，优先上次成功区域，低置信度时再扩大搜索；支持配置 Tesseract 语言并明确显示是否回退到 Whisper。
@@ -181,6 +185,7 @@ v0.2 将 React 工作台确定为唯一新增功能的 UI，旧 Tk GUI 进入兼
 
 ## 公开资产与安全
 
+- 英语字幕难度提示使用 [FrequencyWords 英文字幕词表](src/yblocalizer/common_en_20k.txt)，数据授权为 CC BY-SA 4.0，来源与处理方式见文件开头。
 - 仅 `demo/authorized-demo-10s.mp4` 与从它生成的 `demo/artifacts/` 可作为公开演示媒体。
 - `outputs/`、浏览器诊断截图、cookies、Profile、API 响应、日志及无明确授权素材一律忽略，禁止提交。
 - `.env` 已忽略；请勿提交 API Key。有关本地开发与基准更新方式见 [benchmarks/README.md](benchmarks/README.md)。

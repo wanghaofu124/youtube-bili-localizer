@@ -66,7 +66,7 @@ def test_balanced_download_applies_rate_limit(monkeypatch: pytest.MonkeyPatch, t
     monkeypatch.setattr("yblocalizer.download.po_token_provider_status", lambda: {"available": False, "browser_path": None})
     monkeypatch.setitem(sys.modules, "yt_dlp", SimpleNamespace(YoutubeDL=FakeYoutubeDL))
 
-    download_with_ytdlp("https://example.test/video", tmp_path, resource_profile="balanced")
+    download_with_ytdlp("https://www.youtube.com/watch?v=demotest", tmp_path, resource_profile="balanced", prefer_platform_subtitles=False)
 
     assert captured["ratelimit"] == 6 * 1024 * 1024
 

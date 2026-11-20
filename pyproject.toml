@@ -29,7 +29,7 @@ yblocalizer-gui = "yblocalizer.gui:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-yblocalizer = ["default_glossary.json"]
+yblocalizer = ["default_glossary.json", "common_en_20k.txt"]
 
 [tool.setuptools.dynamic]
 version = {attr = "yblocalizer.__version__"}

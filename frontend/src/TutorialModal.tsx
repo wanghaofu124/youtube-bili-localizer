@@ -16,8 +16,37 @@ const Tip = ({ children }: { children: ReactNode }) => <p className="tutorial-ti
 const ChoiceTable = ({ rows }: { rows: Array<[string, string, string]> }) => <div className="tutorial-choice-table"><div className="tutorial-choice-head"><b>选择</b><b>适合</b><b>注意</b></div>{rows.map(([choice, fit, note]) => <div className="tutorial-choice-row" key={choice}><b>{choice}</b><span>{fit}</span><span>{note}</span></div>)}</div>;
 
 const chapters: TutorialChapter[] = [
-  { id: "overview", title: "认识工作流", eyebrow: "开始 · 先看路线", body: <><p>工作台按五个阶段保存检查点：获取素材、字幕提取、翻译、渲染、发布辅助。每一阶段完成后才进入下一阶段，失败或关闭应用后可从最后有效检查点继续。</p><Steps items={["准备一段你有权处理的素材；第一次建议使用“授权演示结果”或约 10 秒片段。", "在“素材”页选择 URL 或本地文件，确认授权和处理范围。", "保存方案并检查准备，解决阻断项后运行需要的阶段。", "在“字幕”页人工检查，再重新渲染并到“文件”页取出成片。", "需要投稿时进入“发布”页准备草稿，最终公开提交由你手动确认。"]} /><Tip>打开教程、点击章节导航或跳转页面都不会自动开始处理、安装、下载或发送在线请求。</Tip></>, figure: { src: "/images/tutorial/tutorial-material.jpg", alt: "素材页显示视频来源、授权和处理范围设置", caption: "在“处理范围”选择“仅处理前10秒”试跑；确认授权后保存素材并配置方案。" } },
-  { id: "material", title: "添加素材与范围", eyebrow: "素材 · 先确认授权", body: <><p>“素材”页负责登记来源、范围和画质。URL 会先读取标题与时长；本地文件直接登记原路径，不会因为打开教程而复制或上传。</p><Steps items={["点击左侧“素材”，选择“视频链接”或“本地文件”。", "粘贴 YouTube/B 站链接，或选择本地视频；确认授权复选框。", "读取元数据后，在“处理范围”选择完整视频或仅处理前，并输入秒/分钟/小时范围。", "在画质和访问设置中选择需要的质量；高画质会增加网络、磁盘和处理时间。", "点击“保存素材并配置方案”，只保存方案并进入准备检查。"]} /><Tip>常见错误：链接读不到时先检查访问设置、Cookies 或平台可见性；本地原文件移动后，应用可能无法继续读取；不要把别人的 Cookies 粘贴到公开 Issue。</Tip></>, figure: { src: "/images/tutorial/tutorial-material.jpg", alt: "素材页显示视频来源、授权和处理范围设置", caption: "在“处理范围”选择“仅处理前10秒”试跑；确认授权后保存素材并配置方案。" }, action: { label: "打开素材页", target: "material" } },
+  {
+    id: "overview", title: "认识工作流", eyebrow: "开始 · 先看路线",
+    body: <>
+      <p>工作台在获取素材、提取字幕、翻译、渲染和发布辅助后保存检查点。任务失败或应用关闭后，可从最后一个有效检查点继续。</p>
+      <Steps items={[
+        "准备一段你有权处理的素材。第一次可在素材页底部点击“预览授权演示”。",
+        "在“素材”页选择“单条链接”“批量”或“本地文件”。",
+        "确认授权和处理方案。单条任务可选“先出字幕”或“直接出成片”，多条选“开始批量处理”。",
+        "在“字幕”页人工检查。修改字幕后重新渲染，再到“文件”页查看成片。",
+        "需要投稿时进入“发布”页准备草稿，最终公开提交由你手动确认。",
+      ]} />
+      <Tip>打开教程、点击章节导航或跳转页面都不会自动开始处理、安装、下载或发送在线请求。</Tip>
+    </>,
+    figure: { src: "/images/tutorial/tutorial-material.jpg", alt: "素材页显示本地视频预览、处理方案和开始按钮", caption: "选择素材并确认方案后，勾选授权并开始处理。" },
+  },
+  {
+    id: "material", title: "添加素材与范围", eyebrow: "素材 · 先确认授权",
+    body: <>
+      <p>单条链接和本地文件可在素材页查看预览。批量解析后可查看每条视频的标题和已有封面。</p>
+      <Steps items={[
+        "单条链接模式下，粘贴链接并点击“读取视频信息”。本地文件模式下，先勾选授权，再拖入视频或点击选择文件。",
+        "链接素材可在“处理范围”选择完整视频，或按秒、分钟、小时截取开头。",
+        "批量模式下，每行粘贴一条链接并点击“解析”，再勾选要处理的视频。修改链接后重新解析。",
+        "在“处理方案”选择常用设置。点击“更多参数”可调整模型、运行设备、编码和输出目录。",
+        "确认授权并选择“先出字幕”或“直接出成片”。先出字幕时，校对完成后点“生成成片”。",
+      ]} />
+      <Tip>链接读不到时可检查获取代理和 Cookies。桌面版直接读取本地原文件，移动文件后需要重新选择。</Tip>
+    </>,
+    figure: { src: "/images/tutorial/tutorial-material.jpg", alt: "素材页显示本地视频预览、处理方案和开始按钮", caption: "单条素材使用大预览。需要处理多条链接时，切换到“批量”。" },
+    action: { label: "打开素材页", target: "material" },
+  },
   { id: "prepare", title: "准备工具与模型", eyebrow: "依赖中心 · 按需准备", body: <><p>依赖中心按当前方案显示需要的组件。WebView2 用于桌面界面，FFmpeg 用于音频/视频处理，Whisper 用于语音转写，Tesseract 用于 OCR，Node.js/浏览器用于部分平台验证和投稿辅助，Ollama 运行本机翻译模型。</p><Steps items={["从顶部“更多”打开“依赖中心”，先点“重新检测”。", "按字幕来源安装必需组件：音频转写需要 Whisper/FFmpeg，OCR 需要 Tesseract 语言包。", "使用在线翻译时配置对应服务；使用本机翻译时启动 Ollama 并选择模型。", "查看组件状态变为可用，再回到“处理”页运行准备检查。"]} /><ChoiceTable rows={[["small Whisper", "普通桌面、先跑通流程", "更快更省资源，仍需人工复核"],["large-v3 Whisper", "有更多内存/显存、重视转写质量", "更慢、更占资源，仍不是免校对"],["Ollama", "希望文本请求留在本机", "无在线翻译 API 费，但占内存/显存/磁盘"],["DeepSeek/OpenAI", "需要在线翻译或文案生成", "请求前会提示内容和费用，账单以服务商为准"]]} /><Tip>不要为了“自动完成”安装所有组件；先按字幕来源和目标功能选择，缺少可选组件不必处理。</Tip></>, figure: { src: "/images/tutorial/tutorial-dependencies.jpg", alt: "依赖中心显示 FFmpeg 和 Whisper 检测与安装入口", caption: "“可用”表示组件已就绪；按需要安装 Whisper 模型，不必全部安装，状态以本机检测为准。" }, action: { label: "打开依赖中心", target: "dependencies" } },
   { id: "translation", title: "选择转写与翻译", eyebrow: "处理方案 · 区分来源与服务", body: <><p>GPU/CUDA 主要影响 Whisper 语音转写速度；它不等于 OCR，也不决定翻译服务。字幕来源决定是否读取音频、画面文字或平台字幕。</p><Steps items={["打开“处理”，找到“字幕来源”：自动、音频、OCR 或音频 + OCR 合并。", "选择 Whisper 模型、源语言和设备；CPU 更通用，CUDA 需要可用的 NVIDIA 驱动。", "在“翻译服务与模型”选择 DeepSeek、OpenAI、Ollama 或“不翻译”。", "设置目标语言和智能上下文；在线服务发送前会显示服务商、端点、模型、内容类别和费用提示。", "点击“保存方案并检查准备”，确认检查结果后再运行。"]} /><Tip>先排查字幕提取可以选“不翻译”；Ollama 无在线翻译 API 费但需要本机模型，在线服务费用估算只供参考，最终以账单为准。</Tip></>, figure: { src: "/images/tutorial/tutorial-process.jpg", alt: "处理页显示字幕来源、Whisper 和翻译器选择", caption: "左侧选择字幕来源/Whisper，右侧选择翻译器；图中 DeepSeek 缺少 Key 时请配置或更换翻译器。" }, action: { label: "打开处理页", target: "process" } },
   { id: "run", title: "运行与失败恢复", eyebrow: "检查点 · 出错后继续", body: <><p>运行前准备检查会验证依赖、输入和配置。运行中不要反复点击主操作；任务详情会显示当前阶段、百分比、费用小表和日志。</p><Steps items={["点击“保存方案并检查准备”，逐项查看通过、警告和阻断。", "解决阻断项后，从“运行当前阶段”或顶部主操作开始；按需要运行到渲染。", "失败时打开右侧“任务详情”，查看阶段错误和“完整日志”；依赖问题可回到依赖中心重新检测。", "修复设置后回到同一任务，点击“从检查点继续”或运行失败阶段。", "确认已完成的阶段保持有效，再继续后续阶段；不会无故重新下载或转写全部内容。"]} /><Tip>任务库中的恢复任务不会自动消耗资源；载入后仍需你确认准备检查和下一阶段。</Tip></>, figure: { src: "/images/tutorial/tutorial-process.jpg", alt: "处理页显示保存方案和准备检查入口", caption: "先保存方案并检查准备；失败后查看完整日志，再从失败检查点继续。" }, action: { label: "打开处理页", target: "process" } },
