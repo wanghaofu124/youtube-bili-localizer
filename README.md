@@ -1,28 +1,26 @@
-# YouTube 视频本地化工具（YouTube Bili Localizer）
+# YouTube Bili Localizer
 
-## 隐私与 Code signing policy
+把本地视频拖进 Windows 工作台，或贴上 YouTube 等站点的授权链接，就可以开始做中文字幕。
 
-- [隐私政策](docs/privacy-policy.md)：说明本机保存、用户主动选择的来源平台和在线 AI 服务请求。
-- [Code signing policy](docs/signing/code-signing-policy-draft.md)：SignPath 申请已于 2026-10-14 提交，正在等待资格评估；尚无赞助、证书或签名批准。
+[Windows 下载](#windows-下载) · [使用教程](docs/使用教程.md) · [更新日志](CHANGELOG.md)
 
+## 从字幕稿到成片
 
-面向**已获授权视频**的 Python 本地化工具：将本地文件或授权 URL 转为中文字幕硬字幕视频，并在人工确认前辅助填写 B 站投稿信息。
+1. **先看字幕稿。** 选「先出字幕」，等转写和翻译完成后，沿时间轴对照原文逐句校对。想一路处理到导出，也可以选「直接出成片」。
+2. **在原画面试样式。** 调整字体、描边和双语排版，试渲染当前 8 秒。网页、表格或代码占满画面时，可以把字幕放进画面下方的黑栏。
+3. **导出字幕或成片。** 保存 SRT 或带字幕的 MP4。准备发到 B 站时，可以生成标题、简介和标签草稿，核对后手动投稿。
+
+![授权样例在字幕编辑器中按时间轴对照原文和中文译文](frontend/public/images/tutorial/tutorial-subtitles.jpg)
 
 ## Windows 下载
+
+以下是已发布的 Windows 版本。主分支新增的字幕分步处理和 8 秒试渲染见 [更新日志](CHANGELOG.md) 中的未发布条目。
 
 - 将 **v0.3.2 Windows x64 便携版**解压到有写入权限的文件夹，运行目录内的 `YouTubeBiliLocalizer.exe`。 [下载 ZIP](https://github.com/wanghaofu124/youtube-bili-localizer/releases/download/v0.3.2/YouTubeBiliLocalizer-v0.3.2-windows-x64.zip)
 - 优先使用安装程序时可选 v0.3.0。 [下载安装程序](https://github.com/wanghaofu124/youtube-bili-localizer/releases/download/v0.3.0/YouTubeBiliLocalizer-v0.3.0-setup.exe)
 - 桌面窗口需要 WebView2。默认音频流程需要 FFmpeg、ffprobe 和所选 Whisper 模型，均可在依赖中心检查。 [发布页与校验文件](https://github.com/wanghaofu124/youtube-bili-localizer/releases/tag/v0.3.2)
 
-本仓库近期的源码改进记录在 [更新日志](CHANGELOG.md)。
-
 当前公开 Windows 二进制未签名，Windows 仍可能显示 SmartScreen 或其他安全检查。运行前请在发布页核对对应的 SHA-256 校验文件；选择 ZIP 便携版不会取消系统安全检查。
-
-0.2.52 起，任务检查器提供按环节的翻译费用小表，任务库显示累计估算金额。包含校对、断句、翻译、复审、精简和手工重译；重试的已知用量计入，未返回用量的请求标为待核对。缓存复用不产生新 API 费用。累计从该版本开始记录，旧任务过去未记录的费用不补算。
-
-官方 DeepSeek 精确模型（`deepseek-flash`、`deepseek-v4-flash`、`deepseek-v4-flash-vision-exp`、`deepseek-v4-pro`）在 `https://api.deepseek.com` 下自动使用 2026-10-11 的人民币价格预设。按请求开始时的缓存输入、普通输入和输出分别估算，不重复计算思考 Token；缓存拆分缺失时显示区间。价格来源为 [DeepSeek 官方定价](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)，2026 节假日依据[国务院通知](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm)。未知年份的工作日峰时采用峰谷区间。第三方网关、未知模型和未返回用量显示待核对，不估算为零。高级设置可填写三项自定义人民币单价，服务、接口 origin、模型必须全部匹配；价格在调用时冻结，改价不追溯重算历史，也不使字幕缓存失效。估算值不代表实际扣费，最终以服务商账单为准。
-
-任务检查器保留请求、重试、Token 和缓存复用明细。每次处理在任务目录的 `.attempt-llm-*` 中保存 `llm_usage.jsonl` 与原子写入的 `llm_usage.json`；任务累计保存于 `llm_usage_index.json`，按 session 身份与 revision 替换聚合，重复回调不重复计费。重开任务只读取一次索引，页面轮询使用内存；不保存请求正文、译文或凭据。统计失败不会中断翻译，也不会使旧字幕重新翻译。DeepSeek 快速模式从 0.2.51 起默认启用。
 
 > 仅处理你拥有版权、已取得明确授权或许可证允许下载、改编与转载的素材。本项目不绕过登录、验证码、风控或版权限制；B 站流程不会自动点击“立即投稿”。
 
@@ -183,8 +181,18 @@ v0.2 将 React 工作台确定为唯一新增功能的 UI，旧 Tk GUI 进入兼
 | 动态字幕排版 | 根据语种、可用时长和字符数调整换行，限制屏幕行数以提升可读性。 |
 | 人工确认投稿 | Playwright 仅协助上传和填写；用户核对分类、版权声明和内容后手动提交。 |
 
+## 翻译用量与费用估算
+
+0.2.52 起，任务检查器提供按环节的翻译费用小表，任务库显示累计估算金额。包含校对、断句、翻译、复审、精简和手工重译；重试的已知用量计入，未返回用量的请求标为待核对。缓存复用不产生新 API 费用。累计从该版本开始记录，旧任务过去未记录的费用不补算。
+
+官方 DeepSeek 精确模型（`deepseek-flash`、`deepseek-v4-flash`、`deepseek-v4-flash-vision-exp`、`deepseek-v4-pro`）在 `https://api.deepseek.com` 下自动使用 2026-10-11 的人民币价格预设。按请求开始时的缓存输入、普通输入和输出分别估算，不重复计算思考 Token；缓存拆分缺失时显示区间。价格来源为 [DeepSeek 官方定价](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)，2026 节假日依据[国务院通知](https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm)。未知年份的工作日峰时采用峰谷区间。第三方网关、未知模型和未返回用量显示待核对，不估算为零。高级设置可填写三项自定义人民币单价，服务、接口 origin、模型必须全部匹配；价格在调用时冻结，改价不追溯重算历史，也不使字幕缓存失效。估算值不代表实际扣费，最终以服务商账单为准。
+
+任务检查器保留请求、重试、Token 和缓存复用明细。每次处理在任务目录的 `.attempt-llm-*` 中保存 `llm_usage.jsonl` 与原子写入的 `llm_usage.json`；任务累计保存于 `llm_usage_index.json`，按 session 身份与 revision 替换聚合，重复回调不重复计费。重开任务只读取一次索引，页面轮询使用内存；不保存请求正文、译文或凭据。统计失败不会中断翻译，也不会使旧字幕重新翻译。DeepSeek 快速模式从 0.2.51 起默认启用。
+
 ## 公开资产与安全
 
+- [隐私政策](docs/privacy-policy.md)说明本地数据保存，以及哪些操作会向来源平台或在线 AI 服务发送请求。
+- [代码签名政策草案](docs/signing/code-signing-policy-draft.md)记录当前方案和申请状态。
 - 英语字幕难度提示使用 [FrequencyWords 英文字幕词表](src/yblocalizer/common_en_20k.txt)，数据授权为 CC BY-SA 4.0，来源与处理方式见文件开头。
 - 仅 `demo/authorized-demo-10s.mp4` 与从它生成的 `demo/artifacts/` 可作为公开演示媒体。
 - `outputs/`、浏览器诊断截图、cookies、Profile、API 响应、日志及无明确授权素材一律忽略，禁止提交。
